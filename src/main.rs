@@ -31,6 +31,9 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--diag") {
         return diag();
     }
+    if args.iter().any(|a| a == "--cells") {
+        return cells(&args);
+    }
     run()
 }
 
@@ -190,6 +193,10 @@ fn snapshot(args: &[String]) -> Result<()> {
 
     let mut st = AppState::default();
     sample_data(&mut st);
+    // `--idle` previews the no-music right column (live system graphs).
+    if args.iter().any(|a| a == "--idle") {
+        st.music.playing = false;
+    }
 
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend)?;
@@ -204,6 +211,56 @@ fn snapshot(args: &[String]) -> Result<()> {
             line.push_str(buf[(x, y)].symbol());
         }
         writeln!(out, "{}", line.trim_end())?;
+    }
+    Ok(())
+}
+
+/// Dump every rendered cell with its fg/bg color for off-screen image
+/// rendering: `studioboard --cells [WxH] [--idle]`. One line per cell:
+///   x\ty\tfr\tfg\tfb\tbr\tbg\tbb\t<symbol>
+fn cells(args: &[String]) -> Result<()> {
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    let (w, h) = args
+        .iter()
+        .find_map(|a| a.split_once('x'))
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+        .unwrap_or((140u16, 44u16));
+
+    let mut st = AppState::default();
+    sample_data(&mut st);
+    if args.iter().any(|a| a == "--idle") {
+        st.music.playing = false;
+    }
+
+    let t = args
+        .iter()
+        .find_map(|a| a.strip_prefix("t="))
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.3);
+    let backend = TestBackend::new(w, h);
+    let mut term = Terminal::new(backend)?;
+    term.draw(|f| ui::render(f, &st, t))?;
+    let buf = term.backend().buffer().clone();
+
+    let bg0 = (13u8, 14u8, 22u8); // theme::BG
+    let rgb = |c: Color, fb: (u8, u8, u8)| match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => fb,
+    };
+    let mut out = io::stdout().lock();
+    writeln!(out, "{w} {h}")?;
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            let (br, bgc, bb) = rgb(cell.bg, bg0);
+            let (fr, fg, fb) = rgb(cell.fg, (br, bgc, bb));
+            writeln!(
+                out,
+                "{x}\t{y}\t{fr}\t{fg}\t{fb}\t{br}\t{bgc}\t{bb}\t{}",
+                cell.symbol()
+            )?;
+        }
     }
     Ok(())
 }
@@ -238,16 +295,26 @@ fn sample_data(st: &mut AppState) {
             ("kernel_task".into(), 2.0, 120_000_000),
         ],
     };
-    // Staggered identical samples so the delayed interpolation has data to
-    // read at `now - EQ_DELAY`.
-    let pc = st.system.per_core.clone();
+    // Staggered, gently-varying samples (~16 s of history) so the delayed
+    // interpolation has real data to read across the whole GRAPH_WINDOW — the
+    // snapshot then shows the smooth scrolling curves, not flat lines.
+    let base = st.system.per_core.clone();
     let now = Instant::now();
-    for k in [4u64, 3, 2, 1, 0] {
+    for k in (0..16u64).rev() {
         let ts = now.checked_sub(Duration::from_secs(k)).unwrap_or(now);
-        st.cpu_samples.push_back((ts, pc.clone()));
-        st.net_samples.push_back((ts, 2_400_000.0));
+        let ph = k as f32 * 0.5;
+        let cores: Vec<f32> = base
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v + 18.0 * (ph + i as f32 * 0.6).sin()).clamp(0.0, 100.0))
+            .collect();
+        st.cpu_samples.push_back((ts, cores));
+        let net = (2_400_000.0 * (1.0 + 0.6 * (ph as f64 * 0.8).sin())).max(1000.0) as f32;
+        st.net_samples.push_back((ts, net));
+        let gpu = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
+        let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
         st.silicon_samples
-            .push_back((ts, vec![31.0, 18.4, 58.0, 52.0, 9.2, 3.1, 55.6, 41.0, 23.0, 0.2]));
+            .push_back((ts, vec![gpu, 18.4, 58.0, 52.0, 9.2, 3.1, pwr, 41.0, 23.0, 0.2]));
     }
     for (i, v) in [12, 20, 35, 50, 41, 30, 48, 62, 55, 37].iter().enumerate() {
         let _ = i;

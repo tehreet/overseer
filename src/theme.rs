@@ -30,6 +30,20 @@ pub fn heat(t: f32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// Funky synthwave ramp for a 0..1 value: blue -> violet -> pink -> white.
+/// Used to give the Apple Silicon gauges + power wave their jazzy look.
+pub fn jazz(t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let (r, g, b) = if t < 0.40 {
+        lerp((86, 214, 255), (157, 124, 255), t / 0.40) // blue -> violet
+    } else if t < 0.75 {
+        lerp((157, 124, 255), (255, 110, 199), (t - 0.40) / 0.35) // violet -> pink
+    } else {
+        lerp((255, 110, 199), (245, 245, 255), (t - 0.75) / 0.25) // pink -> white
+    };
+    Color::Rgb(r, g, b)
+}
+
 /// Cool gradient for the karaoke wipe: cyan -> violet -> pink across a line.
 pub fn wipe(t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);

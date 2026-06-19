@@ -28,11 +28,132 @@ fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, u: f32) -> f32 {
         + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u3)
 }
 
-/// Shared sine-flow pattern (0..1) for the equalizer panels. `phase` desyncs
-/// each bar. Lower frequencies here = gentler, slower undulation across the
-/// whole spectrum — tune these two numbers to taste.
-fn eq_flow(t: f64, phase: f64) -> f32 {
-    (((t * 1.6 + phase).sin() * 0.5 + 0.5) * ((t * 2.7 + phase * 1.7).sin() * 0.5 + 0.5)) as f32
+/// How wide a time window the scrolling area-graphs show, ending at
+/// `now - EQ_DELAY`. We sample one delay-interpolated point per column, so the
+/// curve glides continuously left at frame rate instead of stepping once per
+/// real sample — honest data, buttery motion.
+const GRAPH_WINDOW: Duration = Duration::from_millis(12_000);
+
+/// Delayed Catmull-Rom value of channel `ch` from a multi-channel sample buffer
+/// at `target` time (companion to `sampled_scalar` / `sampled_cores`).
+fn sampled_channel(samples: &VecDeque<(Instant, Vec<f32>)>, ch: usize, target: Instant) -> f32 {
+    let m = samples.len();
+    if m == 0 {
+        return 0.0;
+    }
+    let g = |k: usize| samples[k].1.get(ch).copied().unwrap_or(0.0);
+    if m == 1 || target <= samples[0].0 {
+        return g(0);
+    }
+    if target >= samples[m - 1].0 {
+        return g(m - 1);
+    }
+    let mut i = m - 2;
+    for j in 0..m - 1 {
+        if samples[j].0 <= target && target < samples[j + 1].0 {
+            i = j;
+            break;
+        }
+    }
+    let span = (samples[i + 1].0 - samples[i].0).as_secs_f32().max(1e-3);
+    let u = ((target - samples[i].0).as_secs_f32() / span).clamp(0.0, 1.0);
+    let i0 = i.saturating_sub(1);
+    let i3 = (i + 2).min(m - 1);
+    catmull(g(i0), g(i), g(i + 1), g(i3), u).max(0.0)
+}
+
+/// Build a `w`-wide series, one delay-interpolated point per column spanning
+/// `GRAPH_WINDOW` and ending at `now - EQ_DELAY`. `sample` reads the buffer at a
+/// target time; `norm` maps the raw value into 0..1 for plotting.
+fn series<T>(buf: &T, w: usize, sample: impl Fn(&T, Instant) -> f32, norm: impl Fn(f32) -> f32) -> Vec<f32> {
+    if w == 0 {
+        return Vec::new();
+    }
+    let end = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
+    let step = GRAPH_WINDOW.as_secs_f32() / w as f32;
+    (0..w)
+        .map(|x| {
+            let back = Duration::from_secs_f32((w - 1 - x) as f32 * step);
+            let target = end.checked_sub(back).unwrap_or(end);
+            norm(sample(buf, target))
+        })
+        .collect()
+}
+
+/// How an area graph colours its fill.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// Per-column flame: green→red by that column's own height.
+    Heat,
+    /// One hue, dim at the baseline → vivid at the crest.
+    Tint(ratatui::style::Color),
+    /// Funky synthwave bands: blue→violet→pink→white up the height.
+    Jazz,
+}
+
+/// Render a buttery, continuously-scrolling filled area graph into `area`.
+/// `vals` holds one normalized value (0..1) per column, oldest→newest. The fill
+/// is a vertical gradient — dim at the baseline, vivid at the crest — so spikes
+/// glow; the top edge uses 1/8 vertical blocks for sub-cell smoothness.
+fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
+    use ratatui::style::Color;
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w == 0 || h == 0 || vals.is_empty() {
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    for row in 0..h {
+        let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
+        let crest = ((r_bot + 0.5) / h as f32).clamp(0.0, 1.0);
+        // Run-length merge same-coloured cells so each row is a few spans.
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_col: Option<Color> = None;
+        for x in 0..w {
+            let v = vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let fh = v * h as f32; // fill height in rows
+            let lit = fh > r_bot;
+            let ch = if !lit {
+                ' '
+            } else if fh >= r_bot + 1.0 {
+                '█'
+            } else {
+                c::vblock(fh - r_bot)
+            };
+            let cell_col = if !lit {
+                None
+            } else {
+                let base = match fill {
+                    Fill::Heat => c::heat(v),
+                    Fill::Tint(col) => col,
+                    Fill::Jazz => c::jazz(crest),
+                };
+                Some(c::blend(c::BG, base, 0.28 + 0.72 * crest))
+            };
+            if cell_col == run_col {
+                run.push(ch);
+            } else {
+                if !run.is_empty() {
+                    let prev = std::mem::take(&mut run);
+                    spans.push(match run_col {
+                        Some(col) => Span::styled(prev, Style::default().fg(col)),
+                        None => Span::raw(prev),
+                    });
+                }
+                run.push(ch);
+                run_col = cell_col;
+            }
+        }
+        if !run.is_empty() {
+            spans.push(match run_col {
+                Some(col) => Span::styled(run, Style::default().fg(col)),
+                None => Span::raw(run),
+            });
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Scalar version of the delayed Catmull-Rom interpolation (for net energy).
@@ -128,9 +249,9 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
         ])
         .split(body[0]);
 
-    cpu_eq_panel(f, left[0], s, t);
-    resources_panel(f, left[1], s, t);
-    silicon_panel(f, left[2], s);
+    cpu_eq_panel(f, left[0], s);
+    resources_panel(f, left[1], s);
+    silicon_panel(f, left[2], s, t);
     claude_panel(f, left[3], s);
     git_panel(f, left[4], s);
     weather_panel(f, left[5], s);
@@ -143,13 +264,62 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
 
     now_playing(f, right[0], s, t);
     // Until the first music poll lands, show the (neutral) lyrics panel so we
-    // never flash the pulse before the real state is known. After that:
-    // actively playing → lyrics; paused/stopped/idle → ambient system pulse.
+    // never flash the wrong thing before the real state is known. After that:
+    // actively playing → lyrics; paused/stopped/idle → live system graphs.
     if !s.music.polled || (s.music.playing && !s.music.track.is_empty()) {
         lyrics_panel(f, right[1], s);
     } else {
-        pulse_panel(f, right[1], s, t);
+        system_panel(f, right[1], s);
     }
+}
+
+/// A horizontal gauge: a coloured filled portion, then plain background for the
+/// remainder. The unfilled track is spaces (no glyph), so it vanishes into the
+/// terminal background like the CPU bars' empty space — the spaces still hold
+/// the width so trailing text stays aligned.
+fn bar_spans(frac: f32, width: usize, color: ratatui::style::Color) -> Vec<Span<'static>> {
+    let frac = frac.clamp(0.0, 1.0) as f64;
+    let eighths = (frac * width as f64 * 8.0).round() as usize;
+    let full = (eighths / 8).min(width);
+    let rem = eighths % 8;
+    let mut fill = "█".repeat(full);
+    let mut drawn = full;
+    if drawn < width && rem > 0 {
+        fill.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][rem]);
+        drawn += 1;
+    }
+    vec![
+        Span::styled(fill, Style::default().fg(color)),
+        Span::raw(" ".repeat(width.saturating_sub(drawn))),
+    ]
+}
+
+/// Render `text` with a soft sheen of light that glides smoothly across it — a
+/// narrow bright band (toward pink/white) sweeps left→right over an otherwise
+/// calm base colour, so stat readouts shimmer like brushed metal. `row` offsets
+/// the sweep per line so stacked rows don't shimmer in lockstep. Per-character
+/// truecolor blend → buttery, and the band wraps so it never pops.
+fn shimmer_text(text: &str, t: f64, row: f32) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1);
+    let head = ((t * 0.22 + row as f64 * 0.18).rem_euclid(1.0)) as f32; // 0..1 sweep
+    let sheen = c::jazz(0.88); // pink-white glint
+    let mut spans = Vec::with_capacity(n);
+    for (i, ch) in chars.iter().enumerate() {
+        if *ch == ' ' {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+        let p = i as f32 / n as f32;
+        let mut d = (p - head).abs();
+        if d > 0.5 {
+            d = 1.0 - d; // wrap so the glint is continuous
+        }
+        let b = (-(d * d) / (2.0 * 0.07 * 0.07)).exp(); // narrow bright band 0..1
+        let col = c::blend(c::DIM, sheen, b); // calm base -> glint
+        spans.push(Span::styled(ch.to_string(), Style::default().fg(col)));
+    }
+    Line::from(spans)
 }
 
 fn panel(title: &str, hot: bool) -> Block<'_> {
@@ -245,12 +415,11 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Half-width CPU equalizer: one vertical bar per core, height = utilization.
-/// Each core is a column that *flows* with the same sine motion as the
-/// now-playing / net EQ, but its amplitude is that core's real (delay-
-/// interpolated) load — busy cores dance tall, idle cores stay low. Smooth
-/// like the music EQ, still honest to the data. Green→red gradient.
-fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+/// Half-width CPU equalizer: one vertical bar per core, height = that core's
+/// real, delay-interpolated load. The Catmull-Rom playback (sampled at
+/// `now - EQ_DELAY`, advanced every frame) makes the bars glide smoothly
+/// between the 1 Hz samples — honest data, buttery motion. Green→red gradient.
+fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
     let vals = sampled_cores(&s.cpu_samples, target);
     let n = vals.len();
@@ -265,16 +434,9 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         return;
     }
 
-    // Flowing per-core heights: amplitude = real load, motion = sine (like the
-    // music EQ). Each core gets its own phase so the spectrum dances.
-    let heights: Vec<f32> = (0..n)
-        .map(|core| {
-            let energy = (vals[core] / 100.0).clamp(0.0, 1.0);
-            let amp = 0.08 + 0.92 * energy;
-            let phase = core as f64 * 0.7;
-            amp * (0.3 + 0.7 * eq_flow(t, phase))
-        })
-        .collect();
+    // Per-core heights = real, delay-interpolated load. No fabricated motion;
+    // the smoothness is the continuous Catmull-Rom playback between samples.
+    let heights: Vec<f32> = (0..n).map(|core| (vals[core] / 100.0).clamp(0.0, 1.0)).collect();
 
     let bar_rows = (inner.height as usize).saturating_sub(1); // reserve last row for labels
     let iw = inner.width as usize;
@@ -290,7 +452,6 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         let row_bot = (bar_rows - r - 1) as f32 / bar_rows as f32;
         let mid = (row_top + row_bot) * 0.5;
         let color = c::heat(mid);
-        let dim = c::blend(color, c::BG, 0.7);
         let mut spans: Vec<Span> = Vec::with_capacity(n * 2 + 1);
         if lead > 0 {
             spans.push(Span::raw(" ".repeat(lead)));
@@ -307,7 +468,9 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             if glyph == ' ' {
                 spans.push(Span::raw(" ".repeat(bar_w)));
             } else {
-                let st = Style::default().fg(if glyph == '█' { color } else { dim });
+                // Bright crest (no dark cap): the partial block already conveys
+                // the sub-cell height; colour it the same as a full cell.
+                let st = Style::default().fg(color);
                 spans.push(Span::styled(glyph.to_string().repeat(bar_w), st));
             }
             if core < n {
@@ -337,7 +500,7 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn resources_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = panel("MEM · DISK · NET", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -359,22 +522,20 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let bw = iw.saturating_sub(30).clamp(8, 32);
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    lines.push(Line::from(vec![
-        Span::styled("mem  ", Style::default().fg(c::DIM)),
-        Span::styled(c::bar(memf, bw), Style::default().fg(c::heat(memf))),
-        Span::styled(
-            format!(" {:>3.0}%  {} / {}", memf * 100.0, fmt_bytes(s.system.mem_used), fmt_bytes(s.system.mem_total)),
-            Style::default().fg(c::TEXT),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("disk ", Style::default().fg(c::DIM)),
-        Span::styled(c::bar(diskf, bw), Style::default().fg(c::heat(diskf))),
-        Span::styled(
-            format!(" {:>3.0}%  {} / {}", diskf * 100.0, fmt_bytes(s.system.disk_used), fmt_bytes(s.system.disk_total)),
-            Style::default().fg(c::TEXT),
-        ),
-    ]));
+    let mut mem_line = vec![Span::styled("mem  ", Style::default().fg(c::DIM))];
+    mem_line.extend(bar_spans(memf, bw, c::heat(memf)));
+    mem_line.push(Span::styled(
+        format!(" {:>3.0}%  {} / {}", memf * 100.0, fmt_bytes(s.system.mem_used), fmt_bytes(s.system.mem_total)),
+        Style::default().fg(c::TEXT),
+    ));
+    lines.push(Line::from(mem_line));
+    let mut disk_line = vec![Span::styled("disk ", Style::default().fg(c::DIM))];
+    disk_line.extend(bar_spans(diskf, bw, c::heat(diskf)));
+    disk_line.push(Span::styled(
+        format!(" {:>3.0}%  {} / {}", diskf * 100.0, fmt_bytes(s.system.disk_used), fmt_bytes(s.system.disk_total)),
+        Style::default().fg(c::TEXT),
+    ));
+    lines.push(Line::from(disk_line));
     lines.push(Line::from(vec![
         Span::styled("net  ", Style::default().fg(c::DIM)),
         Span::styled("▼ ", Style::default().fg(c::GREEN)),
@@ -383,54 +544,29 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Span::styled(format!("{:>10}", fmt_rate(s.system.net_tx_bps)), Style::default().fg(c::PINK)),
     ]));
 
-    // Net visualizer: a music-EQ-style spectrum whose energy swells/recedes
-    // with real (delay-interpolated) throughput, but whose motion is sine-
-    // smooth — so it flows like the now-playing EQ.
-    let eq_rows = (inner.height as usize).saturating_sub(lines.len());
-    if eq_rows >= 1 {
-        let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
-        let bps = sampled_scalar(&s.net_samples, target);
-        let energy = ((bps.max(1.0).log10() - 3.0) / 4.0).clamp(0.0, 1.0); // ~1KB/s..10MB/s
-        let amp = 0.18 + 0.82 * energy;
+    // Top rows: the mem/disk/net text. Bottom rows: a real, continuously-
+    // scrolling area graph of total throughput (delay-interpolated, log-scaled
+    // ~1 KB/s..10 MB/s). Honest data, frame-smooth motion.
+    let text_h = lines.len() as u16;
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: text_h },
+    );
 
-        let bar_w = 2usize;
-        let gap = 1usize;
-        let nbars = (iw + gap) / (bar_w + gap);
-        for r in 0..eq_rows {
-            let row_top = (eq_rows - r) as f32 / eq_rows as f32;
-            let row_bot = (eq_rows - r - 1) as f32 / eq_rows as f32;
-            let mid = (row_top + row_bot) * 0.5;
-            let col = c::blend(c::GREEN, c::CYAN, mid);
-            let dim = c::blend(col, c::BG, 0.7);
-            let mut spans: Vec<Span> = Vec::with_capacity(nbars * 2);
-            for b in 0..nbars {
-                let phase = b as f64 * 0.6;
-                let h = amp * (0.3 + 0.7 * eq_flow(t, phase));
-                let glyph = if h >= row_top {
-                    '█'
-                } else if h > row_bot {
-                    c::vblock((h - row_bot) / (row_top - row_bot))
-                } else {
-                    ' '
-                };
-                if glyph == ' ' {
-                    spans.push(Span::raw(" ".repeat(bar_w)));
-                } else {
-                    spans.push(Span::styled(
-                        glyph.to_string().repeat(bar_w),
-                        Style::default().fg(if glyph == '█' { col } else { dim }),
-                    ));
-                }
-                spans.push(Span::raw(" ".repeat(gap)));
-            }
-            lines.push(Line::from(spans));
-        }
+    let plot_h = inner.height.saturating_sub(text_h);
+    if plot_h >= 1 {
+        let plot = Rect { x: inner.x, y: inner.y + text_h, width: inner.width, height: plot_h };
+        let vals = series(
+            &s.net_samples,
+            plot.width as usize,
+            sampled_scalar,
+            |bps| ((bps.max(1.0).log10() - 3.0) / 4.0).clamp(0.0, 1.0),
+        );
+        area_graph(f, plot, &vals, Fill::Tint(c::CYAN));
     }
-
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState) {
+fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let hot = s.silicon.gpu_temp_c > 80.0 || s.silicon.cpu_temp_c > 90.0;
     let block = panel("APPLE SILICON", hot);
     let inner = block.inner(area);
@@ -457,39 +593,79 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let ecpu = g(7, si.ecpu_pct);
     let pcpu = g(8, si.pcpu_pct);
 
-    let bw = (inner.width as usize).saturating_sub(24).clamp(8, 30);
+    // Gauges in a fixed-width column on the left; the smooth power-draw graph
+    // fills everything to the right edge so it sits snug against the gauges
+    // (no awkward gap) and reads the same width as the NET wave.
+    let gauge_w = 38u16.min(inner.width);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(gauge_w), Constraint::Min(0)])
+        .split(inner);
+    let gauge_area = cols[0];
+    let graph_area = cols[1];
+
+    let bw = (gauge_area.width as usize).saturating_sub(24).clamp(8, 30);
     let tnorm = |t: f32| ((t - 30.0) / 70.0).clamp(0.0, 1.0); // 30–100 °C → 0–1
     let gpu_share = if spw > 0.1 { (gpw / spw * 100.0).clamp(0.0, 100.0) } else { 0.0 };
 
     // label, value bar (0..1), bar color, trailing text
     let gauge = |label: &str, frac: f32, col: ratatui::style::Color, tail: String| {
-        Line::from(vec![
-            Span::styled(format!("{label:<6} "), Style::default().fg(c::DIM)),
-            Span::styled(c::bar(frac, bw), Style::default().fg(col)),
-            Span::styled(tail, Style::default().fg(c::TEXT)),
-        ])
+        let mut spans = vec![Span::styled(format!("{label:<6} "), Style::default().fg(c::DIM))];
+        spans.extend(bar_spans(frac, bw, col));
+        spans.push(Span::styled(tail, Style::default().fg(c::TEXT)));
+        Line::from(spans)
     };
 
+    // Jazzy synthwave bars: blue→violet→pink→white by fill, so the whole box
+    // reads purple/pink/blue/white. Magnitude still scans (low=blue, high=white).
     let lines = vec![
-        gauge("gpu", gpu / 100.0, c::heat(gpu / 100.0), format!(" {:>3.0}%  {} MHz", gpu, si.gpu_freq_mhz)),
-        gauge("e-cpu", ecpu / 100.0, c::heat(ecpu / 100.0), format!(" {:>3.0}%  {} MHz", ecpu, si.ecpu_freq_mhz)),
-        gauge("p-cpu", pcpu / 100.0, c::heat(pcpu / 100.0), format!(" {:>3.0}%  {} MHz", pcpu, si.pcpu_freq_mhz)),
-        Line::from(vec![
-            Span::styled("power  ", Style::default().fg(c::DIM)),
-            Span::styled(c::bar((spw / 120.0).clamp(0.0, 1.0), bw), Style::default().fg(c::YELLOW)),
-            Span::styled(format!(" {:>4.1} W", spw), Style::default().fg(c::YELLOW).add_modifier(Modifier::BOLD)),
-        ]),
+        gauge("gpu", gpu / 100.0, c::jazz(gpu / 100.0), format!(" {:>3.0}%  {} MHz", gpu, si.gpu_freq_mhz)),
+        gauge("e-cpu", ecpu / 100.0, c::jazz(ecpu / 100.0), format!(" {:>3.0}%  {} MHz", ecpu, si.ecpu_freq_mhz)),
+        gauge("p-cpu", pcpu / 100.0, c::jazz(pcpu / 100.0), format!(" {:>3.0}%  {} MHz", pcpu, si.pcpu_freq_mhz)),
+        {
+            let pf = (spw / 120.0).clamp(0.0, 1.0);
+            let mut spans = vec![Span::styled("power  ", Style::default().fg(c::DIM))];
+            spans.extend(bar_spans(pf, bw, c::jazz(pf)));
+            spans.push(Span::styled(format!(" {:>4.1} W", spw), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            Line::from(spans)
+        },
         Line::from(""), // padding under the power bar
         Line::from(vec![
             Span::styled("       gpu ", Style::default().fg(c::FAINT)),
             Span::styled(format!("{gpw:.1} W", ), Style::default().fg(c::DIM)),
-            Span::styled(format!("   ·   {gpu_share:.0}% of system draw"), Style::default().fg(c::FAINT)),
+            Span::styled(format!("  ·  {gpu_share:.0}% of draw"), Style::default().fg(c::FAINT)),
         ]),
         Line::from(""),
-        gauge("cpu °C", tnorm(ctemp), c::heat(tnorm(ctemp)), format!(" {ctemp:>3.0}°C")),
-        gauge("gpu °C", tnorm(gtemp), c::heat(tnorm(gtemp)), format!(" {gtemp:>3.0}°C")),
+        gauge("cpu °C", tnorm(ctemp), c::jazz(tnorm(ctemp)), format!(" {ctemp:>3.0}°C")),
+        gauge("gpu °C", tnorm(gtemp), c::jazz(tnorm(gtemp)), format!(" {gtemp:>3.0}°C")),
     ];
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), gauge_area);
+
+    // Right side: a shimmering SoC power-breakdown stat block, then the live
+    // system-power draw scrolling smoothly over GRAPH_WINDOW (jazz gradient).
+    if graph_area.width > 6 {
+        let g = graph_area;
+        let si = &s.silicon;
+        let stats = [
+            format!("cpu {:>4.1}W   ane {:>4.1}W", si.cpu_power_w, si.ane_power_w),
+            format!("gpu {:>4.1}W   pkg {:>4.1}W", si.gpu_power_w, si.all_power_w),
+        ];
+        for (i, line) in stats.iter().enumerate() {
+            f.render_widget(
+                Paragraph::new(shimmer_text(line, t, i as f32)),
+                Rect { x: g.x, y: g.y + i as u16, width: g.width, height: 1 },
+            );
+        }
+        let top = stats.len() as u16 + 1; // stats + one blank row
+        let plot = Rect { x: g.x, y: g.y + top, width: g.width, height: g.height.saturating_sub(top) };
+        let vals = series(
+            &s.silicon_samples,
+            plot.width as usize,
+            |buf, t| sampled_channel(buf, 6, t),
+            |w| (w / 120.0).clamp(0.0, 1.0),
+        );
+        area_graph(f, plot, &vals, Fill::Jazz);
+    }
 }
 
 fn claude_panel(f: &mut Frame, area: Rect, s: &AppState) {
@@ -590,11 +766,9 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Span::styled(m.album.clone(), Style::default().fg(c::DIM)),
     ]);
     let bw = (info.width as usize).saturating_sub(16).clamp(8, 90);
-    let progress_spans = vec![
-        Span::styled(format!("{} ", fmt_clock(pos)), Style::default().fg(c::CYAN)),
-        Span::styled(c::bar(frac, bw), Style::default().fg(c::PINK)),
-        Span::styled(format!(" {}", fmt_clock(m.duration)), Style::default().fg(c::DIM)),
-    ];
+    let mut progress_spans = vec![Span::styled(format!("{} ", fmt_clock(pos)), Style::default().fg(c::CYAN))];
+    progress_spans.extend(bar_spans(frac, bw, c::PINK));
+    progress_spans.push(Span::styled(format!(" {}", fmt_clock(m.duration)), Style::default().fg(c::DIM)));
     f.render_widget(
         Paragraph::new(vec![
             title,
@@ -610,91 +784,63 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     );
 }
 
-/// Ambient "system pulse": concentric sonar rings expanding from the center,
-/// their brightness and speed driven by live CPU + GPU + network energy. Fills
-/// the right side whenever music isn't playing.
-fn pulse_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
-    use ratatui::style::Color;
-
-    // Smooth, delay-interpolated energy from the same buffers the EQs use.
-    let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
-    let cpuv = sampled_cores(&s.cpu_samples, target);
-    let cpu = if cpuv.is_empty() {
-        s.system.cpu_overall
-    } else {
-        cpuv.iter().sum::<f32>() / cpuv.len() as f32
-    };
-    let gpu = sampled_cores(&s.silicon_samples, target)
-        .first()
-        .copied()
-        .unwrap_or(s.silicon.gpu_pct);
-    let netbps = sampled_scalar(&s.net_samples, target);
-    let net_e = ((netbps.max(1.0).log10() - 3.0) / 4.0).clamp(0.0, 1.0);
-    let activity = (cpu / 100.0 * 0.45 + gpu / 100.0 * 0.35 + net_e * 0.20).clamp(0.0, 1.0);
-    let energy = 0.32 + 0.68 * activity;
-
-    let title = format!("SYSTEM PULSE      cpu {cpu:>2.0}%    gpu {gpu:>2.0}%");
+/// Right-column filler when music isn't playing: three buttery, continuously-
+/// scrolling area graphs of real SoC telemetry — CPU load, GPU load, and system
+/// power over the last GRAPH_WINDOW. Honest data, frame-smooth motion (the same
+/// delay-interpolated playback the gauges use).
+fn system_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let si = &s.silicon;
+    let cpu = if si.fresh { si.cpu_pct } else { s.system.cpu_overall };
+    let title = format!("SYSTEM      cpu {cpu:>2.0}%    gpu {:>2.0}%    {:.0} W", si.gpu_pct, si.sys_power_w);
     let block = panel(&title, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let (w, h) = (inner.width as i32, inner.height as i32);
-    if w < 4 || h < 2 {
+    if inner.height < 3 || inner.width < 8 {
         return;
     }
 
-    let cx = (w as f32 - 1.0) / 2.0;
-    let cy = (h as f32 - 1.0) / 2.0;
-    let maxd = ((cx * cx) + (cy * 2.0) * (cy * 2.0)).sqrt().max(1.0);
-    let speed = 1.6 + 4.5 * energy; // rings expand faster when busy
-    let density = 0.6f32; // ring spacing
-    let tf = t as f32;
-    let quant = |c: u8| c & 0xF0; // coarsen colours so runs merge → fewer spans
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
+        .split(inner);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(h as usize);
-    for y in 0..h {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut run = String::new();
-        let mut run_col: Option<Color> = None;
-        for x in 0..w {
-            let dx = x as f32 - cx;
-            let dy = (y as f32 - cy) * 2.0; // cells are ~2× taller than wide
-            let d = (dx * dx + dy * dy).sqrt();
-            let wave = (d * density - tf * speed).sin();
-            let b = ((wave - 0.15) / 0.85).clamp(0.0, 1.0);
-            let inten = b * b * energy;
-            let cell_col = if inten < 0.05 {
-                None
-            } else {
-                let rc = c::wipe((d / maxd).clamp(0.0, 1.0));
-                match c::blend(c::BG, rc, inten.min(1.0)) {
-                    Color::Rgb(r, g, bl) => Some(Color::Rgb(quant(r), quant(g), quant(bl))),
-                    other => Some(other),
-                }
-            };
-            let ch = if cell_col.is_none() { ' ' } else { '█' };
-            if cell_col == run_col {
-                run.push(ch);
-            } else {
-                if !run.is_empty() {
-                    let prev = std::mem::take(&mut run);
-                    spans.push(match run_col {
-                        Some(col) => Span::styled(prev, Style::default().fg(col)),
-                        None => Span::raw(prev),
-                    });
-                }
-                run.push(ch);
-                run_col = cell_col;
-            }
+    let draw = |f: &mut Frame, r: Rect, label: &str, vals: Vec<f32>, fill: Fill| {
+        if r.height < 2 {
+            return;
         }
-        if !run.is_empty() {
-            spans.push(match run_col {
-                Some(col) => Span::styled(run, Style::default().fg(col)),
-                None => Span::raw(run),
-            });
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(Paragraph::new(lines), inner);
+        f.render_widget(
+            Paragraph::new(Span::styled(label.to_string(), Style::default().fg(c::FAINT))),
+            Rect { x: r.x, y: r.y, width: r.width, height: 1 },
+        );
+        let plot = Rect { x: r.x, y: r.y + 1, width: r.width, height: r.height - 1 };
+        area_graph(f, plot, &vals, fill);
+    };
+
+    let w = rows[0].width as usize;
+    let cpu_vals = series(
+        &s.cpu_samples,
+        w,
+        |buf, t| {
+            let v = sampled_cores(buf, t);
+            if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
+        },
+        |x| (x / 100.0).clamp(0.0, 1.0),
+    );
+    draw(f, rows[0], "cpu load", cpu_vals, Fill::Jazz);
+    draw(
+        f,
+        rows[1],
+        "gpu load",
+        series(&s.silicon_samples, w, |buf, t| sampled_channel(buf, 0, t), |x| (x / 100.0).clamp(0.0, 1.0)),
+        Fill::Jazz,
+    );
+    draw(
+        f,
+        rows[2],
+        "power",
+        series(&s.silicon_samples, w, |buf, t| sampled_channel(buf, 6, t), |x| (x / 120.0).clamp(0.0, 1.0)),
+        Fill::Jazz,
+    );
 }
 
 /// Render the album-art thumbnail as truecolor half-blocks (two vertical
