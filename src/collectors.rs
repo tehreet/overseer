@@ -1436,7 +1436,12 @@ pub fn spawn_messages(shared: Shared) {
     thread::spawn(move || {
         let Some(home) = dirs::home_dir() else { return };
         let db = home.join("Library/Messages/chat.db");
-        let uri = format!("file:{}?immutable=1", db.display());
+        // Read-only (NOT immutable): chat.db is a live WAL database. `immutable=1`
+        // tells SQLite to ignore the -wal file, so freshly-received messages that
+        // haven't been checkpointed into the main db yet stay invisible and the
+        // card shows a stale snapshot. `mode=ro` reads the WAL in place (no 627MB
+        // copy, no write lock on Messages.app) so the latest messages show.
+        let uri = format!("file:{}?mode=ro", db.display());
 
         // Network agent + per-ROWID summary cache, reused across polls.
         let agent = ureq::AgentBuilder::new()
@@ -1512,7 +1517,7 @@ pub fn diag_messages() {
         return;
     };
     let db = home.join("Library/Messages/chat.db");
-    let uri = format!("file:{}?immutable=1", db.display());
+    let uri = format!("file:{}?mode=ro", db.display()); // read WAL (see spawn_messages)
     println!("studioboard --diag-msg\n");
     println!("chat.db: {}", db.display());
 
