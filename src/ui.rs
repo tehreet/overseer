@@ -269,10 +269,9 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             Constraint::Length(9),  // [1] MEM · DISK · NET
             Constraint::Length(11), // [2] APPLE SILICON
             Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
-            Constraint::Length(7),  // [4] CLAUDE CODE   (compact: token windows + big graph)
-            Constraint::Length(6),  // [5] GIT
-            Constraint::Length(8),  // [6] WEATHER       (jazzed, +data)
-            Constraint::Min(9),     // [7] iMESSAGE      (Builder 2 fills this)
+            Constraint::Length(9),  // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
+            Constraint::Length(8),  // [5] WEATHER       (jazzed, +data)
+            Constraint::Min(9),     // [6] iMESSAGE
         ])
         .split(body[0]);
 
@@ -280,10 +279,9 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     resources_panel(f, left[1], s);
     silicon_panel(f, left[2], s, t);
     proc_panel(f, left[3], s);
-    claude_panel(f, left[4], s);
-    git_panel(f, left[5], s);
-    weather_panel(f, left[6], s);
-    messages_panel(f, left[7], s, t);
+    robots_panel(f, left[4], s, t);
+    weather_panel(f, left[5], s);
+    messages_panel(f, left[6], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
@@ -721,62 +719,143 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     }
 }
 
-fn claude_panel(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = panel("CLAUDE CODE", false);
+/// Merged "ROBOTS WORKING" card: left column = Claude token throughput
+/// (today/week/month) + 30-day sessions + the burn bar chart; right column =
+/// the most-recently-active local git branch's pulse. A shimmery jazz divider
+/// sweeps between them.
+fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    let block = panel("ROBOTS WORKING", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let u = &s.usage;
+    let g = &s.git;
+    if inner.height < 2 || inner.width < 24 {
+        return;
+    }
 
+    let h = inner.height as usize;
+    // Left column kept narrow so the divider sits left and the commit message
+    // (right column) gets the room.
+    let lw = ((inner.width as usize * 34 / 100).max(16))
+        .min((inner.width as usize).saturating_sub(24)) as u16;
+    let div_x = inner.x + lw + 1; // 1-col gutter, then divider
+    let rx = div_x + 2; // 1-col gutter after the divider
+    let rw = (inner.x + inner.width).saturating_sub(rx);
+
+    // ----- shimmery jazz divider: a base blue→pink gradient down the line with
+    // a bright white-pink glint that sweeps downward over time -----
+    let head = ((t * 0.5).rem_euclid(1.0)) as f32;
+    for r in 0..h {
+        let p = r as f32 / h.max(1) as f32;
+        let mut d = (p - head).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        let glint = (-(d * d) / (2.0 * 0.13 * 0.13)).exp();
+        let col = c::blend(c::jazz(0.22 + 0.58 * p), c::jazz(0.97), glint);
+        f.render_widget(
+            Paragraph::new(Span::styled("│", Style::default().fg(col))),
+            Rect { x: div_x, y: inner.y + r as u16, width: 1, height: 1 },
+        );
+    }
+
+    // ----- left: token windows + burn bar chart -----
     if !u.fresh {
         f.render_widget(
             Paragraph::new(Span::styled("scanning ~/.claude…", Style::default().fg(c::DIM))),
-            inner,
+            Rect { x: inner.x, y: inner.y, width: lw, height: 1 },
+        );
+    } else {
+        let tot_today = u.today_input + u.today_output + u.today_cache_read + u.today_cache_write;
+        let row = |label: &str, val: String, col| {
+            Line::from(vec![
+                Span::styled(format!("{label:<8} "), Style::default().fg(c::DIM)),
+                Span::styled(val, Style::default().fg(col).add_modifier(Modifier::BOLD)),
+            ])
+        };
+        let text = vec![
+            row("today", fmt_tokens(tot_today), c::CYAN),
+            row("week", fmt_tokens(u.tokens_7d), c::ACCENT),
+            row("month", fmt_tokens(u.tokens_30d), c::PINK),
+            row("sessions", format!("{}", u.sessions_30d), c::TEXT),
+        ];
+        let tlen = text.len() as u16;
+        f.render_widget(
+            Paragraph::new(text),
+            Rect { x: inner.x, y: inner.y, width: lw, height: tlen.min(inner.height) },
+        );
+        // The loved burn bar chart, pinned to the bottom row of the left column.
+        if inner.height > tlen {
+            // "burn" label padded to the value-label width (8+1) so the bars
+            // begin in the same column as the today/week/month numbers above.
+            let mut burn = vec![Span::styled(format!("{:<8} ", "burn"), Style::default().fg(c::DIM))];
+            burn.extend(jazz_spark(&u.hourly, (lw as usize).saturating_sub(9)));
+            f.render_widget(
+                Paragraph::new(Line::from(burn)),
+                Rect { x: inner.x, y: inner.y + inner.height - 1, width: lw, height: 1 },
+            );
+        }
+    }
+
+    // ----- right: the active git branch's pulse -----
+    if rw < 8 {
+        return;
+    }
+    let rwn = rw as usize;
+    if !g.fresh || !g.ok {
+        let msg = if !g.fresh { "reading repo…" } else { "no git repo" };
+        f.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(c::DIM))),
+            Rect { x: rx, y: inner.y, width: rw, height: 1 },
         );
         return;
     }
-    if inner.height < 2 || inner.width < 8 {
-        return;
+    // Branch row sits flush at the right column's left edge (no glyph/pad) so the
+    // repo/branch lines up exactly with the commit hash below it.
+    let mut branch_spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    if !g.repo.is_empty() {
+        let r = format!("{}/", g.repo);
+        used += r.chars().count();
+        branch_spans.push(Span::styled(r, Style::default().fg(c::DIM)));
     }
-    let tot_today = u.today_input + u.today_output + u.today_cache_read + u.today_cache_write;
-
-    // Two tight text rows: token windows (today / 7d / 30d) + 30-day sessions.
-    let tokens = Line::from(vec![
-        Span::styled("today ", Style::default().fg(c::DIM)),
-        Span::styled(fmt_tokens(tot_today), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("   7d ", Style::default().fg(c::DIM)),
-        Span::styled(fmt_tokens(u.tokens_7d), Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled("   30d ", Style::default().fg(c::DIM)),
-        Span::styled(fmt_tokens(u.tokens_30d), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)),
+    branch_spans.push(Span::styled(
+        truncate(&g.branch, rwn.saturating_sub(used).max(3)),
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    ));
+    let branch = Line::from(branch_spans);
+    let hashw = g.last_hash.chars().count() + 1;
+    let commit = Line::from(vec![
+        Span::styled(format!("{} ", g.last_hash), Style::default().fg(c::CYAN)),
+        Span::styled(truncate(&g.last_msg, rwn.saturating_sub(hashw)), Style::default().fg(c::TEXT)),
     ]);
-    let sess = Line::from(vec![
-        Span::styled("sessions ", Style::default().fg(c::DIM)),
-        Span::styled(format!("{}", u.sessions_30d), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled("  ·  rolling 30d", Style::default().fg(c::FAINT)),
+    let age = Line::from(Span::styled(
+        if g.last_rel.is_empty() { "—".to_string() } else { g.last_rel.clone() },
+        Style::default().fg(c::FAINT),
+    ));
+    // Branch activity, two metrics per row: loc · commits, then PRs · merges.
+    let loc = Line::from(vec![
+        Span::styled(format!("+{}", g.loc_added), Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" -{}", g.loc_removed), Style::default().fg(if g.loc_removed > 0 { c::RED } else { c::FAINT })),
+        Span::styled(" loc", Style::default().fg(c::FAINT)),
+        Span::styled("   ·   ", Style::default().fg(c::FAINT)),
+        Span::styled(format!("{}", g.branch_commits), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(" commits", Style::default().fg(c::DIM)),
+    ]);
+    let prm = Line::from(vec![
+        Span::styled(format!("{}", g.pr_count), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)),
+        Span::styled(" PRs", Style::default().fg(c::DIM)),
+        Span::styled("   ·   ", Style::default().fg(c::FAINT)),
+        Span::styled(
+            format!("{}", g.merges_main),
+            Style::default().fg(if g.merges_main > 0 { c::GREEN } else { c::TEXT }).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" merges → main", Style::default().fg(c::DIM)),
     ]);
     f.render_widget(
-        Paragraph::new(vec![tokens, sess]),
-        Rect { x: inner.x, y: inner.y, width: inner.width, height: 2 },
+        Paragraph::new(vec![branch, commit, age, Line::from(""), loc, prm]),
+        Rect { x: rx, y: inner.y, width: rw, height: inner.height },
     );
-
-    // The rest of the card is the (now bigger) graph: hourly token activity over
-    // the last 24h as a filled jazz area graph (auto-smoothed by area_graph).
-    let plot = Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: inner.height.saturating_sub(2) };
-    if plot.height >= 1 && plot.width > 0 {
-        let n = u.hourly.len().max(1);
-        let maxv = u.hourly.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let w = plot.width as usize;
-        let vals: Vec<f32> = (0..w)
-            .map(|x| {
-                let pos = if w > 1 { x as f32 / (w - 1) as f32 * (n - 1) as f32 } else { 0.0 };
-                let i0 = pos.floor() as usize;
-                let i1 = (i0 + 1).min(n - 1);
-                let frac = pos - i0 as f32;
-                let v = u.hourly[i0] as f32 * (1.0 - frac) + u.hourly[i1] as f32 * frac;
-                v / maxv
-            })
-            .collect();
-        area_graph(f, plot, &vals, Fill::Jazz);
-    }
 }
 
 fn now_playing(f: &mut Frame, area: Rect, s: &AppState, _t: f64) {
@@ -941,51 +1020,6 @@ fn render_art(f: &mut Frame, area: Rect, art: &crate::state::AlbumArt, matches: 
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
-}
-
-fn git_panel(f: &mut Frame, area: Rect, s: &AppState) {
-    let g = &s.git;
-    let dirty = g.ok && g.dirty > 0;
-    let block = panel("GIT · battlestation", dirty);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if !g.fresh {
-        f.render_widget(Paragraph::new(Span::styled("reading repo…", Style::default().fg(c::DIM))), inner);
-        return;
-    }
-    if !g.ok {
-        f.render_widget(Paragraph::new(Span::styled("not a git repo", Style::default().fg(c::DIM))), inner);
-        return;
-    }
-    let clean_col = if g.dirty == 0 { c::GREEN } else { c::PINK };
-    let mut head = vec![
-        Span::styled("", Style::default().fg(c::ACCENT)),
-        Span::styled(g.branch.clone(), Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
-    ];
-    if g.ahead > 0 {
-        head.push(Span::styled(format!("  ↑{}", g.ahead), Style::default().fg(c::GREEN)));
-    }
-    if g.behind > 0 {
-        head.push(Span::styled(format!("  ↓{}", g.behind), Style::default().fg(c::RED)));
-    }
-    let status = if g.dirty == 0 {
-        Line::from(Span::styled("✓ clean", Style::default().fg(c::GREEN)))
-    } else {
-        Line::from(vec![
-            Span::styled(format!("● {} dirty", g.dirty), Style::default().fg(clean_col).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("   {} staged  {} untracked", g.staged, g.untracked), Style::default().fg(c::DIM)),
-        ])
-    };
-    let last = Line::from(vec![
-        Span::styled(format!("{} ", g.last_hash), Style::default().fg(c::CYAN)),
-        Span::styled(truncate(&g.last_msg, inner.width as usize - 12), Style::default().fg(c::TEXT)),
-    ]);
-    let rel = Line::from(vec![
-        Span::styled(g.last_rel.clone(), Style::default().fg(c::FAINT)),
-        Span::styled(format!("   {} commits today", g.commits_today), Style::default().fg(c::DIM)),
-    ]);
-    f.render_widget(Paragraph::new(vec![Line::from(head), status, last, rel]), inner);
 }
 
 fn proc_panel(f: &mut Frame, area: Rect, s: &AppState) {

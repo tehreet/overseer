@@ -529,12 +529,34 @@ fn git(repo: &str, args: &[&str]) -> Option<String> {
 fn scan_git(repo: &str) -> crate::state::GitStats {
     use crate::state::GitStats;
     let mut g = GitStats { fresh: true, ..Default::default() };
-    let Some(branch) = git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]) else {
+    // The most-recently-active LOCAL branch (by last commit date), plus that
+    // branch's last commit — branch, short hash, subject, relative age — in one
+    // for-each-ref call. \x1f = unit separator so commit subjects stay intact.
+    let fmt = "--format=%(refname:short)\x1f%(objectname:short)\x1f%(contents:subject)\x1f%(committerdate:relative)";
+    let Some(line) = git(
+        repo,
+        &["for-each-ref", "--sort=-committerdate", "refs/heads", fmt, "--count=1"],
+    ) else {
         return g; // not a repo / git missing
     };
+    if line.trim().is_empty() {
+        return g;
+    }
     g.ok = true;
-    g.branch = branch;
+    g.repo = std::path::Path::new(repo)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut p = line.split('\x1f');
+    g.branch = p.next().unwrap_or("").trim().to_string();
+    g.last_hash = p.next().unwrap_or("").to_string();
+    g.last_msg = p.next().unwrap_or("").to_string();
+    g.last_rel = p.next().unwrap_or("").trim().to_string();
 
+    // Commits on that branch since midnight + working-tree dirtiness (for the hot border).
+    if let Some(n) = git(repo, &["rev-list", "--count", "--since=midnight", &g.branch]) {
+        g.commits_today = n.trim().parse().unwrap_or(0);
+    }
     if let Some(porc) = git(repo, &["status", "--porcelain"]) {
         for l in porc.lines() {
             g.dirty += 1;
@@ -545,21 +567,47 @@ fn scan_git(repo: &str) -> crate::state::GitStats {
             }
         }
     }
-    if let Some(lr) = git(repo, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
-        let mut it = lr.split_whitespace();
-        g.behind = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        g.ahead = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    // Branch activity vs the main line: commits/loc/merges this branch carries
+    // that aren't yet on origin/main (its own work). Falls back gracefully.
+    if let Some(base) = ["origin/main", "origin/master", "main", "master"]
+        .into_iter()
+        .find(|r| git(repo, &["rev-parse", "--verify", "--quiet", r]).map(|h| !h.trim().is_empty()).unwrap_or(false))
+    {
+        let range = format!("{base}..HEAD");
+        if let Some(n) = git(repo, &["rev-list", "--count", &range]) {
+            g.branch_commits = n.trim().parse().unwrap_or(0);
+        }
+        if let Some(n) = git(repo, &["rev-list", "--count", "--merges", &range]) {
+            g.merges_main = n.trim().parse().unwrap_or(0);
+        }
+        if let Some(stat) = git(repo, &["diff", "--numstat", &format!("{base}...HEAD")]) {
+            for l in stat.lines() {
+                let mut it = l.split('\t');
+                g.loc_added += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+                g.loc_removed += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+            }
+        }
     }
-    if let Some(last) = git(repo, &["log", "-1", "--format=%h\x1f%s\x1f%cr"]) {
-        let mut p = last.split('\x1f');
-        g.last_hash = p.next().unwrap_or("").to_string();
-        g.last_msg = p.next().unwrap_or("").to_string();
-        g.last_rel = p.next().unwrap_or("").to_string();
-    }
-    if let Some(n) = git(repo, &["rev-list", "--count", "--since=midnight", "HEAD"]) {
-        g.commits_today = n.parse().unwrap_or(0);
-    }
+    // PRs authored by the user (all states). Best-effort — needs gh + auth.
+    g.pr_count = gh_pr_count(repo).unwrap_or(0);
     g
+}
+
+/// Count of pull requests the user has authored on this repo (any state), via
+/// the `gh` CLI run inside the repo. None if gh is missing/unauthed/offline.
+fn gh_pr_count(repo: &str) -> Option<u32> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "list", "--author", "@me", "--state", "all", "--limit", "200", "--json",
+            "number", "--jq", "length",
+        ])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 // ---------------------------------------------------------------------------

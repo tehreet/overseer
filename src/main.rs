@@ -562,9 +562,15 @@ fn sample_data(st: &mut AppState, compose: bool) {
         ahead: 2,
         behind: 0,
         last_hash: "9a554a6".into(),
-        last_msg: "feat(macos): Hyper-layer display/KVM switching".into(),
-        last_rel: "3 days ago".into(),
-        commits_today: 4,
+        last_msg: "feat(studioboard): merge Robots Working card".into(),
+        last_rel: "16 minutes ago".into(),
+        commits_today: 7,
+        pr_count: 0,
+        repo: "battlestation".into(),
+        loc_added: 10,
+        loc_removed: 0,
+        branch_commits: 8,
+        merges_main: 0,
     };
     st.weather = state::Weather {
         fresh: true,

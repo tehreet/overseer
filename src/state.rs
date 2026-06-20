@@ -195,6 +195,16 @@ pub struct GitStats {
     pub last_msg: String,
     pub last_rel: String,
     pub commits_today: u32,
+    /// Pull requests authored by the user on this repo (all states).
+    pub pr_count: u32,
+    /// Repo directory name (shown before the branch, e.g. "battlestation").
+    pub repo: String,
+    /// Branch activity vs origin/main: lines added/removed across the branch's
+    /// commits, commit count, and merge-commit count ("merges to main").
+    pub loc_added: u32,
+    pub loc_removed: u32,
+    pub branch_commits: u32,
+    pub merges_main: u32,
 }
 
 #[derive(Clone, Default)]
