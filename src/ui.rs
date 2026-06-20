@@ -190,65 +190,65 @@ struct Band {
     vals: Vec<f32>, // normalized 0..1, oldest→newest, one per plot column
 }
 
-/// Render a tall, buttery **stacked** area wave — every shade is a live metric.
-/// The bands pile bottom-to-top: each column's bands are summed, so the wave's
-/// height is the whole system's combined IO/memory pressure, and each coloured
-/// shade you see is the thickness of one real series. Within a band the fill
-/// glides dim→vivid toward its own crest, and band boundaries use 1/8 vertical
-/// blocks so the seams between shades are sub-cell smooth, never stair-stepped.
-fn multi_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
+/// Render the resources wave: several live series **layered** as translucent
+/// colour hills in the SAME plot, each filling from the baseline up to its own
+/// height. They paint back-to-front (tallest behind), so at any cell the *shortest*
+/// series still covering it wins the colour — you see distinct coloured zones
+/// stacked by height (the burstier a series, the more its colour breathes), with
+/// the tallest setting a sub-cell-smooth silhouette. A dim→vivid vertical gradient
+/// gives the whole wave that synthwave glow. Each series is normalised on its own,
+/// so a near-constant one (memory) reads as a calm band while net / disk I/O dance.
+fn overlay_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
     use ratatui::style::Color;
     let w = area.width as usize;
     let h = area.height as usize;
     if w == 0 || h == 0 || bands.is_empty() {
         return;
     }
-    // Blur each band so bursty signals (disk I/O, net) read as one buttery curve.
-    let bands: Vec<Band> = bands
+    // Blur each series so bursty signals read as one buttery curve, not cliffs.
+    let bands: Vec<(Color, Vec<f32>)> = bands
         .iter()
-        .map(|b| Band { color: b.color, vals: smoothed(&b.vals, 2, 4) })
+        .map(|b| (b.color, smoothed(&b.vals, 2, 4)))
         .collect();
-    // Per-column cumulative band tops (in 0..1 stacked units) so we can find which
-    // band a given sub-cell height lands in. The total is normalized so the tallest
-    // column just kisses the top of the plot — the wave always fills the stage.
-    let n_bands = bands.len();
-    let mut totals = vec![0.0f32; w];
-    for x in 0..w {
-        for b in &bands {
-            totals[x] += b.vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        }
-    }
-    let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.6);
-    let scale = (n_bands as f32 * 0.85) / peak; // headroom so crests don't clip flat
 
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for row in 0..h {
         let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
+        let crest = ((r_bot + 0.5) / h as f32).clamp(0.0, 1.0); // dim base → vivid top
         let mut spans: Vec<Span> = Vec::new();
         let mut run = String::new();
         let mut run_col: Option<Color> = None;
         for x in 0..w {
-            // Walk the stacked bands bottom-up, accumulating filled height (in rows)
-            // until we reach the cell this row covers; the band straddling it wins.
-            let mut acc = 0.0f32; // filled height so far, in rows
-            let mut ch = ' ';
-            let mut col: Option<Color> = None;
-            for b in &bands {
-                let bv = b.vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let band_rows = bv * scale * h as f32 / n_bands as f32;
-                let top = acc + band_rows;
-                if top > r_bot && band_rows > 0.0 {
-                    // This band covers (at least part of) this cell's row.
-                    let fill_to = top.min(r_bot + 1.0);
-                    let frac = (fill_to - r_bot).clamp(0.0, 1.0);
-                    ch = if frac >= 0.999 { '█' } else { c::vblock(frac) };
-                    // Brighten toward the band's own crest for that synthwave glow.
-                    let local = ((top - r_bot) / band_rows.max(1e-3)).clamp(0.0, 1.0);
-                    col = Some(c::blend(c::BG, b.color, 0.30 + 0.70 * local));
-                    break;
+            // The shortest series still covering this cell is the front layer; the
+            // tallest sets the silhouette's sub-cell top glyph.
+            let mut front_fh = f32::INFINITY;
+            let mut front_col = c::BG;
+            let mut top_fh = 0.0f32;
+            let mut covered = false;
+            for (col, vals) in &bands {
+                let v = vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let fh = v * h as f32; // fill height in rows
+                if fh > r_bot {
+                    covered = true;
+                    if fh < front_fh {
+                        front_fh = fh;
+                        front_col = *col;
+                    }
                 }
-                acc = top;
+                if fh > top_fh {
+                    top_fh = fh;
+                }
             }
+            let (ch, col) = if !covered {
+                (' ', None)
+            } else {
+                let cc = c::blend(c::BG, front_col, 0.30 + 0.70 * crest);
+                if top_fh >= r_bot + 1.0 {
+                    ('█', Some(cc))
+                } else {
+                    (c::vblock(top_fh - r_bot), Some(cc)) // smooth silhouette top
+                }
+            };
             if col == run_col {
                 run.push(ch);
             } else {
@@ -956,7 +956,7 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState) {
 }
 
 fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
-    let block = panel("MEM · DISK · NET", false);
+    let block = panel("RESOURCES", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 || inner.width < 8 {
@@ -987,52 +987,38 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     top.extend(bar_spans(diskf, dbw, c::jazz(diskf)));
     top.push(Span::styled(format!(" {:>3.0}%", diskf * 100.0), Style::default().fg(c::TEXT)));
 
-    // Bands of the wave — each shade is a live metric. Colours walk the synthwave
-    // ramp so the stack reads cyan→green→violet→pink→white bottom-to-top.
-    let bands = [
-        (c::cyan(), "net▼"),   // network down
-        (c::GREEN, "disk○"), // disk free space
-        (c::accent(), "mem"),  // memory used
-        (c::YELLOW, "io"),   // disk I/O
-        (c::pink(), "net▲"),   // network up
-    ];
-
-    // Gap line: a hair of vertical space + a tiny colour-keyed legend so each
-    // shade in the wave below is identifiable at a glance (no numbers — the wave
-    // is the show). Rendered dim and small so the bars and wave dominate.
-    let mut legend = Vec::with_capacity(bands.len() * 2);
-    for (i, (col, name)) in bands.iter().enumerate() {
-        if i > 0 {
-            legend.push(Span::styled(" ", Style::default().fg(c::DIM)));
-        }
-        legend.push(Span::styled("▰", Style::default().fg(*col)));
-        legend.push(Span::styled(*name, Style::default().fg(c::DIM)));
-    }
-
-    let lines = vec![Line::from(top), Line::from(legend)];
+    // Top row is just the two tidy bars — no legend; the wave is the whole show.
+    let lines = vec![Line::from(top)];
     let text_h = lines.len() as u16;
     f.render_widget(
         Paragraph::new(lines),
         Rect { x: inner.x, y: inner.y, width: inner.width, height: text_h },
     );
 
-    // --- The wave: BIG. It owns every remaining row of the card. Five stacked,
-    // shaded bands each encode a real, live series. Bursty signals are log-scaled
-    // so a quiet system still shows texture and a busy one doesn't peg flat. ---
-    let plot_h = inner.height.saturating_sub(text_h);
+    // --- The wave: BIG. It owns every remaining row of the card. Four live
+    // metrics overlay as translucent colour waves — memory (violet), net down
+    // (cyan), net up (pink), disk I/O (green) — that brighten where they cross.
+    // A blank gap row keeps the wave off the bars above. Bursty rates are
+    // log-scaled so a quiet system still shows texture and a busy one won't peg.
+    let plot_h = inner.height.saturating_sub(text_h + 1);
     if plot_h >= 1 {
-        let plot = Rect { x: inner.x, y: inner.y + text_h, width: inner.width, height: plot_h };
+        let plot = Rect {
+            x: inner.x,
+            y: inner.y + text_h + 1,
+            width: inner.width,
+            height: plot_h,
+        };
         let pw = plot.width as usize;
-        // log10 ~1 KB/s..10 MB/s → 0..1, matching the old net wave's scaling.
-        let lograte = |kbps: f32| ((kbps.max(0.5).log10() + 0.0) / 4.0).clamp(0.0, 1.0);
+        // log10 ~1 KB/s..10 MB/s → 0..1.
+        let lograte = |kbps: f32| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
+        let pct = |p: f32| (p / 100.0).clamp(0.0, 1.0);
         let plot_bands = vec![
-            Band { color: bands[0].0, vals: hist_series(&s.net_rx_hist.data, pw, lograte) },
-            Band { color: bands[1].0, vals: hist_series(&s.disk_free_hist.data, pw, |p| (p / 100.0).clamp(0.0, 1.0)) },
-            Band { color: bands[2].0, vals: hist_series(&s.mem_hist.data, pw, |p| (p / 100.0).clamp(0.0, 1.0)) },
-            Band { color: bands[3].0, vals: hist_series(&s.disk_io_hist.data, pw, lograte) },
-            Band { color: bands[4].0, vals: hist_series(&s.net_tx_hist.data, pw, lograte) },
+            Band { color: c::accent(), vals: hist_series(&s.mem_hist.data, pw, pct) }, // memory used
+            Band { color: c::cyan(), vals: hist_series(&s.net_rx_hist.data, pw, lograte) }, // net down
+            Band { color: c::pink(), vals: hist_series(&s.net_tx_hist.data, pw, lograte) }, // net up
+            Band { color: c::GREEN, vals: hist_series(&s.disk_io_hist.data, pw, lograte) }, // disk I/O
         ];
-        multi_area_graph(f, plot, &plot_bands);
+        overlay_area_graph(f, plot, &plot_bands);
     }
 }
 
@@ -1449,12 +1435,14 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let max_rows = (inner.height as usize).max(1);
     let bullets = [c::cyan(), c::pink(), c::GREEN, c::YELLOW, c::accent()];
 
-    // Render each fact to its wrapped, bulleted block of lines. Every line —
-    // not just the first — gets the brushed-metal shimmer, with a per-line phase
-    // offset (running row index) so stacked lines glint out of lockstep rather
-    // than pulsing together. Continuation lines sit on a calmer base so the
-    // bulleted head still reads as the fact's start.
-    let mut row: f32 = 0.0;
+    // A slow, *uniform* sheen: every line breathes together (no travelling glint,
+    // no per-line phase offset) so the facts read as a calm, nicely-tinted block
+    // that shimmers just a little. Text sits in a soft violet-white; the breath
+    // nudges it toward a gentle glint and back.
+    let glow = 0.5 + 0.5 * (t * 0.6).sin() as f32; // 0..1, slow + uniform
+    let head_base = c::blend(c::TEXT, c::accent(), 0.16); // soft violet-white
+    let cont_base = c::blend(c::DIM, c::accent(), 0.12);
+    let sheen = c::blend(c::TEXT, c::cyan(), 0.35); // gentle glint target
     let blocks: Vec<Vec<Line>> = fa
         .lines
         .iter()
@@ -1465,14 +1453,14 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
                 .into_iter()
                 .enumerate()
                 .map(|(j, seg)| {
-                    let base = if j == 0 { c::TEXT } else { c::DIM };
+                    let base = if j == 0 { head_base } else { cont_base };
+                    let col = c::blend(base, sheen, 0.14 * glow); // a little, uniform
                     let mut spans = if j == 0 {
                         vec![Span::styled("• ", Style::default().fg(color).add_modifier(Modifier::BOLD))]
                     } else {
                         vec![Span::raw("  ")]
                     };
-                    spans.extend(shimmer_spans(&seg, t, row, base, 0.22, 0.07, false));
-                    row += 1.0;
+                    spans.push(Span::styled(seg, Style::default().fg(col)));
                     Line::from(spans)
                 })
                 .collect()
@@ -2222,24 +2210,24 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             Style::default().fg(sender_col)
         };
         let preview = pad_width(&m.preview, prevw);
-        let prev_style = if m.is_rich {
-            Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)
-        } else {
-            Style::default().fg(prev_col)
-        };
         let dot = if m.unread {
             Span::styled(" ●", Style::default().fg(dot_col).add_modifier(Modifier::BOLD))
         } else {
             Span::raw("  ")
         };
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(sender, sender_style),
-            Span::raw(" "),
-            Span::styled(preview, prev_style),
-            Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)),
-            dot,
-        ]));
+        let mut row_spans: Vec<Span> = vec![marker, Span::styled(sender, sender_style), Span::raw(" ")];
+        if m.is_rich {
+            // A picture/video preview ("[rich message]") gets a gentle travelling
+            // sheen so it reads as special — the same glint energy as an unread
+            // sender name, pink while unread and settling to faint once read.
+            let base = if m.unread { c::blend(c::pink(), c::FAINT, adv) } else { c::FAINT };
+            row_spans.extend(shimmer_spans(&preview, t, i as f32, base, 0.5, 0.10, false));
+        } else {
+            row_spans.push(Span::styled(preview, Style::default().fg(prev_col)));
+        }
+        row_spans.push(Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)));
+        row_spans.push(dot);
+        lines.push(Line::from(row_spans));
     }
 
     // ----- separator + keybind hint (only while focused) -----
