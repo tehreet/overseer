@@ -1170,7 +1170,28 @@ fn lyrics_row(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 fn queue_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let q = &s.queue;
     let m = &s.music;
-    let block = panel("QUEUE", false);
+
+    // Title with an on-palette count badge — same custom-span construction the
+    // discord card uses, so the queued-track "3" reads as cyan (not off-palette).
+    let mut title_spans = vec![Span::styled(
+        " QUEUE  ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    let queued = q.items.len();
+    if m.running && !m.track.is_empty() && queued > 0 {
+        title_spans.push(Span::styled(
+            format!("{queued}"),
+            Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
+        ));
+        title_spans.push(Span::styled(" up next ", Style::default().fg(c::DIM)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 6 || inner.height < 2 {
