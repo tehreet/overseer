@@ -57,6 +57,7 @@ fn run() -> Result<()> {
     collectors::spawn_signal(shared.clone());
     collectors::spawn_discord(shared.clone());
     collectors::spawn_doctor(shared.clone());
+    collectors::spawn_keybinds(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;
@@ -774,6 +775,47 @@ fn sample_data(st: &mut AppState, compose: bool) {
         last_rel: "12m".into(),
         today_cost: 0.34,
         incidents_total: 11,
+    };
+    // KEYBINDS card preview — a representative slice of the Hammerspoon cheat sheet.
+    let g = |name: &str, binds: &[(&str, &str)]| state::KeyGroup {
+        name: name.into(),
+        binds: binds.iter().map(|(k, d)| (k.to_string(), d.to_string())).collect(),
+    };
+    st.keybinds = state::Keybinds {
+        available: true,
+        hyper: "hold Caps Lock".into(),
+        groups: vec![
+            g("Apps · Hyper+key", &[
+                ("T", "Warp"), ("C", "Google Chrome"), ("F", "Finder"), ("D", "Discord"),
+                ("M", "Music"), ("N", "Music · next song"), ("=", "Music · volume +10%"),
+                ("-", "Music · volume -10%"),
+            ]),
+            g("Windows · Hyper+key", &[
+                ("←", "left half"), ("→", "right half"), ("↑", "maximize"), ("↓", "center 70%"),
+                ("1", "left third"), ("2", "middle third"), ("3", "right third"),
+                ("Z", "undo last move"), ("V", "clipboard history"), ("H", "toggle cheat sheet"),
+            ]),
+            g("Window mode · after Hyper+W", &[
+                ("←", "left half"), ("→", "right half"), ("↑", "maximize"), ("↓", "center 70%"),
+                ("hjkl", "nudge"), ("escape", "exit"),
+            ]),
+            g("Controls · Ctrl+Alt+key", &[
+                ("←", "all windows → extended"), ("→", "gather → main"), ("R", "reload config"),
+                ("C", "close window"), ("M", "minimize"), ("↑", "maximize"), ("↓", "restore 70%"),
+                ("= / −", "grow / shrink"),
+            ]),
+            g("Displays / KVM", &[
+                ("[", "Studio → LEFT · RIGHT to MacBook"),
+                ("]", "Studio → RIGHT · LEFT to MacBook"),
+                ("0", "bailout · reclaim BOTH panels"),
+            ]),
+            g("Capture · Hyper+key", &[
+                ("S", "selection screenshot → clipboard"), ("R", "record window → Desktop"),
+            ]),
+            g("Text expansion", &[
+                ("@@", "email"), (";dt", "date"), (";shrug", "¯\\_(ツ)_/¯"),
+            ]),
+        ],
     };
     // `--compose` previews the inline reply input affordance.
     if compose {

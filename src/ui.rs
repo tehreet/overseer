@@ -1627,6 +1627,28 @@ fn card_height(m: &crate::state::Messages, active: bool) -> u16 {
     2 + n + footer
 }
 
+/// Shared unread/all-read title badge for the iMESSAGE and SIGNAL cards so the
+/// glyph, color and spacing stay congruent. `dot` lets the caller animate the
+/// unread bullet color (iMESSAGE crossfades pink→green on settle); Signal passes
+/// a flat pink.
+fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'static>> {
+    if unread_count > 0 {
+        vec![
+            Span::styled(" ● ", Style::default().fg(dot).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}", unread_count),
+                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" unread ", Style::default().fg(c::DIM)),
+        ]
+    } else {
+        vec![
+            Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("all read ", Style::default().fg(c::DIM)),
+        ]
+    }
+}
+
 /// iMESSAGE card: unread badge in the title, a list of recent inbound messages
 /// (focus marker · sender · preview · rel-time · unread dot), and an inline reply
 /// input that wipes open on a double-press. All motion is interpolated each
@@ -1658,18 +1680,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
     )];
     if msgs.available && msgs.fresh {
-        if msgs.unread_count > 0 {
-            let dot = c::blend(c::PINK, c::GREEN, badge_blend);
-            title_spans.push(Span::styled(" ● ", Style::default().fg(dot).add_modifier(Modifier::BOLD)));
-            title_spans.push(Span::styled(
-                format!("{}", msgs.unread_count),
-                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
-            ));
-            title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
-        } else {
-            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
-            title_spans.push(Span::styled("all read ", Style::default().fg(c::DIM)));
-        }
+        let dot = c::blend(c::PINK, c::GREEN, badge_blend);
+        title_spans.extend(unread_badge(msgs.unread_count, dot));
     }
 
     // Failure flash: border pulses red, fade in 120ms / out 240ms.
@@ -1893,17 +1905,7 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
         Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
     )];
     if sig.available && sig.fresh {
-        if sig.unread_count > 0 {
-            title_spans.push(Span::styled(" ● ", Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
-            title_spans.push(Span::styled(
-                format!("{}", sig.unread_count),
-                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
-            ));
-            title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
-        } else {
-            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
-            title_spans.push(Span::styled("all read ", Style::default().fg(c::DIM)));
-        }
+        title_spans.extend(unread_badge(sig.unread_count, c::PINK));
     }
 
     let block = Block::default()

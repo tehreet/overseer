@@ -2669,3 +2669,82 @@ fn read_doctor() -> crate::state::Doctor {
     }
     d
 }
+
+// ----------------------------------------------------------------------------
+// Hammerspoon keybinds: mirror the live cheat sheet.
+//
+// init.lua exports its self-documenting `doc` registry to
+// ~/Library/Application Support/studioboard/keybinds.json on every reload. We
+// read + parse it (poll on mtime) so the KEYBINDS card always matches the real
+// bindings with no second list to maintain.
+// ----------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct KbBind {
+    group: String,
+    keys: String,
+    desc: String,
+}
+#[derive(serde::Deserialize)]
+struct KbExport {
+    #[serde(default)]
+    hyper: String,
+    #[serde(default)]
+    group_order: Vec<String>,
+    #[serde(default, rename = "groupOrder")]
+    group_order_camel: Vec<String>,
+    #[serde(default)]
+    binds: Vec<KbBind>,
+}
+
+fn keybinds_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join("Library/Application Support/studioboard/keybinds.json")
+}
+
+pub fn spawn_keybinds(shared: Shared) {
+    thread::spawn(move || loop {
+        let snap = read_keybinds();
+        {
+            let mut s = shared.lock().unwrap();
+            s.keybinds = snap;
+        }
+        thread::sleep(Duration::from_secs(3));
+    });
+}
+
+fn read_keybinds() -> crate::state::Keybinds {
+    use crate::state::{KeyGroup, Keybinds};
+    let mut kb = Keybinds::default();
+    let Ok(raw) = std::fs::read_to_string(keybinds_path()) else {
+        return kb; // Hammerspoon hasn't exported yet → card shows a hint
+    };
+    let Ok(export) = serde_json::from_str::<KbExport>(&raw) else {
+        return kb;
+    };
+    kb.available = true;
+    kb.hyper = export.hyper;
+
+    // Group the flat bind list, preserving first-seen row order within a group.
+    let mut order: Vec<String> = if !export.group_order_camel.is_empty() {
+        export.group_order_camel
+    } else {
+        export.group_order
+    };
+    let mut groups: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for b in export.binds {
+        if !order.contains(&b.group) {
+            order.push(b.group.clone()); // any group missing from the order list
+        }
+        groups.entry(b.group).or_default().push((b.keys, b.desc));
+    }
+    kb.groups = order
+        .into_iter()
+        .filter_map(|name| {
+            groups.remove(&name).map(|binds| KeyGroup { name, binds })
+        })
+        .filter(|g| !g.binds.is_empty())
+        .collect();
+    kb
+}

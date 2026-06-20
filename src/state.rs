@@ -355,6 +355,23 @@ pub struct Doctor {
     pub incidents_total: u64,   // lifetime incident count
 }
 
+/// One group of Hammerspoon keybindings (e.g. "Apps · Hyper+key") with its rows.
+#[derive(Clone, Default)]
+pub struct KeyGroup {
+    pub name: String,
+    pub binds: Vec<(String, String)>, // (keys, description), cheat-sheet order
+}
+
+/// Hammerspoon keybind cheat sheet, mirrored from the live config. Hammerspoon
+/// exports its self-documenting `doc` registry to JSON on every reload; the
+/// spawn_keybinds collector reads it so this card always matches the real binds.
+#[derive(Clone, Default)]
+pub struct Keybinds {
+    pub available: bool,        // the exported JSON was found + parsed
+    pub hyper: String,          // how "Hyper" is produced (e.g. "hold Caps Lock")
+    pub groups: Vec<KeyGroup>,  // in cheat-sheet display order
+}
+
 /// iMessage card data (written by the spawn_messages collector).
 #[derive(Clone, Default)]
 pub struct Messages {
@@ -475,6 +492,7 @@ pub struct AppState {
     pub signal: Messages, // Signal Desktop conversations (read-only; reuses Messages shape)
     pub discord: Discord, // Discord voice presence + recent text channels
     pub doctor: Doctor,   // mac-doctor / syswatch triage agent status
+    pub keybinds: Keybinds, // Hammerspoon keybind cheat sheet
     pub cpu_hist: History,
     pub gpu_hist: History,
     pub power_hist: History,
@@ -504,6 +522,7 @@ impl Default for AppState {
             signal: Messages::default(),
             discord: Discord::default(),
             doctor: Doctor::default(),
+            keybinds: Keybinds::default(),
             cpu_hist: History::new(120),
             gpu_hist: History::new(120),
             power_hist: History::new(120),
