@@ -2982,65 +2982,126 @@ fn window(
     width: usize,
     wipe_frac: Option<f32>,
 ) -> Vec<Line<'static>> {
-    let start = active as isize - center as isize;
+    let width = width.max(4);
+    let n_lines = ly.lines.len();
+    if n_lines == 0 {
+        return vec![Line::from(""); height];
+    }
+
+    // One *display row* of the band. A single lyric may wrap into several of
+    // these; `cstart`/`total` carry the lyric's running character offset so the
+    // karaoke wipe + gradient stay continuous as they flow across wrapped rows.
+    struct DRow {
+        lyric: usize,
+        text: String,
+        cstart: usize,
+        total: usize,
+        active: bool,
+    }
+
+    // Flatten the lyrics around `active` into wrapped display rows. The range is
+    // padded enough on both sides to over-fill the band whatever the wrapping.
+    let lo = active.saturating_sub(height + center);
+    let hi = (active + height + 1).min(n_lines);
+    let mut rows: Vec<DRow> = Vec::new();
+    let mut active_start = 0usize;
+    let mut active_h = 1usize;
+    for i in lo..hi {
+        let is_active = i == active;
+        if is_active {
+            active_start = rows.len();
+        }
+        let txt = &ly.lines[i].text;
+        if txt.is_empty() {
+            if is_active {
+                active_h = 1;
+            }
+            rows.push(DRow { lyric: i, text: "♪".into(), cstart: 0, total: 1, active: is_active });
+            continue;
+        }
+        let wrapped = wrap_text(txt, width);
+        let total: usize = wrapped.iter().map(|r| r.chars().count()).sum::<usize>().max(1);
+        if is_active {
+            active_h = wrapped.len().max(1);
+        }
+        let mut cstart = 0usize;
+        for r in wrapped {
+            let rc = r.chars().count();
+            rows.push(DRow { lyric: i, text: r, cstart, total, active: is_active });
+            cstart += rc;
+        }
+    }
+
+    // Anchor the active lyric's first row at `center`, then nudge so the whole
+    // wrapped active block stays on-screen (prefer showing all of it — never
+    // clip the line you're singing). If the active lyric alone is taller than
+    // the band, top-align it so the wipe leads from the first row.
+    let mut ds = active_start as isize - center as isize;
+    if active_h <= height {
+        let bottom = (active_start + active_h) as isize;
+        if bottom > ds + height as isize {
+            ds = bottom - height as isize;
+        }
+        if (active_start as isize) < ds {
+            ds = active_start as isize;
+        }
+    } else {
+        ds = active_start as isize;
+    }
+
     let mut out = Vec::with_capacity(height);
-    for row in 0..height as isize {
-        let idx = start + row;
-        if idx < 0 || idx as usize >= ly.lines.len() {
+    for r in 0..height as isize {
+        let di = ds + r;
+        if di < 0 || di as usize >= rows.len() {
             out.push(Line::from(""));
             continue;
         }
-        let i = idx as usize;
-        if ly.lines[i].text.is_empty() {
+        let dr = &rows[di as usize];
+        if dr.text == "♪" {
             out.push(Line::from(Span::styled("♪", Style::default().fg(c::FAINT))));
-            continue;
-        }
-        // Truncate to the (possibly narrow) box so centered lines never clip at
-        // the edges — long lyrics get a trailing ellipsis instead.
-        let text = truncate(&ly.lines[i].text, width.max(4));
-        if i == active {
+        } else if dr.active {
             if let Some(frac) = wipe_frac {
-                out.push(karaoke(&text, frac));
+                out.push(karaoke_row(&dr.text, dr.cstart, dr.total, frac));
             } else {
                 out.push(Line::from(Span::styled(
-                    text,
+                    dr.text.clone(),
                     Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
                 )));
             }
         } else {
-            let dist = (i as isize - active as isize).unsigned_abs();
-            let col = match dist {
-                1 => c::DIM,
-                _ => c::FAINT,
-            };
-            out.push(Line::from(Span::styled(text, Style::default().fg(col))));
+            let dist = (dr.lyric as isize - active as isize).unsigned_abs();
+            let col = if dist == 1 { c::DIM } else { c::FAINT };
+            out.push(Line::from(Span::styled(dr.text.clone(), Style::default().fg(col))));
         }
     }
     out
 }
 
-/// The karaoke line: characters up to `frac` are lit with a cyan→violet→pink
-/// gradient; the rest stay dim. The single boundary character is *blended*
-/// between dim and lit by the sub-character fraction, so the wipe glides
-/// smoothly instead of popping per glyph. Combined with the slewed playback
+/// One wrapped row of the active karaoke line. Characters lit up to `frac`
+/// (measured across the *whole* lyric, not just this row) get the cyan→violet→
+/// pink gradient; the rest stay a calm "pending" tone. `cstart` is this row's
+/// character offset within the lyric and `total` its full length, so the wipe
+/// and the gradient flow continuously from one wrapped row into the next. The
+/// single boundary glyph is *blended* by the sub-character fraction, so the
+/// wipe glides instead of popping per glyph — combined with the slewed playback
 /// clock, this is the buttery part.
-fn karaoke(text: &str, frac: f32) -> Line<'static> {
+fn karaoke_row(text: &str, cstart: usize, total: usize, frac: f32) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1);
-    let litf = (frac * n as f32).clamp(0.0, n as f32);
+    let total = total.max(1);
+    let litf = (frac * total as f32).clamp(0.0, total as f32);
     let full = litf.floor() as usize;
     let partial = litf.fract();
     // The not-yet-wiped tail of the ACTIVE line glows brighter than the DIM
     // context lines (a calm cyan-violet), so the active lyric always reads as
-    // "lit/current" even before the wipe reaches a given character. The boundary
-    // glyph then blends from this pending tone to the vivid wipe colour.
+    // "lit/current" even before the wipe reaches a given character.
     let pending = c::blend(c::DIM, c::accent(), 0.45);
-    let mut spans = Vec::with_capacity(n);
+    let mut spans = Vec::with_capacity(chars.len());
     for (i, ch) in chars.iter().enumerate() {
-        let p = i as f32 / n as f32;
-        let style = if i < full {
+        let gi = cstart + i; // global char index within the whole lyric
+        let p = gi as f32 / total as f32;
+        let style = if gi < full {
             Style::default().fg(c::wipe(p)).add_modifier(Modifier::BOLD)
-        } else if i == full {
+        } else if gi == full {
             // Boundary glyph fades in as we sweep across it.
             Style::default()
                 .fg(c::blend(pending, c::wipe(p), partial))
