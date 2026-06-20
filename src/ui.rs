@@ -495,44 +495,6 @@ fn faded_lines(lines: Vec<Line<'static>>, alpha: f32) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A metadata line (title / artist · album) that shimmers, and — when it
-/// overflows `width` — gently cross-dissolves between successive windows of the
-/// text instead of cell-scrolling. `lead` is pinned at the left (transport icon).
-fn cycle_dissolve(
-    lead: Vec<Span<'static>>,
-    lead_w: usize,
-    segs: &[(&str, Color, bool)],
-    width: usize,
-    t: f64,
-    row: f32,
-) -> Line<'static> {
-    let mut toks: Vec<(char, Color, bool)> = Vec::new();
-    for (txt, col, bold) in segs {
-        for ch in txt.chars() {
-            toks.push((ch, *col, *bold));
-        }
-    }
-    let avail = width.saturating_sub(lead_w).max(1);
-    if toks.len() <= avail {
-        return shimmer_window(lead, lead_w, &toks, width, t, row, 1.0);
-    }
-    // Window start offsets covering the whole string (slight overlap for context).
-    let max_off = toks.len() - avail;
-    let step = (avail * 3 / 4).max(1);
-    let mut offs: Vec<usize> = Vec::new();
-    let mut o = 0usize;
-    loop {
-        offs.push(o.min(max_off));
-        if o >= max_off {
-            break;
-        }
-        o += step;
-    }
-    let (i, alpha) = dissolve_phase(offs.len(), t, 2.8, 0.85);
-    let off = offs[i];
-    shimmer_window(lead, lead_w, &toks[off..off + avail], width, t, row, alpha)
-}
-
 /// Render a token window with the shimmer sweep and a dissolve `alpha`. The lead
 /// (icon) stays fully opaque; only the text fades.
 fn shimmer_window(
@@ -568,6 +530,96 @@ fn shimmer_window(
         spans.push(Span::styled(ch.to_string(), st));
     }
     Line::from(spans)
+}
+
+/// A single line of `segs` that shimmers, and — when it overflows `width` —
+/// marquee-scrolls smoothly left across the box. The scroll is frame-paced off
+/// `t`: it eases out of a hold at the start, glides through the text, eases into
+/// a hold at the end, then bounces back — no cell-stepped jitter, the offset is
+/// smoothed by a cosine so the sweep accelerates and decelerates buttery-soft.
+/// `row` phase-offsets the sheen so stacked lines don't shimmer in lockstep.
+fn marquee(segs: &[(&str, Color, bool)], width: usize, t: f64, row: f32) -> Line<'static> {
+    let mut toks: Vec<(char, Color, bool)> = Vec::new();
+    for (txt, col, bold) in segs {
+        for ch in txt.chars() {
+            toks.push((ch, *col, *bold));
+        }
+    }
+    let width = width.max(1);
+    if toks.len() <= width {
+        return shimmer_window(Vec::new(), 0, &toks, width, t, row, 1.0);
+    }
+
+    // How far we must travel, in cells. A pad of blanks at the tail lets the line
+    // fully clear the box before it bounces back, so the end never looks clipped.
+    let pad = 3usize;
+    let travel = (toks.len() + pad).saturating_sub(width) as f64;
+
+    // One full cycle = scroll out (scan) + hold at each end. The phase ping-pongs
+    // 0→1→0 so the text slides left, pauses, and slides home — never wrapping with
+    // a visible pop. `triangle` is the raw 0..1 sweep; `eased` smooths its ends.
+    let hold = 2.2f64; // seconds parked at each extreme
+    let scan = (travel / 6.0).max(2.0); // seconds to traverse (≈6 cells/s)
+    let period = 2.0 * (scan + hold);
+    let x = t.rem_euclid(period);
+    let raw = if x < hold {
+        0.0
+    } else if x < hold + scan {
+        (x - hold) / scan
+    } else if x < hold + scan + hold {
+        1.0
+    } else {
+        1.0 - (x - hold - scan - hold) / scan
+    };
+    // Cosine ease-in-out so the start and end of every slide are gentle.
+    let eased = 0.5 - 0.5 * (raw.clamp(0.0, 1.0) * std::f64::consts::PI).cos();
+    let off = (eased * travel).round() as usize;
+    let end = (off + width).min(toks.len());
+    let window = &toks[off..end];
+    shimmer_window(Vec::new(), 0, window, width, t, row, 1.0)
+}
+
+/// A progress bar that doesn't just sit there — a bright sheen glides across the
+/// *filled* portion on top of a position-graded jazz ramp, so it reads like lit
+/// glass. Sub-cell fill via 1/8-block glyphs keeps the leading edge smooth as the
+/// track plays; the unfilled track is a faint rail. Built on `jazz`/`blend` so it
+/// stays dead-on the synthwave palette and animates buttery off the `t` clock.
+fn shimmer_bar(frac: f32, width: usize, t: f64) -> Vec<Span<'static>> {
+    let frac = frac.clamp(0.0, 1.0) as f64;
+    let width = width.max(1);
+    let eighths = (frac * width as f64 * 8.0).round() as usize;
+    let full = (eighths / 8).min(width);
+    let rem = eighths % 8;
+    // A narrow bright band sweeps across the bar; it wraps so it never pops.
+    let head = (t * 0.45).rem_euclid(1.0) as f32;
+    let sigma = 0.10f32;
+    let sheen = c::jazz(0.92); // pink-white glint
+    let cell = |i: usize, glyph: char| -> Span<'static> {
+        let p = (i as f32 + 0.5) / width as f32;
+        // Position-graded base so the bar itself ramps violet→pink across its run.
+        let base = c::jazz(0.30 + 0.55 * p);
+        let mut d = (p - head).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        let b = (-(d * d) / (2.0 * sigma * sigma)).exp();
+        let col = c::blend(base, sheen, b);
+        Span::styled(glyph.to_string(), Style::default().fg(col).add_modifier(Modifier::BOLD))
+    };
+    let mut spans = Vec::with_capacity(width);
+    for i in 0..full {
+        spans.push(cell(i, '█'));
+    }
+    let mut drawn = full;
+    if drawn < width && rem > 0 {
+        spans.push(cell(full, ['█', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][rem]));
+        drawn += 1;
+    }
+    if drawn < width {
+        // Faint rail for the unplayed remainder.
+        spans.push(Span::styled("░".repeat(width - drawn), Style::default().fg(c::FAINT)));
+    }
+    spans
 }
 
 fn panel(title: &str, hot: bool) -> Block<'_> {
@@ -1389,50 +1441,39 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let gap = art_cols + 3;
     let pos = m.position();
     let frac = if m.duration > 0.0 { (pos / m.duration) as f32 } else { 0.0 };
-    let icon = if m.playing { "▶" } else { "❚❚" };
 
     // Text column width — needed before we lay out the (possibly scrolling) title.
     let textw = (inner.width.saturating_sub(gap)) as usize;
 
-    // Title / artist / album shimmer; a line wider than the column marquee-scrolls
-    // instead of truncating. The transport icon stays pinned at the left.
-    let lead = vec![Span::styled(
-        format!("{icon} "),
-        Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
-    )];
-    let lead_w = icon.chars().count() + 1;
-    let title = cycle_dissolve(lead, lead_w, &[(&m.track, c::TEXT, true)], textw, t, 0.0);
-    let meta = cycle_dissolve(
-        Vec::new(),
-        0,
+    // Line 1 = "Artist - Song" (no transport glyph); line 2 = album. A line wider
+    // than the column smoothly marquee-scrolls instead of truncating; both shimmer.
+    let title = marquee(
         &[
-            (m.artist.as_str(), c::ACCENT, false),
-            ("  ·  ", c::FAINT, false),
-            (m.album.as_str(), c::DIM, false),
+            (m.artist.as_str(), c::ACCENT, true),
+            (" - ", c::FAINT, false),
+            (m.track.as_str(), c::TEXT, true),
         ],
         textw,
         t,
-        1.0,
+        0.0,
     );
+    let album = marquee(&[(m.album.as_str(), c::DIM, false)], textw, t, 1.0);
 
     // Progress bar stretches to the right edge of the card: only the two time
-    // labels are reserved, the bar takes everything between them.
+    // labels are reserved, the bar takes everything between them. A sheen glides
+    // across the filled portion so it reads like lit glass while the track plays.
     let pfx = format!("{} ", fmt_clock(pos));
     let sfx = format!(" {}", fmt_clock(m.duration));
     let bw = textw.saturating_sub(pfx.chars().count() + sfx.chars().count()).max(8);
     let mut progress_spans = vec![Span::styled(pfx, Style::default().fg(c::CYAN))];
-    progress_spans.extend(bar_spans(frac, bw, c::PINK));
+    progress_spans.extend(shimmer_bar(frac, bw, t));
     progress_spans.push(Span::styled(sfx, Style::default().fg(c::DIM)));
-
-    // Transport word only — the dancing spectrum below carries the motion.
-    let status = Line::from(Span::styled(
-        if m.playing { "playing" } else { "paused" },
-        Style::default().fg(c::FAINT),
-    ));
 
     let tx = inner.x + gap;
     let tw = inner.width.saturating_sub(gap);
-    let body = vec![title, meta, Line::from(""), Line::from(progress_spans), status];
+    // Bar sits directly under the album line (no spacer, no status word) — the
+    // dancing spectrum below carries the rest of the motion.
+    let body = vec![title, album, Line::from(progress_spans)];
     let body_h = body.len() as u16;
 
     // Text block sits at the top, sharing a baseline with the album art's top.
