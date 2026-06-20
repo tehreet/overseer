@@ -213,6 +213,70 @@ impl AlbumArt {
     }
 }
 
+/// Cross-fade duration for the album-art palette swap on a track change. Long
+/// enough to read as a glide, short enough to feel responsive.
+const THEME_FADE: Duration = Duration::from_millis(450);
+
+/// The dynamic, album-art-derived accent palette. Holds where the accents are
+/// fading *from* (`current`) and *to* (`target`), plus when the fade began, so
+/// the render loop can serve a per-frame RGB lerp off `eased()` — never a hard
+/// cut. The artwork collector retargets it (capturing the live eased value as
+/// the new `current`) whenever a new cover yields different dominant colors.
+#[derive(Clone)]
+pub struct DynamicTheme {
+    pub source_track_id: String,        // cover this target was derived from
+    pub current: [(u8, u8, u8); 3],     // accent, cyan, pink we're fading FROM
+    pub target: [(u8, u8, u8); 3],      // accent, cyan, pink we're fading TO
+    pub blend_start: Instant,           // when the active cross-fade began
+}
+
+impl Default for DynamicTheme {
+    fn default() -> Self {
+        // Seed both ends to the house synthwave accents so the first frames are
+        // on-brand and a no-art session never tints.
+        let base = [
+            crate::theme::ACCENT_BASE,
+            crate::theme::CYAN_BASE,
+            crate::theme::PINK_BASE,
+        ];
+        Self {
+            source_track_id: String::new(),
+            current: base,
+            target: base,
+            blend_start: Instant::now(),
+        }
+    }
+}
+
+impl DynamicTheme {
+    /// Begin a cross-fade toward `target`, anchoring `current` at wherever the
+    /// fade currently sits so retargeting mid-fade never pops.
+    pub fn retarget(&mut self, source_track_id: String, target: [(u8, u8, u8); 3]) {
+        self.current = self.eased();
+        self.target = target;
+        self.source_track_id = source_track_id;
+        self.blend_start = Instant::now();
+    }
+
+    /// The cross-faded accent triple for *this* frame (ease-out cubic). Once the
+    /// fade completes it pins to `target`, so steady-state is allocation- and
+    /// drift-free.
+    pub fn eased(&self) -> [(u8, u8, u8); 3] {
+        let raw = (self.blend_start.elapsed().as_secs_f32() / THEME_FADE.as_secs_f32()).clamp(0.0, 1.0);
+        // Ease-out cubic: fast then settle — reads as a smooth glide, not a ramp.
+        let t = 1.0 - (1.0 - raw).powi(3);
+        let lerp = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            (f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
+        };
+        [
+            lerp(self.current[0], self.target[0]),
+            lerp(self.current[1], self.target[1]),
+            lerp(self.current[2], self.target[2]),
+        ]
+    }
+}
+
 /// One upcoming track in Apple Music's queue (next-up from the current playlist).
 #[derive(Clone, Default)]
 pub struct QueueTrack {
@@ -490,6 +554,8 @@ pub struct AppState {
     /// reconciled — surfaced as the "N missing" badge on the LYRICS card.
     pub lyrics_misses: usize,
     pub album_art: AlbumArt,
+    /// Album-art-derived accent palette, cross-faded per frame (issue #8).
+    pub dynamic_theme: DynamicTheme,
     pub facts: MusicFacts,
     pub queue: Queue,
     pub git: GitStats,
@@ -528,6 +594,7 @@ impl Default for AppState {
             lyrics: Lyrics::default(),
             lyrics_misses: 0,
             album_art: AlbumArt::default(),
+            dynamic_theme: DynamicTheme::default(),
             facts: MusicFacts::default(),
             queue: Queue::default(),
             git: GitStats::default(),

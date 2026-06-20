@@ -623,6 +623,12 @@ fn sample_data(st: &mut AppState, compose: bool) {
     // Album art: decode the last real dump (so visual-verify exercises the true
     // sampling path on a real cover); fall back to a radial gradient otherwise.
     st.album_art = collectors::sample_album_art(st.music.track_id());
+    // Drive the dynamic palette off that cover so off-screen verify shows the
+    // album-biased accents too. Back-date the fade so the single headless frame
+    // renders the cross-fade fully settled rather than mid-glide (#8).
+    let target = theme::theme_from_art(&st.album_art.px);
+    st.dynamic_theme.retarget(st.music.track_id(), [target.0, target.1, target.2]);
+    st.dynamic_theme.blend_start = Instant::now() - std::time::Duration::from_secs(1);
     st.facts = state::MusicFacts {
         track_id: st.music.track_id(),
         source: "claude".into(),

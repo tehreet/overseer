@@ -575,9 +575,17 @@ pub fn spawn_artwork(shared: Shared) {
                             crate::state::AlbumArt { track_id: id.clone(), ..Default::default() }
                         }
                     };
+                    // Derive the album-biased accent palette once, off-lock, then
+                    // begin a cross-fade toward it (issue #8). Empty art relaxes
+                    // back to the house synthwave accents.
+                    let target = crate::theme::theme_from_art(&art.px);
+                    let target = [target.0, target.1, target.2];
                     let mut s = shared.lock().unwrap();
                     if s.music.track_id() == id {
                         s.album_art = art;
+                        if s.dynamic_theme.source_track_id != id || s.dynamic_theme.target != target {
+                            s.dynamic_theme.retarget(id.clone(), target);
+                        }
                     }
                 }
             }

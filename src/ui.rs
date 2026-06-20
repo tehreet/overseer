@@ -419,6 +419,10 @@ fn left_card_heights(avail: u16, s: &AppState) -> [u16; 11] {
 }
 
 pub fn render(f: &mut Frame, s: &AppState, t: f64) {
+    // Push this frame's cross-faded, album-biased accents into the live palette
+    // store up front so every card below reads a coherent, glided value (#8).
+    c::apply_dynamic(&s.dynamic_theme);
+
     let area = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(c::BG)),
@@ -747,7 +751,7 @@ fn panel(title: &str, hot: bool) -> Block<'_> {
         .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG))
@@ -826,7 +830,7 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     let cpu_col = if load_alarm { c::RED } else { c::jazz(cpu / 100.0) };
 
     let mut spans = vec![
-        Span::styled(" q ", Style::default().fg(c::BG).bg(c::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" q ", Style::default().fg(c::BG).bg(c::accent()).add_modifier(Modifier::BOLD)),
         Span::styled(" quit", Style::default().fg(c::DIM).bg(c::PANEL_BORDER)),
         sep(),
         lbl("CPU "),
@@ -848,8 +852,8 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     spans.push(val(format!("{:>3.0}%", memf * 100.0), c::jazz(memf)));
     spans.push(sep());
     spans.push(lbl("NET "));
-    spans.push(Span::styled(format!("▼{:>5}", fmt_rate_short(sys.net_rx_bps)), Style::default().fg(c::CYAN).bg(c::PANEL_BORDER)));
-    spans.push(Span::styled(format!(" ▲{:>5}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::PINK).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!("▼{:>5}", fmt_rate_short(sys.net_rx_bps)), Style::default().fg(c::cyan()).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!(" ▲{:>5}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::pink()).bg(c::PANEL_BORDER)));
     if s.usage.fresh {
         spans.push(sep());
         spans.push(lbl("Claude today "));
@@ -986,11 +990,11 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     // Bands of the wave — each shade is a live metric. Colours walk the synthwave
     // ramp so the stack reads cyan→green→violet→pink→white bottom-to-top.
     let bands = [
-        (c::CYAN, "net▼"),   // network down
+        (c::cyan(), "net▼"),   // network down
         (c::GREEN, "disk○"), // disk free space
-        (c::ACCENT, "mem"),  // memory used
+        (c::accent(), "mem"),  // memory used
         (c::YELLOW, "io"),   // disk I/O
-        (c::PINK, "net▲"),   // network up
+        (c::pink(), "net▲"),   // network up
     ];
 
     // Gap line: a hair of vertical space + a tiny colour-keyed legend so each
@@ -1094,7 +1098,7 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             let pf = (spw / 120.0).clamp(0.0, 1.0);
             let mut spans = vec![Span::styled("power  ", Style::default().fg(c::DIM))];
             spans.extend(bar_spans(pf, bw, c::jazz(pf)));
-            spans.push(Span::styled(format!(" {:>4.1}W", spw), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!(" {:>4.1}W", spw), Style::default().fg(c::pink()).add_modifier(Modifier::BOLD)));
             Line::from(spans)
         },
         Line::from(""), // padding under the power bar
@@ -1187,9 +1191,9 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             ])
         };
         let windows = [
-            ("today", fmt_tokens(tot_today), c::CYAN),
-            ("week", fmt_tokens(u.tokens_7d), c::ACCENT),
-            ("month", fmt_tokens(u.tokens_30d), c::PINK),
+            ("today", fmt_tokens(tot_today), c::cyan()),
+            ("week", fmt_tokens(u.tokens_7d), c::accent()),
+            ("month", fmt_tokens(u.tokens_30d), c::pink()),
             ("sessions", format!("{}", u.sessions_30d), c::TEXT),
         ];
         // Window today's per-hour burn so it ENDS at the current hour — the live
@@ -1275,12 +1279,12 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     }
     branch_spans.push(Span::styled(
         truncate(&g.branch, rwn.saturating_sub(used).max(3)),
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     ));
     let branch = Line::from(branch_spans);
     let hashw = g.last_hash.chars().count() + 1;
     let commit = Line::from(vec![
-        Span::styled(format!("{} ", g.last_hash), Style::default().fg(c::CYAN)),
+        Span::styled(format!("{} ", g.last_hash), Style::default().fg(c::cyan())),
         Span::styled(truncate(&g.last_msg, rwn.saturating_sub(hashw)), Style::default().fg(c::TEXT)),
     ]);
     let age = Line::from(Span::styled(
@@ -1298,7 +1302,7 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Span::styled(" commits", Style::default().fg(c::DIM)),
     ]);
     let prs = Line::from(vec![
-        Span::styled(format!("{}", g.pr_count), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}", g.pr_count), Style::default().fg(c::pink()).add_modifier(Modifier::BOLD)),
         Span::styled(" PRs", Style::default().fg(c::DIM)),
     ]);
     let merges = Line::from(vec![
@@ -1356,13 +1360,13 @@ fn queue_panel(f: &mut Frame, area: Rect, s: &AppState) {
     // discord card uses, so the queued-track "3" reads as cyan (not off-palette).
     let mut title_spans = vec![Span::styled(
         " QUEUE  ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     let queued = q.items.len();
     if m.running && !m.track.is_empty() && queued > 0 {
         title_spans.push(Span::styled(
             format!("{queued}"),
-            Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
+            Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD),
         ));
         title_spans.push(Span::styled(" up next ", Style::default().fg(c::DIM)));
     }
@@ -1394,7 +1398,7 @@ fn queue_panel(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
     let w = inner.width as usize;
-    let accents = [c::CYAN, c::PINK, c::GREEN];
+    let accents = [c::cyan(), c::pink(), c::GREEN];
     let mut lines: Vec<Line> = Vec::new();
     for (i, it) in q.items.iter().enumerate() {
         let col = accents[i % accents.len()];
@@ -1443,7 +1447,7 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 
     let width = inner.width as usize;
     let max_rows = (inner.height as usize).max(1);
-    let bullets = [c::CYAN, c::PINK, c::GREEN, c::YELLOW, c::ACCENT];
+    let bullets = [c::cyan(), c::pink(), c::GREEN, c::YELLOW, c::accent()];
 
     // Render each fact to its wrapped, bulleted block of lines. Every line —
     // not just the first — gets the brushed-metal shimmer, with a per-line phase
@@ -1578,7 +1582,7 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // than the column smoothly marquee-scrolls instead of truncating; both shimmer.
     let title = marquee(
         &[
-            (m.artist.as_str(), c::ACCENT, true),
+            (m.artist.as_str(), c::accent(), true),
             (" - ", c::FAINT, false),
             (m.track.as_str(), c::TEXT, true),
         ],
@@ -1594,7 +1598,7 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let pfx = format!("{} ", fmt_clock(pos));
     let sfx = format!(" {}", fmt_clock(m.duration));
     let bw = textw.saturating_sub(pfx.chars().count() + sfx.chars().count()).max(8);
-    let mut progress_spans = vec![Span::styled(pfx, Style::default().fg(c::CYAN))];
+    let mut progress_spans = vec![Span::styled(pfx, Style::default().fg(c::cyan()))];
     progress_spans.extend(shimmer_bar(frac, bw, t));
     progress_spans.push(Span::styled(sfx, Style::default().fg(c::DIM)));
 
@@ -1912,7 +1916,7 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
         .max(1);
     let big = Line::from(vec![
         Span::styled(format!("{} ", icon), Style::default().fg(c::YELLOW)),
-        Span::styled(format!("{}°F", w.temp_f), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}°F", w.temp_f), Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", w.desc), Style::default().fg(c::TEXT)),
         Span::styled(format!("  feels {}°", w.feels_f), Style::default().fg(c::DIM)),
         Span::raw(" ".repeat(pad)),
@@ -1924,9 +1928,9 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     // row 1 — hi-lo (warm up = pink, cool down = cyan) / hum / UV.
     let detail = Line::from(vec![
-        Span::styled(format!("↑{}°", w.hi_f), Style::default().fg(c::PINK)),
+        Span::styled(format!("↑{}°", w.hi_f), Style::default().fg(c::pink())),
         Span::styled(" ", Style::default().fg(c::FAINT)),
-        Span::styled(format!("↓{}°", w.lo_f), Style::default().fg(c::CYAN)),
+        Span::styled(format!("↓{}°", w.lo_f), Style::default().fg(c::cyan())),
         Span::styled(format!("   hum {}%", w.humidity), Style::default().fg(c::FAINT)),
         Span::styled("   UV ", Style::default().fg(c::DIM)),
         Span::styled(format!("{}", w.uv), Style::default().fg(c::jazz((w.uv as f32 / 11.0).clamp(0.0, 1.0)))),
@@ -1934,7 +1938,7 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     // row 2 — atmosphere: wind / chance of rain / barometric pressure.
     let atmos = Line::from(vec![
-        Span::styled(format!("💨 {} {} mph", w.wind_dir, w.wind_mph), Style::default().fg(c::CYAN)),
+        Span::styled(format!("💨 {} {} mph", w.wind_dir, w.wind_mph), Style::default().fg(c::cyan())),
         Span::styled("   ☔ rain ", Style::default().fg(c::DIM)),
         Span::styled(format!("{}%", w.precip_chance), Style::default().fg(c::jazz((w.precip_chance as f32 / 100.0).clamp(0.0, 1.0)))),
         Span::styled(format!("   {} mb", w.pressure_mb), Style::default().fg(c::DIM)),
@@ -2001,13 +2005,13 @@ fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'stat
             Span::styled(" ● ", Style::default().fg(dot).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{}", unread_count),
-                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+                Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" unread ", Style::default().fg(c::DIM)),
         ]
     } else {
         vec![
-            Span::styled(" ✓ ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" ✓ ", Style::default().fg(c::accent()).add_modifier(Modifier::BOLD)),
             Span::styled("all read ", Style::default().fg(c::DIM)),
         ]
     }
@@ -2041,10 +2045,10 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     };
     let mut title_spans = vec![Span::styled(
         " iMESSAGE ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if msgs.available && msgs.fresh {
-        let dot = c::blend(c::PINK, c::ACCENT, badge_blend);
+        let dot = c::blend(c::pink(), c::accent(), badge_blend);
         title_spans.extend(unread_badge(msgs.unread_count, dot));
     }
 
@@ -2153,8 +2157,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             (
                 c::blend(c::TEXT, c::DIM, adv),
                 c::blend(c::TEXT, c::FAINT, adv),
-                c::blend(c::PINK, c::FAINT, adv),
-                c::blend(c::PINK, c::FAINT, adv),
+                c::blend(c::pink(), c::FAINT, adv),
+                c::blend(c::pink(), c::FAINT, adv),
             )
         } else {
             (c::DIM, c::FAINT, c::FAINT, c::FAINT)
@@ -2222,7 +2226,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 
         let prompt_alpha = e; // text fades in with the wipe
         let mut spans = vec![
-            Span::styled("↳ ", Style::default().fg(c::blend(c::BG, c::PINK, e))),
+            Span::styled("↳ ", Style::default().fg(c::blend(c::BG, c::pink(), e))),
             Span::styled(
                 format!("reply to {sender}  "),
                 Style::default().fg(c::blend(c::BG, c::DIM, prompt_alpha)),
@@ -2230,7 +2234,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         ];
         if ui.phase == MsgPhase::Sending {
             // Shimmer the draft away as a send "whoosh".
-            spans = vec![Span::styled("↳ ", Style::default().fg(c::PINK))];
+            spans = vec![Span::styled("↳ ", Style::default().fg(c::pink()))];
             let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
             let chars: Vec<char> = ui.draft.chars().collect();
             let n = chars.len().max(1);
@@ -2272,10 +2276,10 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // ----- title with unread badge / all-read tick (mirrors iMESSAGE) -----
     let mut title_spans = vec![Span::styled(
         " SIGNAL ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if sig.available && sig.fresh {
-        title_spans.extend(unread_badge(sig.unread_count, c::PINK));
+        title_spans.extend(unread_badge(sig.unread_count, c::pink()));
     }
 
     let block = Block::default()
@@ -2335,7 +2339,7 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let mut lines: Vec<Line> = Vec::with_capacity(ih);
     for m in sig.items.iter().take(shown) {
         let (sender_col, prev_col, dot_col) = if m.unread {
-            (c::TEXT, c::TEXT, c::PINK)
+            (c::TEXT, c::TEXT, c::pink())
         } else {
             (c::DIM, c::FAINT, c::FAINT)
         };
@@ -2418,24 +2422,24 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // ----- title with voice / unread badge -----
     let mut title_spans = vec![Span::styled(
         " DISCORD  ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if d.available && d.fresh {
         if in_voice > 0 {
             title_spans.push(Span::styled(
                 format!("{in_voice}"),
-                Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
+                Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD),
             ));
             title_spans.push(Span::styled(" in voice ", Style::default().fg(c::DIM)));
         } else if unread_text > 0 {
-            title_spans.push(Span::styled(" ● ", Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(" ● ", Style::default().fg(c::pink()).add_modifier(Modifier::BOLD)));
             title_spans.push(Span::styled(
                 format!("{unread_text}"),
-                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+                Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
             ));
             title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
         } else {
-            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::accent()).add_modifier(Modifier::BOLD)));
             title_spans.push(Span::styled("idle ", Style::default().fg(c::DIM)));
         }
     }
@@ -2511,7 +2515,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     for vc in voice.iter().take(DISCORD_MAX_VOICE) {
         lines.push(Line::from(vec![
             Span::raw("  "), // column parity with #text + iMESSAGE/SIGNAL rows
-            Span::styled(pad_width(&vc.name, namew), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_width(&vc.name, namew), Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
             Span::styled(fit_members(&vc.members, memw), Style::default().fg(c::DIM)),
         ]));
@@ -2521,7 +2525,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
     for tc in d.text.iter().take(DISCORD_MAX_TEXT) {
         let (name_col, prev_col, dot_col) = if tc.unread {
-            (c::TEXT, c::TEXT, c::PINK)
+            (c::TEXT, c::TEXT, c::pink())
         } else {
             (c::DIM, c::FAINT, c::FAINT)
         };
@@ -2576,7 +2580,7 @@ fn severity_color(sev: &str) -> ratatui::style::Color {
     match sev {
         "critical" => c::RED,
         "warn" => c::YELLOW,
-        "info" => c::CYAN,
+        "info" => c::cyan(),
         _ => c::DIM,
     }
 }
@@ -2614,12 +2618,12 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // ----- title + status badge -----
     let mut title_spans = vec![Span::styled(
         " MAC-DOCTOR ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if d.available {
         if d.running {
-            title_spans.push(Span::styled(format!(" {spin} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)));
-            title_spans.push(Span::styled("diagnosing ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(format!(" {spin} "), Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("diagnosing ", Style::default().fg(c::accent()).add_modifier(Modifier::BOLD)));
         } else {
             title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
             title_spans.push(Span::styled("watching ", Style::default().fg(c::DIM)));
@@ -2665,7 +2669,7 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         // What it's doing right now.
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{spin} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{spin} "), Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD)),
             Span::styled(
                 fit_width(&pretty_step(&d.step), iw.saturating_sub(4)),
                 Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD),
@@ -2674,7 +2678,7 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         // Why it woke up.
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("breach  ", Style::default().fg(c::PINK)),
+            Span::styled("breach  ", Style::default().fg(c::pink())),
             Span::styled(fit_width(&trigger, iw.saturating_sub(10)), Style::default().fg(c::DIM)),
         ]));
     } else {
@@ -2722,12 +2726,12 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // Footer: backend model · today's Claude spend · lifetime incident count.
     let mut footer: Vec<Span> = vec![Span::raw("  ")];
     if !d.last_model.is_empty() {
-        footer.push(Span::styled(d.last_model.clone(), Style::default().fg(c::ACCENT)));
+        footer.push(Span::styled(d.last_model.clone(), Style::default().fg(c::accent())));
         footer.push(Span::styled("  ·  ", Style::default().fg(c::FAINT)));
     }
     footer.push(Span::styled(
         format!("${:.2} today", d.today_cost),
-        Style::default().fg(if d.today_cost > 0.0 { c::CYAN } else { c::DIM }),
+        Style::default().fg(if d.today_cost > 0.0 { c::cyan() } else { c::DIM }),
     ));
     footer.push(Span::styled("  ·  ", Style::default().fg(c::FAINT)));
     footer.push(Span::styled(format!("{} incidents", d.incidents_total), Style::default().fg(c::DIM)));
@@ -2809,12 +2813,12 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // it ticks down on its own as the reconcile pass chases each one down.
     let mut title_spans = vec![Span::styled(
         " LYRICS  ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if s.lyrics_misses > 0 {
         title_spans.push(Span::styled(
             format!("{}", s.lyrics_misses),
-            Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+            Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
         ));
         title_spans.push(Span::styled(" missing ", Style::default().fg(c::DIM)));
     }
@@ -2954,7 +2958,7 @@ fn window(
             } else {
                 out.push(Line::from(Span::styled(
                     text,
-                    Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
                 )));
             }
         } else {
@@ -2984,7 +2988,7 @@ fn karaoke(text: &str, frac: f32) -> Line<'static> {
     // context lines (a calm cyan-violet), so the active lyric always reads as
     // "lit/current" even before the wipe reaches a given character. The boundary
     // glyph then blends from this pending tone to the vivid wipe colour.
-    let pending = c::blend(c::DIM, c::ACCENT, 0.45);
+    let pending = c::blend(c::DIM, c::accent(), 0.45);
     let mut spans = Vec::with_capacity(n);
     for (i, ch) in chars.iter().enumerate() {
         let p = i as f32 / n as f32;
@@ -3226,7 +3230,7 @@ fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     let mut title_spans = vec![Span::styled(
         " KEYBINDS ",
-        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
     if kb.available && !kb.hyper.is_empty() {
         title_spans.push(Span::styled(
@@ -3275,12 +3279,12 @@ fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
                 KbItem::Blank => lines.push(Line::from("")),
                 KbItem::Header(name) => lines.push(Line::from(Span::styled(
                     fit_width(name, colw),
-                    Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+                    Style::default().fg(c::pink()).add_modifier(Modifier::BOLD),
                 ))),
                 KbItem::Bind(keys, desc) => {
                     let dw = colw.saturating_sub(KB_KEYW + 1);
                     lines.push(Line::from(vec![
-                        Span::styled(pad_width(keys, KB_KEYW), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+                        Span::styled(pad_width(keys, KB_KEYW), Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD)),
                         Span::raw(" "),
                         Span::styled(fit_width(desc, dw), Style::default().fg(c::TEXT)),
                     ]));
