@@ -59,10 +59,17 @@ pub fn spawn_system(shared: Shared) {
             let overall = sys.global_cpu_usage();
             let load = System::load_average();
 
-            let mut procs: Vec<(String, f32, u64)> = sys
+            let mut procs: Vec<(String, f32, u64, u64)> = sys
                 .processes()
                 .values()
-                .map(|p| (p.name().to_string_lossy().to_string(), p.cpu_usage(), p.memory()))
+                .map(|p| {
+                    (
+                        p.name().to_string_lossy().to_string(),
+                        p.cpu_usage(),
+                        p.memory(),
+                        p.run_time(),
+                    )
+                })
                 .collect();
             procs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             procs.truncate(6);
@@ -570,7 +577,10 @@ pub fn spawn_weather(shared: Shared) {
 
 fn fetch_weather() -> Option<crate::state::Weather> {
     use crate::state::Weather;
-    let v: serde_json::Value = ureq::get("https://wttr.in/?format=j1")
+    // Pin the location: Fond du Lac, WI 54937 (43.7730, -88.4471). Querying
+    // wttr.in by explicit coords keeps the dependency-light path while landing
+    // the right city (IP-geolocation otherwise lands on the wrong town).
+    let v: serde_json::Value = ureq::get("https://wttr.in/43.7730,-88.4471?format=j1")
         .set("User-Agent", "curl/8")
         .call()
         .ok()?
@@ -578,9 +588,11 @@ fn fetch_weather() -> Option<crate::state::Weather> {
         .ok()?;
     let cur = v.get("current_condition")?.get(0)?;
     let today = v.get("weather")?.get(0)?;
-    let area = v.get("nearest_area").and_then(|a| a.get(0));
     let gi = |o: &serde_json::Value, k: &str| -> i32 {
         o.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0)
+    };
+    let gs = |o: &serde_json::Value, k: &str| -> String {
+        o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     let desc = cur
         .get("weatherDesc")
@@ -589,24 +601,78 @@ fn fetch_weather() -> Option<crate::state::Weather> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let location = area
-        .map(|a| {
-            let name = a.get("areaName").and_then(|n| n.get(0)).and_then(|n| n.get("value")).and_then(|x| x.as_str()).unwrap_or("");
-            let region = a.get("region").and_then(|n| n.get(0)).and_then(|n| n.get("value")).and_then(|x| x.as_str()).unwrap_or("");
-            format!("{name}, {region}")
+
+    // Highest rain chance across today's hourly slots.
+    let precip_chance = today
+        .get("hourly")
+        .and_then(|h| h.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| h.get("chanceofrain").and_then(|x| x.as_str()).and_then(|s| s.parse::<i32>().ok()))
+                .max()
+                .unwrap_or(0)
         })
+        .unwrap_or(0);
+
+    let astro = today.get("astronomy").and_then(|a| a.get(0));
+    let (sunrise, sunset) = astro
+        .map(|a| (gs(a, "sunrise"), gs(a, "sunset")))
         .unwrap_or_default();
+
+    // Next ~12 hourly temps (°F) across today + tomorrow for the jazz strip.
+    let mut temp_strip: Vec<u64> = Vec::new();
+    if let Some(days) = v.get("weather").and_then(|w| w.as_array()) {
+        for day in days.iter().take(2) {
+            if let Some(hrs) = day.get("hourly").and_then(|h| h.as_array()) {
+                for hr in hrs {
+                    if let Some(t) = hr.get("tempF").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+                        temp_strip.push(t.max(0) as u64);
+                    }
+                }
+            }
+        }
+    }
+    temp_strip.truncate(12);
+
     Some(Weather {
         fresh: true,
         icon: weather_icon(&desc),
-        location,
+        location: "Fond du Lac, WI".into(),
         temp_f: gi(cur, "temp_F"),
         feels_f: gi(cur, "FeelsLikeF"),
         humidity: gi(cur, "humidity"),
         hi_f: gi(today, "maxtempF"),
         lo_f: gi(today, "mintempF"),
+        wind_mph: gi(cur, "windspeedMiles"),
+        wind_dir: gs(cur, "winddir16Point"),
+        precip_chance,
+        uv: gi(cur, "uvIndex"),
+        pressure_mb: gi(cur, "pressure"),
+        sunrise: fmt_clock12_to_24(&sunrise),
+        sunset: fmt_clock12_to_24(&sunset),
+        temp_strip,
         desc,
     })
+}
+
+/// wttr.in emits astronomy times like "06:21 AM" / "08:14 PM". Normalize to a
+/// fixed-width 24h "HH:MM" so the right-aligned weather sun row never jitters.
+fn fmt_clock12_to_24(s: &str) -> String {
+    let s = s.trim();
+    let (time, ap) = match s.rsplit_once(' ') {
+        Some((t, ap)) => (t, ap.to_uppercase()),
+        None => return s.to_string(),
+    };
+    let (h, m) = match time.split_once(':') {
+        Some((h, m)) => (h.parse::<i32>().unwrap_or(0), m),
+        None => return s.to_string(),
+    };
+    let h24 = match ap.as_str() {
+        "PM" if h != 12 => h + 12,
+        "AM" if h == 12 => 0,
+        _ => h,
+    };
+    format!("{h24:02}:{m}")
 }
 
 fn weather_icon(desc: &str) -> String {
@@ -635,14 +701,15 @@ fn weather_icon(desc: &str) -> String {
 // Claude Code usage: roll up token usage + estimated cost from ~/.claude logs.
 // ---------------------------------------------------------------------------
 
-/// Per-million-token pricing, USD. Estimates for at-a-glance cost; edit freely.
-/// (input, output, cache_read, cache_write)
+/// Per-million-token pricing, USD: (input, output, cache_read, cache_write_5m).
+/// API-equivalent only — the user is on a Claude subscription, not API billing.
+/// cache_read = 0.1×input, cache_write(5m) = 1.25×input. Current as of 2026-06.
 fn pricing(model: &str) -> (f64, f64, f64, f64) {
     let m = model.to_lowercase();
     if m.contains("opus") {
-        (15.0, 75.0, 1.5, 18.75)
+        (5.0, 25.0, 0.5, 6.25)
     } else if m.contains("haiku") {
-        (0.8, 4.0, 0.08, 1.0)
+        (1.0, 5.0, 0.1, 1.25)
     } else if m.contains("sonnet") {
         (3.0, 15.0, 0.3, 3.75)
     } else {
@@ -667,24 +734,28 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
     let today = now.date_naive();
     let month = (now.year(), now.month());
 
+    let d7 = now - chrono::Duration::days(7);
+    let d30 = now - chrono::Duration::days(30);
+
     let mut st = UsageStats { fresh: true, ..Default::default() };
     let mut model_counts: std::collections::HashMap<String, u64> = Default::default();
     let mut sessions = std::collections::HashSet::new();
+    let mut sessions_30d = std::collections::HashSet::new();
     let mut hourly = [0u64; 24];
+    // Resumed sessions / sidechains replay the same assistant message across
+    // multiple JSONL files; count each request once or the totals balloon.
+    let mut seen_req: std::collections::HashSet<String> = Default::default();
 
-    // Only files touched this month can contain this month's rows.
-    let month_start = Local::now()
-        .with_day(1)
-        .and_then(|d| d.with_hour(0))
-        .map(|d| d.timestamp())
-        .unwrap_or(0);
+    // Only files touched within the last 31 days can hold rows for our windows
+    // (today / 7d / 30d). One day of slack covers timezone edges.
+    let scan_cutoff = now.timestamp() - 31 * 86400;
 
     let walk = walk_jsonl(&base);
     for path in walk {
         if let Ok(meta) = std::fs::metadata(&path) {
             if let Ok(modt) = meta.modified() {
                 if let Ok(dur) = modt.duration_since(std::time::UNIX_EPOCH) {
-                    if (dur.as_secs() as i64) < month_start - 86400 {
+                    if (dur.as_secs() as i64) < scan_cutoff {
                         continue;
                     }
                 }
@@ -699,11 +770,22 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
             let msg = v.get("message");
             let usage = msg.and_then(|m| m.get("usage")).or_else(|| v.get("usage"));
             let Some(u) = usage else { continue };
+            // Dedup on requestId (fall back to message.id) so replayed rows from
+            // resumed sessions/sidechains aren't double-counted.
+            if let Some(rid) = v
+                .get("requestId")
+                .and_then(|x| x.as_str())
+                .or_else(|| msg.and_then(|m| m.get("id")).and_then(|x| x.as_str()))
+            {
+                if !seen_req.insert(rid.to_string()) {
+                    continue;
+                }
+            }
             let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
             let Ok(dt) = DateTime::parse_from_rfc3339(ts) else { continue };
             let local = dt.with_timezone(&Local);
-            let in_month = (local.year(), local.month()) == month;
-            if !in_month {
+            // Older than our widest window (30d) — nothing to do with it.
+            if local < d30 {
                 continue;
             }
             let model = msg
@@ -716,12 +798,24 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
             let outp = g("output_tokens");
             let cread = g("cache_read_input_tokens");
             let cwrite = g("cache_creation_input_tokens");
+            let tokens = inp + outp + cread + cwrite;
             let (pi, po, pcr, pcw) = pricing(&model);
             let cost = inp as f64 / 1e6 * pi
                 + outp as f64 / 1e6 * po
                 + cread as f64 / 1e6 * pcr
                 + cwrite as f64 / 1e6 * pcw;
-            st.month_cost += cost;
+
+            // Rolling 30-day window (always reached, since we skipped older rows).
+            st.tokens_30d += tokens;
+            if let Some(sid) = v.get("sessionId").and_then(|x| x.as_str()) {
+                sessions_30d.insert(sid.to_string());
+            }
+            if local >= d7 {
+                st.tokens_7d += tokens;
+            }
+            if (local.year(), local.month()) == month {
+                st.month_cost += cost; // kept for the footer's "Claude today/$" readout
+            }
 
             if local.date_naive() == today {
                 st.today_input += inp;
@@ -735,7 +829,7 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
                     sessions.insert(sid.to_string());
                 }
                 let h = local.hour() as usize;
-                hourly[h] += (cost * 100.0) as u64; // cents per hour
+                hourly[h] += tokens; // token activity per hour
             }
         }
     }
@@ -746,6 +840,7 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
         .map(|(m, _)| short_model(&m))
         .unwrap_or_default();
     st.sessions_today = sessions.len() as u64;
+    st.sessions_30d = sessions_30d.len() as u64;
     st.hourly = hourly.to_vec();
     Some(st)
 }
@@ -760,6 +855,361 @@ fn short_model(m: &str) -> String {
         "Haiku".into()
     } else {
         m.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// iMessage: read recent inbound messages from ~/Library/Messages/chat.db via
+// the `sqlite3` CLI (read-only + immutable — zero new deps, FDA grants access).
+// Replies are sent back through osascript. Long previews are summarized via the
+// Anthropic Haiku API when ANTHROPIC_API_KEY is present (best-effort, cached).
+// ---------------------------------------------------------------------------
+
+/// Recent inbound messages, newest first. `quote(attributedBody)` emits a single
+/// `X'..'` hex literal so no embedded tab/newline from the BLOB can break TSV
+/// parsing. We only fetch the hex when `text` is empty (modern macOS stores the
+/// real string in attributedBody for ~9% of messages).
+const MSG_SQL: &str = "\
+SELECT m.ROWID, \
+       (m.date/1000000000.0 + 978307200) AS ts, \
+       m.is_read, \
+       COALESCE(h.id,'') AS handle, \
+       COALESCE(m.text,'') AS text, \
+       CASE WHEN (m.text IS NULL OR m.text='') AND m.attributedBody IS NOT NULL \
+            THEN quote(m.attributedBody) ELSE '' END AS ab \
+FROM message m \
+LEFT JOIN handle h ON m.handle_id = h.ROWID \
+WHERE m.is_from_me = 0 \
+ORDER BY m.date DESC \
+LIMIT 40;";
+
+const UNREAD_SQL: &str =
+    "SELECT count(*) FROM message WHERE is_from_me=0 AND is_read=0;";
+
+/// Beyond this many display chars a preview is summarized (if a key is present)
+/// or smart-truncated to keep the card readable.
+const PREVIEW_BUDGET: usize = 96;
+
+pub fn spawn_messages(shared: Shared) {
+    thread::spawn(move || {
+        let Some(home) = dirs::home_dir() else { return };
+        let db = home.join("Library/Messages/chat.db");
+        let uri = format!("file:{}?immutable=1", db.display());
+
+        // Network agent + per-ROWID summary cache, reused across polls.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(12))
+            .build();
+        let mut summary_cache: std::collections::HashMap<i64, String> = Default::default();
+
+        loop {
+            match read_messages(&uri) {
+                Some((mut items, unread)) => {
+                    // Best-effort summarization of long previews (gated on key).
+                    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                        if !key.is_empty() {
+                            for it in items.iter_mut() {
+                                if it.is_rich {
+                                    continue;
+                                }
+                                if it.full_text.chars().count() <= PREVIEW_BUDGET {
+                                    continue;
+                                }
+                                if let Some(cached) = summary_cache.get(&it.rowid) {
+                                    it.preview = cached.clone();
+                                    continue;
+                                }
+                                if let Some(sum) = summarize(&agent, &key, &it.full_text) {
+                                    summary_cache.insert(it.rowid, sum.clone());
+                                    it.preview = sum;
+                                }
+                            }
+                        }
+                    }
+                    let mut s = shared.lock().unwrap();
+                    s.messages.fresh = true;
+                    s.messages.available = true;
+                    s.messages.unread_count = unread;
+                    s.messages.items = items;
+                    // Keep the focus queue position in bounds as rows change.
+                    let n = s.messages.items.iter().filter(|i| i.unread).count();
+                    if s.msg_ui.queue_pos >= n.max(1) {
+                        s.msg_ui.queue_pos = n.saturating_sub(1);
+                    }
+                }
+                None => {
+                    let mut s = shared.lock().unwrap();
+                    s.messages.fresh = true;
+                    s.messages.available = false;
+                }
+            }
+            thread::sleep(Duration::from_secs(8));
+        }
+    });
+}
+
+/// Run the two queries; return (items newest-first, unread_count). None if the
+/// DB can't be read (no Full Disk Access) so the panel shows a graceful hint.
+fn read_messages(uri: &str) -> Option<(Vec<crate::state::MessageItem>, u32)> {
+    use crate::state::MessageItem;
+    let out = Command::new("sqlite3")
+        .args(["-separator", "\t", "-newline", "\n", uri, MSG_SQL])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("authorization denied") || stderr.contains("unable to open") {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+
+    let now = Local::now().timestamp() as f64;
+    let mut items = Vec::new();
+    for line in body.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let rowid: i64 = f[0].parse().unwrap_or(0);
+        let ts: f64 = f[1].parse().unwrap_or(0.0);
+        let is_read: i64 = f[2].parse().unwrap_or(1);
+        let handle = f[3].to_string();
+        let text = f[4].to_string();
+        let ab = f[5];
+
+        let (full_text, is_rich) = if !text.trim().is_empty() {
+            (text, false)
+        } else if !ab.is_empty() {
+            match decode_attributed_body(ab) {
+                Some(t) if !t.trim().is_empty() => (t, false),
+                _ => ("[rich message]".to_string(), true),
+            }
+        } else {
+            ("[rich message]".to_string(), true)
+        };
+
+        let sender = pretty_handle(&handle);
+        let preview = smart_preview(&full_text, PREVIEW_BUDGET);
+        items.push(MessageItem {
+            rowid,
+            sender,
+            handle,
+            preview,
+            full_text,
+            ts_unix: ts,
+            rel: fmt_rel((now - ts).max(0.0)),
+            is_rich,
+            unread: is_read == 0,
+        });
+    }
+
+    // Unread count (cheap separate query; cap to keep the badge sane).
+    let unread = Command::new("sqlite3")
+        .args([uri, UNREAD_SQL])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+        .unwrap_or_else(|| items.iter().filter(|i| i.unread).count() as u32);
+
+    Some((items, unread))
+}
+
+/// Make a raw handle (phone/email) friendlier. We don't have AddressBook access
+/// here; keep the email local-part or the last digits of a phone number so the
+/// fixed sender column reads cleanly.
+fn pretty_handle(h: &str) -> String {
+    if h.is_empty() {
+        return "Unknown".into();
+    }
+    if let Some((user, _dom)) = h.split_once('@') {
+        return user.to_string();
+    }
+    h.to_string()
+}
+
+/// Best-effort decode of an Apple typedstream `attributedBody` blob delivered as
+/// a `X'..'` SQL hex literal. We don't pull a typedstream crate (dependency-light
+/// rule); instead we hex-decode and extract the longest printable UTF-8 run,
+/// which is the message body in practice. Returns None if nothing sane is found.
+fn decode_attributed_body(hexlit: &str) -> Option<String> {
+    // Strip the leading X' and trailing '.
+    let inner = hexlit
+        .strip_prefix("X'")
+        .or_else(|| hexlit.strip_prefix("x'"))?
+        .strip_suffix('\'')?;
+    if inner.len() < 4 || inner.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(inner.len() / 2);
+    let hb = inner.as_bytes();
+    let hexval = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut i = 0;
+    while i + 1 < hb.len() {
+        let hi = hexval(hb[i])?;
+        let lo = hexval(hb[i + 1])?;
+        bytes.push((hi << 4) | lo);
+        i += 2;
+    }
+
+    // typedstream marks the body string with the class name "NSString"; the
+    // readable run begins shortly after. Find it, else fall back to the longest
+    // printable run anywhere in the blob.
+    let body = if let Some(pos) = find_subseq(&bytes, b"NSString") {
+        longest_printable_run(&bytes[pos + 8..])
+    } else {
+        longest_printable_run(&bytes)
+    };
+    body.filter(|s| s.chars().count() >= 2)
+}
+
+fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Scan a byte buffer for the longest contiguous run of printable UTF-8 text.
+fn longest_printable_run(bytes: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(bytes);
+    let mut best = "";
+    let mut cur_start = 0usize;
+    let mut in_run = false;
+    let mut run_start = 0usize;
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let printable = |c: char| c == ' ' || (!c.is_control() && c != '\u{fffd}');
+    for &(idx, ch) in &chars {
+        if printable(ch) {
+            if !in_run {
+                in_run = true;
+                run_start = idx;
+                cur_start = idx;
+            }
+        } else if in_run {
+            in_run = false;
+            let run = &s[run_start..idx];
+            if run.trim().len() > best.trim().len() {
+                best = &s[cur_start..idx];
+            }
+        }
+    }
+    if in_run {
+        let run = &s[run_start..];
+        if run.trim().len() > best.trim().len() {
+            best = run;
+        }
+    }
+    let t = best.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Single-line smart truncation: collapse newlines, cap to `max` chars with an
+/// ellipsis. The always-on fallback when no summarization key is present.
+fn smart_preview(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Relative-time label from a delta in seconds: "now" "2m" "1h" "yesterday" "3d".
+fn fmt_rel(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s < 45 {
+        "now".into()
+    } else if s < 3600 {
+        format!("{}m", (s / 60).max(1))
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else if s < 172800 {
+        "yd".into()
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
+/// AppleScript string escaping: backslash + double-quote, to stop the reply text
+/// from breaking the script (and basic injection hygiene).
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Send an iMessage reply via osascript, fire-and-forget so the event loop never
+/// blocks. Targets the iMessage service buddy for the given handle.
+pub fn send_imessage(handle: &str, body: &str) {
+    let script = format!(
+        "tell application \"Messages\"\n\
+         set targetService to 1st account whose service type = iMessage\n\
+         set targetBuddy to participant \"{h}\" of targetService\n\
+         send \"{b}\" to targetBuddy\n\
+         end tell",
+        h = applescript_escape(handle),
+        b = applescript_escape(body),
+    );
+    let _ = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Summarize a long message to <=8 words via Anthropic Haiku. Best-effort:
+/// returns None on any failure so the truncation fallback stays in control.
+fn summarize(agent: &ureq::Agent, key: &str, text: &str) -> Option<String> {
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 60,
+        "messages": [{
+            "role": "user",
+            "content": format!(
+                "Summarize this text message in 8 words or fewer, no quotes, no preamble:\n\n{text}"
+            )
+        }]
+    });
+    let resp: serde_json::Value = agent
+        .post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+        .ok()?
+        .into_json()
+        .ok()?;
+    let s = resp
+        .get("content")?
+        .get(0)?
+        .get("text")?
+        .as_str()?
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

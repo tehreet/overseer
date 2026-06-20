@@ -80,12 +80,35 @@ fn series<T>(buf: &T, w: usize, sample: impl Fn(&T, Instant) -> f32, norm: impl 
         .collect()
 }
 
+/// Box-blur a 0..1 series a few times (≈ a Gaussian) so a bursty signal like
+/// net throughput reads as one buttery curve instead of vertical cliffs between
+/// 1 Hz samples. Edges replicate (clamp), so the ends don't sag.
+fn smoothed(v: &[f32], radius: usize, passes: usize) -> Vec<f32> {
+    let n = v.len();
+    let mut cur = v.to_vec();
+    if n < 3 || radius == 0 {
+        return cur;
+    }
+    for _ in 0..passes {
+        let src = cur.clone();
+        for i in 0..n {
+            let lo = i.saturating_sub(radius);
+            let hi = (i + radius).min(n - 1);
+            let mut sum = 0.0f32;
+            for &x in &src[lo..=hi] {
+                sum += x;
+            }
+            cur[i] = sum / (hi - lo + 1) as f32;
+        }
+    }
+    cur
+}
+
 /// How an area graph colours its fill.
 #[derive(Clone, Copy)]
 enum Fill {
-    /// Per-column flame: green→red by that column's own height.
-    Heat,
     /// One hue, dim at the baseline → vivid at the crest.
+    #[allow(dead_code)]
     Tint(ratatui::style::Color),
     /// Funky synthwave bands: blue→violet→pink→white up the height.
     Jazz,
@@ -102,6 +125,10 @@ fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
     if w == 0 || h == 0 || vals.is_empty() {
         return;
     }
+    // Blur the column series so every area graph glides — bursty signals (net)
+    // and smoother ones (cpu/gpu/power) all read as one buttery curve, no cliffs.
+    let vals = smoothed(vals, 2, 4);
+    let vals = vals.as_slice();
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for row in 0..h {
         let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
@@ -125,7 +152,6 @@ fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
                 None
             } else {
                 let base = match fill {
-                    Fill::Heat => c::heat(v),
                     Fill::Tint(col) => col,
                     Fill::Jazz => c::jazz(crest),
                 };
@@ -239,36 +265,54 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),  // CPU equalizer
-            Constraint::Length(9),  // MEM · DISK · NET (same span as CPU)
-            Constraint::Length(11), // APPLE SILICON
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(5),
-            Constraint::Min(6),
+            Constraint::Length(9),  // [0] CPU equalizer
+            Constraint::Length(9),  // [1] MEM · DISK · NET
+            Constraint::Length(11), // [2] APPLE SILICON
+            Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
+            Constraint::Length(7),  // [4] CLAUDE CODE   (compact: token windows + big graph)
+            Constraint::Length(6),  // [5] GIT
+            Constraint::Length(8),  // [6] WEATHER       (jazzed, +data)
+            Constraint::Min(9),     // [7] iMESSAGE      (Builder 2 fills this)
         ])
         .split(body[0]);
 
     cpu_eq_panel(f, left[0], s);
     resources_panel(f, left[1], s);
     silicon_panel(f, left[2], s, t);
-    claude_panel(f, left[3], s);
-    git_panel(f, left[4], s);
-    weather_panel(f, left[5], s);
-    proc_panel(f, left[6], s);
+    proc_panel(f, left[3], s);
+    claude_panel(f, left[4], s);
+    git_panel(f, left[5], s);
+    weather_panel(f, left[6], s);
+    messages_panel(f, left[7], s, t);
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(3)])
-        .split(body[1]);
-
-    now_playing(f, right[0], s, t);
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
     // actively playing → lyrics; paused/stopped/idle → live system graphs.
-    if !s.music.polled || (s.music.playing && !s.music.track.is_empty()) {
+    let show_lyrics = !s.music.polled || (s.music.playing && !s.music.track.is_empty());
+
+    if show_lyrics {
+        // Cap the lyric band to a tight 9-row block (7 inner rows) and hand the
+        // freed vertical space to the live jazz system graphs — zero dead zone.
+        const LYRICS_H: u16 = 9;
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(9),
+                Constraint::Length(LYRICS_H),
+                Constraint::Min(0),
+            ])
+            .split(body[1]);
+        now_playing(f, right[0], s, t);
         lyrics_panel(f, right[1], s);
+        if right[2].height >= 3 {
+            system_panel(f, right[2], s);
+        }
     } else {
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(9), Constraint::Min(3)])
+            .split(body[1]);
+        now_playing(f, right[0], s, t);
         system_panel(f, right[1], s);
     }
 }
@@ -371,46 +415,51 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     let si = &s.silicon;
     let memf = if sys.mem_total > 0 { sys.mem_used as f32 / sys.mem_total as f32 } else { 0.0 };
     let cpu = if si.fresh { si.cpu_pct } else { sys.cpu_overall };
+    let ncpu = sys.per_core.len().max(1) as f64;
 
     let sep = || Span::styled("  │  ", Style::default().fg(c::FAINT).bg(c::PANEL_BORDER));
     let lbl = |t: &str| Span::styled(t.to_string(), Style::default().fg(c::DIM).bg(c::PANEL_BORDER));
     let val = |t: String, col| Span::styled(t, Style::default().fg(col).bg(c::PANEL_BORDER).add_modifier(Modifier::BOLD));
+    // Jazz family for normal readouts; RED only when a real threshold is crossed.
+    let temp_col = if si.cpu_temp_c > 80.0 { c::RED } else { c::jazz((si.cpu_temp_c - 30.0) / 70.0) };
+    let load_alarm = sys.load.0 > ncpu;
+    let cpu_col = if load_alarm { c::RED } else { c::jazz(cpu / 100.0) };
 
     let mut spans = vec![
         Span::styled(" q ", Style::default().fg(c::BG).bg(c::ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(" quit", Style::default().fg(c::DIM).bg(c::PANEL_BORDER)),
         sep(),
         lbl("CPU "),
-        val(format!("{cpu:>2.0}%"), c::heat(cpu / 100.0)),
+        val(format!("{cpu:>3.0}%"), cpu_col),
     ];
     if si.fresh {
         spans.push(sep());
         spans.push(lbl("GPU "));
-        spans.push(val(format!("{:>2.0}%", si.gpu_pct), c::heat(si.gpu_pct / 100.0)));
+        spans.push(val(format!("{:>3.0}%", si.gpu_pct), c::jazz(si.gpu_pct / 100.0)));
         spans.push(sep());
         spans.push(lbl("PWR "));
-        spans.push(val(format!("{:.1}W", si.all_power_w), c::YELLOW));
+        spans.push(val(format!("{:>5.1}W", si.all_power_w), c::jazz((si.all_power_w / 120.0).clamp(0.0, 1.0))));
         spans.push(sep());
         spans.push(lbl("TEMP "));
-        spans.push(val(format!("{:.0}°", si.cpu_temp_c), c::heat((si.cpu_temp_c - 30.0) / 70.0)));
+        spans.push(val(format!("{:>3.0}°", si.cpu_temp_c), temp_col));
     }
     spans.push(sep());
     spans.push(lbl("MEM "));
-    spans.push(val(format!("{:.0}%", memf * 100.0), c::heat(memf)));
+    spans.push(val(format!("{:>3.0}%", memf * 100.0), c::jazz(memf)));
     spans.push(sep());
     spans.push(lbl("NET "));
-    spans.push(Span::styled(format!("▼{}", fmt_rate_short(sys.net_rx_bps)), Style::default().fg(c::GREEN).bg(c::PANEL_BORDER)));
-    spans.push(Span::styled(format!(" ▲{}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::PINK).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!("▼{:>5}", fmt_rate_short(sys.net_rx_bps)), Style::default().fg(c::CYAN).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!(" ▲{:>5}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::PINK).bg(c::PANEL_BORDER)));
     if s.usage.fresh {
         spans.push(sep());
         spans.push(lbl("Claude today "));
-        spans.push(val(format!("${:.2}", s.usage.today_cost), c::GREEN));
+        spans.push(val(format!("${:>5.2}", s.usage.today_cost), c::GREEN));
     }
     spans.push(sep());
     spans.push(lbl("↑ "));
-    spans.push(Span::styled(fmt_dur(sys.uptime_secs), Style::default().fg(c::TEXT).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!("{:>9}", fmt_dur(sys.uptime_secs)), Style::default().fg(c::TEXT).bg(c::PANEL_BORDER)));
     spans.push(sep());
-    spans.push(Span::styled(format!("{} procs", sys.proc_count), Style::default().fg(c::DIM).bg(c::PANEL_BORDER)));
+    spans.push(Span::styled(format!("{:>3} procs", sys.proc_count), Style::default().fg(c::DIM).bg(c::PANEL_BORDER)));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -451,7 +500,6 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState) {
         let row_top = (bar_rows - r) as f32 / bar_rows as f32;
         let row_bot = (bar_rows - r - 1) as f32 / bar_rows as f32;
         let mid = (row_top + row_bot) * 0.5;
-        let color = c::heat(mid);
         let mut spans: Vec<Span> = Vec::with_capacity(n * 2 + 1);
         if lead > 0 {
             spans.push(Span::raw(" ".repeat(lead)));
@@ -468,9 +516,12 @@ fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState) {
             if glyph == ' ' {
                 spans.push(Span::raw(" ".repeat(bar_w)));
             } else {
-                // Bright crest (no dark cap): the partial block already conveys
-                // the sub-cell height; colour it the same as a full cell.
-                let st = Style::default().fg(color);
+                // Synthwave spectrum: hue follows the core's REAL load (0.75*h)
+                // with a gentle vertical lift (0.25*mid) so each column keeps a
+                // legible bottom→top gradient. Idle cores stay blue, busy cores
+                // climb violet→pink→white. No green/orange heat anywhere.
+                let col = c::jazz((0.25 * mid + 0.75 * h).clamp(0.0, 1.0));
+                let st = Style::default().fg(col);
                 spans.push(Span::styled(glyph.to_string().repeat(bar_w), st));
             }
             if core < n {
@@ -523,14 +574,14 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
     let mut mem_line = vec![Span::styled("mem  ", Style::default().fg(c::DIM))];
-    mem_line.extend(bar_spans(memf, bw, c::heat(memf)));
+    mem_line.extend(bar_spans(memf, bw, c::jazz(memf)));
     mem_line.push(Span::styled(
         format!(" {:>3.0}%  {} / {}", memf * 100.0, fmt_bytes(s.system.mem_used), fmt_bytes(s.system.mem_total)),
         Style::default().fg(c::TEXT),
     ));
     lines.push(Line::from(mem_line));
     let mut disk_line = vec![Span::styled("disk ", Style::default().fg(c::DIM))];
-    disk_line.extend(bar_spans(diskf, bw, c::heat(diskf)));
+    disk_line.extend(bar_spans(diskf, bw, c::jazz(diskf)));
     disk_line.push(Span::styled(
         format!(" {:>3.0}%  {} / {}", diskf * 100.0, fmt_bytes(s.system.disk_used), fmt_bytes(s.system.disk_total)),
         Style::default().fg(c::TEXT),
@@ -538,8 +589,8 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     lines.push(Line::from(disk_line));
     lines.push(Line::from(vec![
         Span::styled("net  ", Style::default().fg(c::DIM)),
-        Span::styled("▼ ", Style::default().fg(c::GREEN)),
-        Span::styled(format!("{:>10}", fmt_rate(s.system.net_rx_bps)), Style::default().fg(c::GREEN)),
+        Span::styled("▼ ", Style::default().fg(c::CYAN)),
+        Span::styled(format!("{:>10}", fmt_rate(s.system.net_rx_bps)), Style::default().fg(c::CYAN)),
         Span::styled("    ▲ ", Style::default().fg(c::PINK)),
         Span::styled(format!("{:>10}", fmt_rate(s.system.net_tx_bps)), Style::default().fg(c::PINK)),
     ]));
@@ -562,7 +613,7 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
             sampled_scalar,
             |bps| ((bps.max(1.0).log10() - 3.0) / 4.0).clamp(0.0, 1.0),
         );
-        area_graph(f, plot, &vals, Fill::Tint(c::CYAN));
+        area_graph(f, plot, &vals, Fill::Jazz);
     }
 }
 
@@ -596,7 +647,9 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // Gauges in a fixed-width column on the left; the smooth power-draw graph
     // fills everything to the right edge so it sits snug against the gauges
     // (no awkward gap) and reads the same width as the NET wave.
-    let gauge_w = 38u16.min(inner.width);
+    // 34 (not 38) so the right-side stat block keeps ~22 cols: the strings
+    // 'cpu 9.2W   ane 0.0W' need 21, and at bw=10 the gauge line still fits.
+    let gauge_w = 34u16.min(inner.width);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(gauge_w), Constraint::Min(0)])
@@ -619,14 +672,14 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // Jazzy synthwave bars: blue→violet→pink→white by fill, so the whole box
     // reads purple/pink/blue/white. Magnitude still scans (low=blue, high=white).
     let lines = vec![
-        gauge("gpu", gpu / 100.0, c::jazz(gpu / 100.0), format!(" {:>3.0}%  {} MHz", gpu, si.gpu_freq_mhz)),
-        gauge("e-cpu", ecpu / 100.0, c::jazz(ecpu / 100.0), format!(" {:>3.0}%  {} MHz", ecpu, si.ecpu_freq_mhz)),
-        gauge("p-cpu", pcpu / 100.0, c::jazz(pcpu / 100.0), format!(" {:>3.0}%  {} MHz", pcpu, si.pcpu_freq_mhz)),
+        gauge("gpu", gpu / 100.0, c::jazz(gpu / 100.0), format!(" {:>4.0}%  {} MHz", gpu, si.gpu_freq_mhz)),
+        gauge("e-cpu", ecpu / 100.0, c::jazz(ecpu / 100.0), format!(" {:>4.0}%  {} MHz", ecpu, si.ecpu_freq_mhz)),
+        gauge("p-cpu", pcpu / 100.0, c::jazz(pcpu / 100.0), format!(" {:>4.0}%  {} MHz", pcpu, si.pcpu_freq_mhz)),
         {
             let pf = (spw / 120.0).clamp(0.0, 1.0);
             let mut spans = vec![Span::styled("power  ", Style::default().fg(c::DIM))];
             spans.extend(bar_spans(pf, bw, c::jazz(pf)));
-            spans.push(Span::styled(format!(" {:>4.1} W", spw), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!(" {:>4.1}W", spw), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
             Line::from(spans)
         },
         Line::from(""), // padding under the power bar
@@ -681,45 +734,52 @@ fn claude_panel(f: &mut Frame, area: Rect, s: &AppState) {
         );
         return;
     }
+    if inner.height < 2 || inner.width < 8 {
+        return;
+    }
     let tot_today = u.today_input + u.today_output + u.today_cache_read + u.today_cache_write;
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("today  ", Style::default().fg(c::DIM)),
-            Span::styled(fmt_tokens(tot_today), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(" tok   ", Style::default().fg(c::FAINT)),
-            Span::styled(format!("${:.2}", u.today_cost), Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(" est", Style::default().fg(c::FAINT)),
-        ]),
-        Line::from(vec![
-            Span::styled("       in ", Style::default().fg(c::FAINT)),
-            Span::styled(fmt_tokens(u.today_input), Style::default().fg(c::DIM)),
-            Span::styled("  out ", Style::default().fg(c::FAINT)),
-            Span::styled(fmt_tokens(u.today_output), Style::default().fg(c::DIM)),
-            Span::styled("  cache ", Style::default().fg(c::FAINT)),
-            Span::styled(fmt_tokens(u.today_cache_read + u.today_cache_write), Style::default().fg(c::DIM)),
-        ]),
-        Line::from(vec![
-            Span::styled("sessions ", Style::default().fg(c::DIM)),
-            Span::styled(format!("{}", u.sessions_today), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
-            Span::styled("   msgs ", Style::default().fg(c::DIM)),
-            Span::styled(format!("{}", u.today_messages), Style::default().fg(c::TEXT)),
-            Span::styled("   ", Style::default().fg(c::FAINT)),
-            Span::styled(u.top_model.clone(), Style::default().fg(c::PINK)),
-        ]),
-        Line::from(vec![
-            Span::styled("burn   ", Style::default().fg(c::DIM)),
-            Span::styled(c::spark(&u.hourly, 22), Style::default().fg(c::ORANGE)),
-        ]),
-        Line::from(vec![
-            Span::styled("month  ", Style::default().fg(c::DIM)),
-            Span::styled(format!("${:.2}", u.month_cost), Style::default().fg(c::YELLOW).add_modifier(Modifier::BOLD)),
-            Span::styled(" est", Style::default().fg(c::FAINT)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // Two tight text rows: token windows (today / 7d / 30d) + 30-day sessions.
+    let tokens = Line::from(vec![
+        Span::styled("today ", Style::default().fg(c::DIM)),
+        Span::styled(fmt_tokens(tot_today), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled("   7d ", Style::default().fg(c::DIM)),
+        Span::styled(fmt_tokens(u.tokens_7d), Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("   30d ", Style::default().fg(c::DIM)),
+        Span::styled(fmt_tokens(u.tokens_30d), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)),
+    ]);
+    let sess = Line::from(vec![
+        Span::styled("sessions ", Style::default().fg(c::DIM)),
+        Span::styled(format!("{}", u.sessions_30d), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  rolling 30d", Style::default().fg(c::FAINT)),
+    ]);
+    f.render_widget(
+        Paragraph::new(vec![tokens, sess]),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 2 },
+    );
+
+    // The rest of the card is the (now bigger) graph: hourly token activity over
+    // the last 24h as a filled jazz area graph (auto-smoothed by area_graph).
+    let plot = Rect { x: inner.x, y: inner.y + 2, width: inner.width, height: inner.height.saturating_sub(2) };
+    if plot.height >= 1 && plot.width > 0 {
+        let n = u.hourly.len().max(1);
+        let maxv = u.hourly.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let w = plot.width as usize;
+        let vals: Vec<f32> = (0..w)
+            .map(|x| {
+                let pos = if w > 1 { x as f32 / (w - 1) as f32 * (n - 1) as f32 } else { 0.0 };
+                let i0 = pos.floor() as usize;
+                let i1 = (i0 + 1).min(n - 1);
+                let frac = pos - i0 as f32;
+                let v = u.hourly[i0] as f32 * (1.0 - frac) + u.hourly[i1] as f32 * frac;
+                v / maxv
+            })
+            .collect();
+        area_graph(f, plot, &vals, Fill::Jazz);
+    }
 }
 
-fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+fn now_playing(f: &mut Frame, area: Rect, s: &AppState, _t: f64) {
     let m = &s.music;
     let hot = m.playing;
     let block = panel("NOW PLAYING", hot);
@@ -744,44 +804,49 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 
     // Text column starts after the art + a 3-cell gap.
     let gap = art_cols + 4;
-    let info = Rect {
-        x: inner.x + gap,
-        y: inner.y,
-        width: inner.width.saturating_sub(gap),
-        height: inner.height,
-    };
     let pos = m.position();
     let frac = if m.duration > 0.0 { (pos / m.duration) as f32 } else { 0.0 };
     let icon = if m.playing { "▶" } else { "❚❚" };
-    let eq = if m.playing { eq_bars(t, 10) } else { "▁".repeat(10) };
 
     let title = Line::from(vec![
-        Span::styled(format!("{icon} "), Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
+        // Transport icon rides the jazz family, not green.
+        Span::styled(format!("{icon} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
         Span::styled(m.track.clone(), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("   {eq}"), Style::default().fg(c::PINK)),
     ]);
     let meta = Line::from(vec![
         Span::styled(m.artist.clone(), Style::default().fg(c::ACCENT)),
         Span::styled("  ·  ", Style::default().fg(c::FAINT)),
         Span::styled(m.album.clone(), Style::default().fg(c::DIM)),
     ]);
-    let bw = (info.width as usize).saturating_sub(16).clamp(8, 90);
+    let textw = (inner.width.saturating_sub(gap)) as usize;
+    let bw = textw.saturating_sub(16).clamp(8, 90);
     let mut progress_spans = vec![Span::styled(format!("{} ", fmt_clock(pos)), Style::default().fg(c::CYAN))];
     progress_spans.extend(bar_spans(frac, bw, c::PINK));
     progress_spans.push(Span::styled(format!(" {}", fmt_clock(m.duration)), Style::default().fg(c::DIM)));
-    f.render_widget(
-        Paragraph::new(vec![
-            title,
-            meta,
-            Line::from(""),
-            Line::from(progress_spans),
-            Line::from(Span::styled(
-                if m.playing { "playing" } else { "paused" },
-                Style::default().fg(c::FAINT),
-            )),
-        ]),
-        info,
-    );
+
+    // Status row carries an honest, static EQ flourish (no time term, no fake
+    // motion) plus the transport word — fills the column without lying.
+    let status = Line::from(vec![
+        Span::styled(
+            if m.playing { "playing" } else { "paused" },
+            Style::default().fg(c::FAINT),
+        ),
+        Span::styled("   ▁▂▃▃▂▁", Style::default().fg(c::FAINT)),
+    ]);
+
+    let body = vec![title, meta, Line::from(""), Line::from(progress_spans), status];
+
+    // Vertically center the metadata block against the album art so the text and
+    // art share a baseline — no dead rectangle below the text next to tall art.
+    let nblock = body.len() as u16;
+    let top_pad = inner.height.saturating_sub(nblock) / 2;
+    let info = Rect {
+        x: inner.x + gap,
+        y: inner.y + top_pad,
+        width: inner.width.saturating_sub(gap),
+        height: inner.height.saturating_sub(top_pad),
+    };
+    f.render_widget(Paragraph::new(body), info);
 }
 
 /// Right-column filler when music isn't playing: three buttery, continuously-
@@ -893,10 +958,10 @@ fn git_panel(f: &mut Frame, area: Rect, s: &AppState) {
         f.render_widget(Paragraph::new(Span::styled("not a git repo", Style::default().fg(c::DIM))), inner);
         return;
     }
-    let clean_col = if g.dirty == 0 { c::GREEN } else { c::YELLOW };
+    let clean_col = if g.dirty == 0 { c::GREEN } else { c::PINK };
     let mut head = vec![
-        Span::styled("", Style::default().fg(c::ORANGE)),
-        Span::styled(g.branch.clone(), Style::default().fg(c::ORANGE).add_modifier(Modifier::BOLD)),
+        Span::styled("", Style::default().fg(c::ACCENT)),
+        Span::styled(g.branch.clone(), Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
     ];
     if g.ahead > 0 {
         head.push(Span::styled(format!("  ↑{}", g.ahead), Style::default().fg(c::GREEN)));
@@ -928,21 +993,35 @@ fn proc_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let procs = &s.system.top_procs;
-    if procs.is_empty() {
+    if procs.is_empty() || inner.height < 2 || inner.width < 8 {
+        if !procs.is_empty() {
+            // Too short to render rows gracefully — skip rather than clip.
+            return;
+        }
         f.render_widget(Paragraph::new(Span::styled("…", Style::default().fg(c::DIM))), inner);
         return;
     }
-    let rows = (inner.height as usize).min(procs.len());
-    let namew = (inner.width as usize).saturating_sub(20).clamp(8, 40);
-    let mut lines = Vec::with_capacity(rows);
-    for (name, cpu, mem) in procs.iter().take(rows) {
+    // Column budget: cpu(6) gap(2) mem(6) gap(3) up(6) gap(2) = 25 before name.
+    let namew = (inner.width as usize).saturating_sub(25).clamp(8, 40);
+    let avail = inner.height as usize;
+
+    // Always show a labeled header row so the columns are self-explanatory; the
+    // labels right-align to the same columns as the data below them.
+    let mut lines: Vec<Line> = Vec::with_capacity(avail);
+    lines.push(Line::from(Span::styled(
+        format!("{:>6}  {:>6}   {:>6}  {}", "cpu%", "mem", "uptime", "process"),
+        Style::default().fg(c::DIM).add_modifier(Modifier::BOLD),
+    )));
+    let rows = avail.saturating_sub(lines.len()).min(procs.len());
+    for (name, cpu, mem, uptime) in procs.iter().take(rows) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{:>5.1}%", cpu),
-                Style::default().fg(c::heat((*cpu / 100.0).min(1.0))).add_modifier(Modifier::BOLD),
+                Style::default().fg(c::jazz((*cpu / 100.0).min(1.0))).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {:>6}  ", fmt_bytes(*mem)), Style::default().fg(c::DIM)),
-            Span::styled(truncate(name, namew), Style::default().fg(c::TEXT)),
+            Span::styled(format!("  {:>6}", fmt_bytes(*mem)), Style::default().fg(c::DIM)),
+            Span::styled(format!("   {:>6}", fmt_dur_short(*uptime)), Style::default().fg(c::FAINT)),
+            Span::styled(format!("  {}", truncate(name, namew)), Style::default().fg(c::TEXT)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -957,18 +1036,320 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
         f.render_widget(Paragraph::new(Span::styled("fetching…", Style::default().fg(c::DIM))), inner);
         return;
     }
+    if inner.height < 2 || inner.width < 8 {
+        return;
+    }
+    let iw = inner.width as usize;
+    let h = inner.height as usize;
+
+    // row 0 — big readout on the left, sunrise/sunset flush-right.
+    let left_txt = format!("{} {}°F  {}", w.icon, w.temp_f, w.desc);
+    let right_txt = format!("☀ {}  ☾ {}", w.sunrise, w.sunset);
+    let pad = iw
+        .saturating_sub(left_txt.chars().count() + right_txt.chars().count())
+        .max(1);
     let big = Line::from(vec![
         Span::styled(format!("{} ", w.icon), Style::default().fg(c::YELLOW)),
         Span::styled(format!("{}°F", w.temp_f), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", w.desc), Style::default().fg(c::TEXT)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            format!("☀ {}  ☾ {}", w.sunrise, w.sunset),
+            Style::default().fg(c::jazz(0.85)),
+        ),
     ]);
+
+    // row 1 — feels / hi-lo (warm up = pink, cool down = cyan) / hum / UV.
     let detail = Line::from(vec![
         Span::styled(format!("feels {}°  ", w.feels_f), Style::default().fg(c::DIM)),
-        Span::styled(format!("↑{}° ↓{}°  ", w.hi_f, w.lo_f), Style::default().fg(c::DIM)),
-        Span::styled(format!("hum {}%", w.humidity), Style::default().fg(c::FAINT)),
+        Span::styled(format!("↑{}°", w.hi_f), Style::default().fg(c::PINK)),
+        Span::styled(" ", Style::default().fg(c::FAINT)),
+        Span::styled(format!("↓{}°", w.lo_f), Style::default().fg(c::CYAN)),
+        Span::styled(format!("   hum {}%", w.humidity), Style::default().fg(c::FAINT)),
+        Span::styled("   UV ", Style::default().fg(c::DIM)),
+        Span::styled(format!("{}", w.uv), Style::default().fg(c::jazz((w.uv as f32 / 11.0).clamp(0.0, 1.0)))),
     ]);
-    let loc = Line::from(Span::styled(w.location.clone(), Style::default().fg(c::FAINT)));
-    f.render_widget(Paragraph::new(vec![big, detail, loc]), inner);
+
+    // row 2 — atmosphere: wind / precip chance / pressure.
+    let atmos = Line::from(vec![
+        Span::styled(format!("💨 {} {} mph", w.wind_dir, w.wind_mph), Style::default().fg(c::CYAN)),
+        Span::styled("   ☔ ", Style::default().fg(c::DIM)),
+        Span::styled(format!("{}%", w.precip_chance), Style::default().fg(c::jazz((w.precip_chance as f32 / 100.0).clamp(0.0, 1.0)))),
+        Span::styled(format!("   ◧ {} mb", w.pressure_mb), Style::default().fg(c::DIM)),
+    ]);
+
+    let mut lines: Vec<Line> = vec![big, detail, atmos];
+
+    // row 3 — thin jazz rule for rhythm.
+    if h > 4 {
+        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
+    }
+    // row 4 — tiny hourly temp strip (real forecast temps, jazz-colored).
+    if h > 5 && !w.temp_strip.is_empty() {
+        let mut strip = vec![Span::styled("", Style::default())];
+        strip.extend(jazz_spark(&w.temp_strip, iw));
+        lines.push(Line::from(strip));
+    }
+    // last row — location.
+    lines.push(Line::from(Span::styled(w.location.clone(), Style::default().fg(c::FAINT))));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// iMESSAGE card: unread badge in the title, a list of recent inbound messages
+/// (focus marker · sender · preview · rel-time · unread dot), and an inline reply
+/// input that wipes open on a double-press. All motion is interpolated each
+/// frame off `s.msg_ui.anim_start` — never a discrete flip.
+fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    use crate::state::MsgPhase;
+    let msgs = &s.messages;
+    let ui = &s.msg_ui;
+
+    // ----- title with unread badge / all-read tick -----
+    let hot = ui.active;
+    let border = if hot { c::PANEL_BORDER_HOT } else { c::PANEL_BORDER };
+    // Settle: pink "● n unread" crossfades to green "✓ all read" over 300ms.
+    let badge_blend = match ui.phase {
+        MsgPhase::Advancing if msgs.unread_count == 0 => {
+            ui.progress(Duration::from_millis(300)).unwrap_or(1.0)
+        }
+        _ => {
+            if msgs.unread_count == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    };
+    let mut title_spans = vec![Span::styled(
+        " iMESSAGE ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if msgs.available && msgs.fresh {
+        if msgs.unread_count > 0 {
+            let dot = c::blend(c::PINK, c::GREEN, badge_blend);
+            title_spans.push(Span::styled(" ● ", Style::default().fg(dot).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(
+                format!("{}", msgs.unread_count),
+                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+            ));
+            title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
+        } else {
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("all read ", Style::default().fg(c::DIM)));
+        }
+    }
+
+    // Failure flash: border pulses red, fade in 120ms / out 240ms.
+    let border = if let Some(fa) = ui.send_failed_at {
+        let e = fa.elapsed().as_secs_f32();
+        let amp = if e < 0.12 {
+            e / 0.12
+        } else {
+            (1.0 - (e - 0.12) / 0.24).clamp(0.0, 1.0)
+        };
+        c::blend(border, c::RED, amp)
+    } else {
+        border
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 10 {
+        return;
+    }
+
+    // ----- graceful gating states -----
+    if !msgs.fresh {
+        f.render_widget(
+            Paragraph::new(Span::styled("reading messages…", Style::default().fg(c::DIM))),
+            inner,
+        );
+        return;
+    }
+    if !msgs.available {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("✉  can't read Messages", Style::default().fg(c::DIM))),
+                Line::from(Span::styled(
+                    "grant Full Disk Access to studioboard",
+                    Style::default().fg(c::FAINT),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+    if msgs.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("✉  inbox clear", Style::default().fg(c::FAINT)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let ih = inner.height as usize;
+
+    // The composer (when open) consumes the card's reserved bottom slack so the
+    // message rows above it never reflow. Reserve 1 row while opening/open.
+    let composer_open = ui.composing || ui.phase == MsgPhase::Opening;
+    let composer_rows = if composer_open { 1usize } else { 0 };
+    // One row for the separator+footer summary when there's room.
+    let want_footer = ih > msgs.items.len() + composer_rows + 1;
+    let footer_rows = if want_footer { 2 } else { 0 };
+    let list_rows = ih
+        .saturating_sub(composer_rows)
+        .saturating_sub(footer_rows);
+    let shown = list_rows.min(msgs.items.len());
+
+    // Index (within items) of the focused unread message, for the slide marker.
+    let unread_indices: Vec<usize> = msgs
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.unread)
+        .map(|(i, _)| i)
+        .collect();
+    let focus_idx = unread_indices.get(ui.queue_pos).copied();
+
+    // Reserved column budget: marker(2) + sender(16) + gap(1) + reltime(4) + dot(2).
+    let prevw = iw.saturating_sub(2 + 16 + 1 + 4 + 2).max(6);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(ih);
+    for (i, m) in msgs.items.iter().take(shown).enumerate() {
+        let is_focus = Some(i) == focus_idx;
+        // Read/unread tone, crossfading on Advance for the focused row.
+        let adv = if is_focus && ui.phase == MsgPhase::Advancing {
+            ui.progress(Duration::from_millis(220)).unwrap_or(1.0)
+        } else {
+            0.0
+        };
+        let (sender_col, prev_col, marker_col, dot_col) = if m.unread {
+            // unread → (read) as adv goes 0→1
+            (
+                c::blend(c::TEXT, c::DIM, adv),
+                c::blend(c::TEXT, c::FAINT, adv),
+                c::blend(c::PINK, c::FAINT, adv),
+                c::blend(c::PINK, c::FAINT, adv),
+            )
+        } else {
+            (c::DIM, c::FAINT, c::FAINT, c::FAINT)
+        };
+
+        // Focus marker (the only moving element); reserved width 2.
+        let marker = if is_focus {
+            Span::styled("▌ ", Style::default().fg(marker_col).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        let sender = format!("{:<16}", truncate(&m.sender, 16));
+        let sender_style = if m.unread && adv < 0.5 {
+            Style::default().fg(sender_col).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(sender_col)
+        };
+        let preview = truncate(&m.preview, prevw);
+        let prev_style = if m.is_rich {
+            Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(prev_col)
+        };
+        let dot = if m.unread {
+            Span::styled(" ●", Style::default().fg(dot_col).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(sender, sender_style),
+            Span::raw(" "),
+            Span::styled(format!("{preview:<width$}", width = prevw), prev_style),
+            Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)),
+            dot,
+        ]));
+    }
+
+    // ----- separator + tail summary -----
+    if want_footer {
+        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
+        let earlier = msgs.items.len().saturating_sub(shown);
+        let hint = if ui.active {
+            "  m: read · mm: reply".to_string()
+        } else {
+            format!("read · {earlier} earlier")
+        };
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(c::FAINT))));
+    }
+
+    // ----- inline reply composer (vertical-wipe open / close) -----
+    if composer_open {
+        // Wipe progress: Opening eases 0→1; Closing/Sending eases 1→0.
+        let p = match ui.phase {
+            MsgPhase::Opening => ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+            MsgPhase::Closing => 1.0 - ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+            _ => 1.0,
+        };
+        let e = p * p * (3.0 - 2.0 * p); // smoothstep
+        let sender = focus_idx
+            .and_then(|i| msgs.items.get(i))
+            .map(|m| m.sender.clone())
+            .unwrap_or_else(|| "message".into());
+
+        // Blinking caret: sine on alpha (~1s period), DIM↔TEXT — soft, not hard.
+        let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
+        let caret_col = c::blend(c::FAINT, c::TEXT, blink);
+
+        let prompt_alpha = e; // text fades in with the wipe
+        let mut spans = vec![
+            Span::styled("↳ ", Style::default().fg(c::blend(c::BG, c::PINK, e))),
+            Span::styled(
+                format!("reply to {sender}  "),
+                Style::default().fg(c::blend(c::BG, c::DIM, prompt_alpha)),
+            ),
+        ];
+        if ui.phase == MsgPhase::Sending {
+            // Shimmer the draft away as a send "whoosh".
+            spans = vec![Span::styled("↳ ", Style::default().fg(c::PINK))];
+            let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
+            let chars: Vec<char> = ui.draft.chars().collect();
+            let n = chars.len().max(1);
+            for (ci, ch) in chars.iter().enumerate() {
+                let cp = ci as f32 / n as f32;
+                let d = (cp - head).abs();
+                let b = (-(d * d) / (2.0 * 0.08 * 0.08)).exp();
+                let col = c::blend(c::TEXT, c::jazz(0.88), b);
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(col)));
+            }
+        } else {
+            // Live draft, left-truncated so the caret stays visible.
+            let budget = iw.saturating_sub(2 + 9 + sender.chars().count() + 3).max(4);
+            let draft = &ui.draft;
+            let shown_draft: String = if draft.chars().count() > budget {
+                let skip = draft.chars().count() - budget;
+                draft.chars().skip(skip).collect()
+            } else {
+                draft.clone()
+            };
+            spans.push(Span::styled(
+                shown_draft,
+                Style::default().fg(c::blend(c::BG, c::TEXT, prompt_alpha)),
+            ));
+            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1017,8 +1398,21 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    let height = inner.height as usize;
-    let center = height / 2;
+    // Fixed tight band: show exactly 5 lines — prev2, prev1, ACTIVE, next1,
+    // next2 — with the active line one row above true center so the eye rests
+    // on it. The window's small height kills the old dead vertical space.
+    let avail = inner.height as usize;
+    let height = avail.min(5);
+    let center = (height / 2).min(2);
+
+    // Vertically center the 5-line band inside whatever inner height we got.
+    let pad_top = (avail.saturating_sub(height)) / 2;
+    let band = Rect {
+        x: inner.x,
+        y: inner.y + pad_top as u16,
+        width: inner.width,
+        height: height as u16,
+    };
 
     if !synced {
         // Plain lyrics: gentle auto-scroll proportional to track progress.
@@ -1026,14 +1420,19 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState) {
         let frac = if m.duration > 0.0 { pos / m.duration } else { 0.0 };
         let active = ((ly.lines.len() as f64) * frac) as usize;
         let lines = window(ly, active, center, height, None);
-        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), band);
         return;
     }
 
     let pos = m.position();
     let (active, frac) = ly.active(pos).unwrap_or((0, 0.0));
-    let lines = window(ly, active, center, height, Some(frac as f32));
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    // Smoothstep the per-line wipe so it eases in/out across line boundaries
+    // instead of advancing perfectly linearly. karaoke() still sub-samples the
+    // boundary glyph, so the motion stays buttery.
+    let f32frac = frac as f32;
+    let ef = f32frac * f32frac * (3.0 - 2.0 * f32frac);
+    let lines = window(ly, active, center, height, Some(ef));
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), band);
 }
 
 /// Build the visible lyric window centered on `active`. If `wipe_frac` is set,
@@ -1071,8 +1470,7 @@ fn window(
         } else {
             let dist = (i as isize - active as isize).unsigned_abs();
             let col = match dist {
-                1 => c::TEXT,
-                2 => c::DIM,
+                1 => c::DIM,
                 _ => c::FAINT,
             };
             out.push(Line::from(Span::styled(text.clone(), Style::default().fg(col))));
@@ -1092,6 +1490,11 @@ fn karaoke(text: &str, frac: f32) -> Line<'static> {
     let litf = (frac * n as f32).clamp(0.0, n as f32);
     let full = litf.floor() as usize;
     let partial = litf.fract();
+    // The not-yet-wiped tail of the ACTIVE line glows brighter than the DIM
+    // context lines (a calm cyan-violet), so the active lyric always reads as
+    // "lit/current" even before the wipe reaches a given character. The boundary
+    // glyph then blends from this pending tone to the vivid wipe colour.
+    let pending = c::blend(c::DIM, c::ACCENT, 0.45);
     let mut spans = Vec::with_capacity(n);
     for (i, ch) in chars.iter().enumerate() {
         let p = i as f32 / n as f32;
@@ -1100,29 +1503,42 @@ fn karaoke(text: &str, frac: f32) -> Line<'static> {
         } else if i == full {
             // Boundary glyph fades in as we sweep across it.
             Style::default()
-                .fg(c::blend(c::DIM, c::wipe(p), partial))
+                .fg(c::blend(pending, c::wipe(p), partial))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(c::DIM)
+            Style::default().fg(pending).add_modifier(Modifier::BOLD)
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
     Line::from(spans)
 }
 
-/// Pseudo-random equalizer bars driven by sine waves of the animation clock.
-fn eq_bars(t: f64, n: usize) -> String {
-    let glyphs = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let mut s = String::new();
-    for i in 0..n {
-        let phase = i as f64 * 0.7;
-        let v = (((t * 6.0 + phase).sin() * 0.5 + 0.5)
-            * ((t * 9.3 + phase * 1.7).sin() * 0.5 + 0.5))
-            .clamp(0.0, 1.0);
-        let idx = (v * 7.0).round() as usize;
-        s.push(glyphs[idx.min(7)]);
+/// A sparkline whose bars are coloured by their own height with the jazz ramp
+/// (blue→violet→pink→white), giving a per-bar vertical-style gradient. Honest:
+/// height = real data; colour is purely a function of that height.
+fn jazz_spark(data: &[u64], width: usize) -> Vec<Span<'static>> {
+    let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if data.is_empty() {
+        return vec![Span::raw(" ".repeat(width))];
     }
-    s
+    let slice: Vec<u64> = data.iter().rev().take(width).rev().copied().collect();
+    let max = slice.iter().copied().max().unwrap_or(1).max(1);
+    let mut spans: Vec<Span> = Vec::with_capacity(width);
+    let lead = width.saturating_sub(slice.len());
+    if lead > 0 {
+        spans.push(Span::raw(" ".repeat(lead)));
+    }
+    for v in slice {
+        let frac = (v as f32 / max as f32).clamp(0.0, 1.0);
+        let idx = (frac * 8.0).round() as usize;
+        let ch = glyphs[idx.min(8)];
+        if ch == ' ' {
+            spans.push(Span::raw(" "));
+        } else {
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(c::jazz(frac))));
+        }
+    }
+    spans
 }
 
 // --- formatting helpers ----------------------------------------------------
@@ -1157,7 +1573,9 @@ fn fmt_rate_short(bps: f64) -> String {
 }
 
 fn fmt_tokens(t: u64) -> String {
-    if t >= 1_000_000 {
+    if t >= 1_000_000_000 {
+        format!("{:.1}B", t as f64 / 1e9)
+    } else if t >= 1_000_000 {
         format!("{:.1}M", t as f64 / 1e6)
     } else if t >= 1_000 {
         format!("{:.1}K", t as f64 / 1e3)
@@ -1181,5 +1599,23 @@ fn fmt_dur(secs: u64) -> String {
         format!("{h}h {m}m")
     } else {
         format!("{m}m")
+    }
+}
+
+/// Compact 2-component uptime, capped at 6 chars: "4d6h" "2h11m" "9m" "12s".
+/// Reserved-width friendly so a process crossing a boundary never shoves.
+fn fmt_dur_short(secs: u64) -> String {
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
     }
 }

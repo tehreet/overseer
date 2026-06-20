@@ -48,6 +48,7 @@ fn run() -> Result<()> {
     collectors::spawn_git(shared.clone());
     collectors::spawn_weather(shared.clone());
     collectors::spawn_usage(shared.clone());
+    collectors::spawn_messages(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;
@@ -70,23 +71,34 @@ fn run() -> Result<()> {
     res
 }
 
+/// Longest iMessage animation duration; once a transition's clock passes this we
+/// settle it back to Idle so the card returns to honest stillness.
+const MSG_ANIM_MAX: Duration = Duration::from_millis(300);
+/// Double-press window for the iMessage 'm' hotkey.
+const MSG_DOUBLE: Duration = Duration::from_millis(400);
+
 fn event_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     shared: &Arc<Mutex<AppState>>,
 ) -> Result<()> {
     loop {
-        // Snapshot just what we need for pacing while we hold the lock to draw.
+        // Settle any finished iMessage transition before drawing, then snapshot
+        // pacing info while we hold the lock to draw.
         let playing;
+        let animating;
         {
-            let s = shared.lock().unwrap();
+            let mut s = shared.lock().unwrap();
+            settle_msg_anim(&mut s);
             let t = s.started.elapsed().as_secs_f64();
             playing = s.music.playing;
+            animating = s.msg_ui.animating();
             term.draw(|f| ui::render(f, &s, t))?;
         }
 
-        // The CPU equalizer interpolates continuously between cached samples,
-        // so keep a smooth 60fps baseline; go 120fps with music for the wipe.
-        let budget = if playing {
+        // The CPU equalizer interpolates continuously between cached samples, so
+        // keep a smooth 60fps baseline; go 120fps with music OR while an iMessage
+        // transition / caret blink is live so those glide.
+        let budget = if playing || animating {
             Duration::from_micros(8_333) // ~120 fps
         } else {
             Duration::from_micros(16_667) // ~60 fps baseline (living EQ)
@@ -102,16 +114,171 @@ fn event_loop<B: ratatui::backend::Backend>(
             if event::poll(remaining)? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind != KeyEventKind::Release {
-                        let q = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc);
-                        let ctrl_c = k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(KeyModifiers::CONTROL);
-                        if q || ctrl_c {
+                        if handle_key(shared, k.code, k.modifiers) {
                             return Ok(());
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Once a transition's clock exceeds its window, fold it back to a settled
+/// state: Advancing/Closing/Sending → Idle (Sending also closes the composer).
+fn settle_msg_anim(s: &mut AppState) {
+    use state::MsgPhase;
+    if let Some(start) = s.msg_ui.anim_start {
+        if start.elapsed() >= MSG_ANIM_MAX {
+            match s.msg_ui.phase {
+                MsgPhase::Opening => {} // input stays open; caret keeps blinking
+                MsgPhase::Sending | MsgPhase::Closing => {
+                    s.msg_ui.composing = false;
+                    s.msg_ui.draft.clear();
+                    s.msg_ui.phase = MsgPhase::Idle;
+                    s.msg_ui.anim_start = None;
+                }
+                _ => {
+                    s.msg_ui.phase = MsgPhase::Idle;
+                    s.msg_ui.anim_start = None;
+                }
+            }
+        }
+    }
+    // Clear a stale send-failure flash after its fade completes (~360ms).
+    if let Some(f) = s.msg_ui.send_failed_at {
+        if f.elapsed() >= Duration::from_millis(360) {
+            s.msg_ui.send_failed_at = None;
+        }
+    }
+}
+
+/// Route a keypress through the iMessage state machine. Returns true to quit.
+fn handle_key(
+    shared: &Arc<Mutex<AppState>>,
+    code: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
+    use state::MsgPhase;
+    let ctrl_c = code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL);
+    if ctrl_c {
+        return true; // Ctrl-C always quits, even mid-compose.
+    }
+
+    let mut s = shared.lock().unwrap();
+    let composing = s.msg_ui.composing;
+
+    if composing {
+        // ---- inline reply input ----
+        match code {
+            KeyCode::Enter => {
+                let draft = s.msg_ui.draft.trim().to_string();
+                if !draft.is_empty() {
+                    // Target = the focused unread message's handle.
+                    let handle = focused_handle(&s);
+                    if let Some(h) = handle {
+                        collectors::send_imessage(&h, &draft);
+                        s.msg_ui.phase = MsgPhase::Sending;
+                        s.msg_ui.anim_start = Some(Instant::now());
+                    } else {
+                        // No target — flash failure, keep draft.
+                        s.msg_ui.send_failed_at = Some(Instant::now());
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                s.msg_ui.phase = MsgPhase::Closing;
+                s.msg_ui.anim_start = Some(Instant::now());
+            }
+            KeyCode::Backspace => {
+                s.msg_ui.draft.pop();
+            }
+            KeyCode::Char(ch) => {
+                if !mods.contains(KeyModifiers::CONTROL) {
+                    s.msg_ui.draft.push(ch);
+                }
+            }
+            _ => {}
+        }
+        return false; // never quit while composing
+    }
+
+    // ---- not composing ----
+    match code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Esc => {
+            if s.msg_ui.active {
+                s.msg_ui.active = false; // unfocus the card
+            } else {
+                return true; // quit
+            }
+        }
+        KeyCode::Char('m') => {
+            let now = Instant::now();
+            let double = s
+                .msg_ui
+                .last_key_at
+                .map(|p| now.duration_since(p) <= MSG_DOUBLE)
+                .unwrap_or(false);
+            s.msg_ui.last_key_at = Some(now);
+
+            if !s.msg_ui.active {
+                // First press just focuses the card.
+                s.msg_ui.active = true;
+                s.msg_ui.phase = MsgPhase::Idle;
+            } else if double {
+                // Double-press on the focused message → open inline reply.
+                s.msg_ui.composing = true;
+                s.msg_ui.draft.clear();
+                s.msg_ui.phase = MsgPhase::Opening;
+                s.msg_ui.anim_start = Some(now);
+            } else {
+                // Single press → mark focused read + advance the unread queue.
+                advance_queue(&mut s);
+                s.msg_ui.phase = MsgPhase::Advancing;
+                s.msg_ui.anim_start = Some(now);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Handle (for the AppleScript reply target) of the currently-focused unread
+/// message, walking the unread queue by `queue_pos`.
+fn focused_handle(s: &AppState) -> Option<String> {
+    s.messages
+        .items
+        .iter()
+        .filter(|i| i.unread)
+        .nth(s.msg_ui.queue_pos)
+        .map(|i| i.handle.clone())
+        .filter(|h| !h.is_empty())
+}
+
+/// Mark the focused unread message read (UI-side only — we keep chat.db strictly
+/// read-only/immutable) and advance to the next unread.
+fn advance_queue(s: &mut AppState) {
+    // Find the rowid of the focused unread, then flip it read in our snapshot.
+    let target = s
+        .messages
+        .items
+        .iter()
+        .filter(|i| i.unread)
+        .nth(s.msg_ui.queue_pos)
+        .map(|i| i.rowid);
+    if let Some(rowid) = target {
+        for it in s.messages.items.iter_mut() {
+            if it.rowid == rowid {
+                it.unread = false;
+            }
+        }
+        s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
+    }
+    // queue_pos stays at the front of the (now shorter) unread list.
+    let remaining = s.messages.items.iter().filter(|i| i.unread).count();
+    if s.msg_ui.queue_pos >= remaining {
+        s.msg_ui.queue_pos = remaining.saturating_sub(1);
     }
 }
 
@@ -192,7 +359,7 @@ fn snapshot(args: &[String]) -> Result<()> {
         .unwrap_or((140u16, 44u16));
 
     let mut st = AppState::default();
-    sample_data(&mut st);
+    sample_data(&mut st, args.iter().any(|a| a == "--compose"));
     // `--idle` previews the no-music right column (live system graphs).
     if args.iter().any(|a| a == "--idle") {
         st.music.playing = false;
@@ -228,7 +395,7 @@ fn cells(args: &[String]) -> Result<()> {
         .unwrap_or((140u16, 44u16));
 
     let mut st = AppState::default();
-    sample_data(&mut st);
+    sample_data(&mut st, args.iter().any(|a| a == "--compose"));
     if args.iter().any(|a| a == "--idle") {
         st.music.playing = false;
     }
@@ -238,6 +405,13 @@ fn cells(args: &[String]) -> Result<()> {
         .find_map(|a| a.strip_prefix("t="))
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(1.3);
+    // Headless snapshots draw a single frame, so wall-clock playback is frozen.
+    // Advance the music position by the render clock `t` so the karaoke wipe and
+    // progress bar move between t= phases and the active lyric reads as lit.
+    if st.music.playing {
+        st.music.base_pos += t;
+        st.music.sampled_at = std::time::Instant::now();
+    }
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend)?;
     term.draw(|f| ui::render(f, &st, t))?;
@@ -265,8 +439,9 @@ fn cells(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Fills state with representative data so the snapshot looks real.
-fn sample_data(st: &mut AppState) {
+/// Fills state with representative data so the snapshot looks real. `compose`
+/// opens the iMessage inline reply input so its affordance can be eyeballed.
+fn sample_data(st: &mut AppState, compose: bool) {
     use state::{LyricLine, Lyrics, MusicStats, SiliconStats, SystemStats, UsageStats};
     use std::time::Instant;
 
@@ -287,12 +462,12 @@ fn sample_data(st: &mut AppState) {
         uptime_secs: 367_200,
         proc_count: 612,
         top_procs: vec![
-            ("studioboard".into(), 18.4, 28_000_000),
-            ("WindowServer".into(), 12.1, 480_000_000),
-            ("Music".into(), 6.3, 320_000_000),
-            ("Warp".into(), 4.8, 540_000_000),
-            ("claude".into(), 3.2, 210_000_000),
-            ("kernel_task".into(), 2.0, 120_000_000),
+            ("studioboard".into(), 18.4, 28_000_000, 367_200),
+            ("WindowServer".into(), 12.1, 480_000_000, 367_200),
+            ("Music".into(), 6.3, 320_000_000, 7_860),
+            ("Warp".into(), 4.8, 540_000_000, 14_400),
+            ("claude".into(), 3.2, 210_000_000, 480),
+            ("kernel_task".into(), 2.0, 120_000_000, 920),
         ],
     };
     // Staggered, gently-varying samples (~16 s of history) so the delayed
@@ -345,11 +520,14 @@ fn sample_data(st: &mut AppState) {
         today_output: 818_000,
         today_cache_read: 17_957_000,
         today_cache_write: 3_519_000,
-        today_cost: 18.40,
-        month_cost: 214.75,
+        today_cost: 4.10,
+        month_cost: 47.20,
         today_messages: 342,
         top_model: "Opus".into(),
         sessions_today: 6,
+        tokens_7d: 1_840_000_000,
+        tokens_30d: 7_320_000_000,
+        sessions_30d: 73,
         hourly: vec![0, 0, 0, 0, 0, 0, 0, 12, 40, 88, 120, 64, 30, 55, 90, 140, 110, 70, 0, 0, 0, 0, 0, 0],
     };
     st.music = MusicStats {
@@ -390,7 +568,7 @@ fn sample_data(st: &mut AppState) {
     };
     st.weather = state::Weather {
         fresh: true,
-        location: "Eau Claire, Wisconsin".into(),
+        location: "Fond du Lac, WI".into(),
         temp_f: 62,
         feels_f: 62,
         desc: "Sunny".into(),
@@ -398,7 +576,62 @@ fn sample_data(st: &mut AppState) {
         hi_f: 74,
         lo_f: 49,
         humidity: 62,
+        wind_mph: 8,
+        wind_dir: "NW".into(),
+        precip_chance: 12,
+        uv: 5,
+        pressure_mb: 1014,
+        sunrise: "06:21".into(),
+        sunset: "20:14".into(),
+        temp_strip: vec![58, 60, 63, 66, 70, 72, 74, 71, 67, 62, 57, 53],
     };
+    st.messages = state::Messages {
+        fresh: true,
+        available: true,
+        unread_count: 3,
+        items: vec![
+            ("Mom", "+15555550111",
+             "can you call me when you get a chance? want to talk about the trip next month and what time works for everyone",
+             "2m", false, true),
+            ("Alex Rivera", "alex@example.com", "sounds good, see you then", "8m", false, true),
+            ("Sarah", "+15555550133", "[rich message]", "1h", true, true),
+            ("Topping Support", "support@topping.example",
+             "your RMA has been received and is in processing", "3h", false, false),
+            ("Best Buy", "+15550022", "your order is ready for pickup", "yd", false, false),
+            ("Dad", "dad@example.com", "ok 👍", "yd", false, false),
+        ]
+        .into_iter()
+        .map(|(sender, handle, text, rel, rich, unread): (&str, &str, &str, &str, bool, bool)| {
+            state::MessageItem {
+                rowid: 0,
+                sender: sender.into(),
+                handle: handle.into(),
+                preview: {
+                    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if flat.chars().count() <= 96 {
+                        flat
+                    } else {
+                        let cut: String = flat.chars().take(95).collect();
+                        format!("{cut}…")
+                    }
+                },
+                full_text: text.into(),
+                ts_unix: 0.0,
+                rel: rel.into(),
+                is_rich: rich,
+                unread,
+            }
+        })
+        .collect(),
+    };
+    st.msg_ui = state::MsgUi { active: true, queue_pos: 0, ..Default::default() };
+    // `--compose` previews the inline reply input affordance.
+    if compose {
+        st.msg_ui.composing = true;
+        st.msg_ui.draft = "on my way".into();
+        st.msg_ui.phase = state::MsgPhase::Opening;
+        st.msg_ui.anim_start = Some(Instant::now());
+    }
     st.lyrics = Lyrics {
         synced: true,
         track_id: st.music.track_id(),

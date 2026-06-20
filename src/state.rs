@@ -1,7 +1,7 @@
 //! Shared application state. Collector threads write; the render loop reads a snapshot.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Ring-buffer history for sparklines. Fixed capacity, cheap push.
 #[derive(Clone)]
@@ -42,8 +42,8 @@ pub struct SystemStats {
     pub net_tx_bps: f64,
     pub uptime_secs: u64,
     pub proc_count: usize,
-    /// Top processes by CPU: (name, cpu% of one core, memory bytes).
-    pub top_procs: Vec<(String, f32, u64)>,
+    /// Top processes by CPU: (name, cpu% of one core, memory bytes, uptime secs).
+    pub top_procs: Vec<(String, f32, u64, u64)>,
 }
 
 /// Apple Silicon metrics straight from `macmon pipe`.
@@ -208,6 +208,103 @@ pub struct Weather {
     pub hi_f: i32,
     pub lo_f: i32,
     pub humidity: i32,
+    pub wind_mph: i32,
+    pub wind_dir: String,
+    pub precip_chance: i32,
+    pub uv: i32,
+    pub pressure_mb: i32,
+    pub sunrise: String,
+    pub sunset: String,
+    /// Next ~12 hourly forecast temps (°F) for the tiny jazz temp strip.
+    pub temp_strip: Vec<u64>,
+}
+
+/// One recent inbound iMessage/SMS row, newest-first in `Messages.items`.
+#[derive(Clone, Default)]
+pub struct MessageItem {
+    pub rowid: i64,
+    pub sender: String,    // resolved contact name or raw handle
+    pub handle: String,    // raw handle (phone/email) for the AppleScript reply target
+    pub preview: String,   // display text: real text, summarized, or smart-truncated
+    pub full_text: String, // untruncated text (summarize input / send context)
+    pub ts_unix: f64,      // unix seconds
+    pub rel: String,       // "2m" "1h" "yesterday"
+    pub is_rich: bool,     // attributedBody-only → "[rich message]" marker
+    pub unread: bool,      // is_from_me=0 AND is_read=0
+}
+
+/// iMessage card data (written by the spawn_messages collector).
+#[derive(Clone, Default)]
+pub struct Messages {
+    pub fresh: bool,        // first poll completed
+    pub available: bool,    // chat.db readable (Full Disk Access granted)?
+    pub unread_count: u32,  // is_from_me=0 AND is_read=0
+    pub items: Vec<MessageItem>, // recent inbound, newest-first
+}
+
+/// Phase of the iMessage card's interaction animation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MsgPhase {
+    Idle,
+    /// Marking the focused message read + sliding the marker to the next unread.
+    Advancing,
+    /// The inline reply input is wiping open.
+    Opening,
+    /// The reply is shimmering away + the input collapsing.
+    Sending,
+    /// Esc cancel: the input wipes closed.
+    Closing,
+}
+
+impl Default for MsgPhase {
+    fn default() -> Self {
+        MsgPhase::Idle
+    }
+}
+
+/// iMessage interaction state. Lives on AppState so the pure render fn can read
+/// it; mutated only by the main.rs event loop. Animations are interpolated each
+/// frame off `anim_start` — never a discrete flip — so motion is buttery.
+#[derive(Clone)]
+pub struct MsgUi {
+    pub active: bool,                 // is the iMessage card focused?
+    pub queue_pos: usize,             // index into the unread queue (focused row)
+    pub last_key_at: Option<Instant>, // double-press window for 'm'
+    pub composing: bool,              // inline reply input open?
+    pub draft: String,                // reply being typed
+    pub phase: MsgPhase,              // current transition
+    pub anim_start: Option<Instant>,  // when the current transition began
+    pub send_failed_at: Option<Instant>, // osascript nonzero → border flash
+}
+
+impl Default for MsgUi {
+    fn default() -> Self {
+        Self {
+            active: false,
+            queue_pos: 0,
+            last_key_at: None,
+            composing: false,
+            draft: String::new(),
+            phase: MsgPhase::Idle,
+            anim_start: None,
+            send_failed_at: None,
+        }
+    }
+}
+
+impl MsgUi {
+    /// Animation progress 0..1 over `dur`; None when no transition is running.
+    pub fn progress(&self, dur: Duration) -> Option<f32> {
+        let start = self.anim_start?;
+        let p = (start.elapsed().as_secs_f32() / dur.as_secs_f32()).clamp(0.0, 1.0);
+        Some(p)
+    }
+    /// Is any motion (transition or live caret blink) in flight?
+    pub fn animating(&self) -> bool {
+        self.composing
+            || self.phase != MsgPhase::Idle
+            || self.send_failed_at.is_some()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -222,7 +319,12 @@ pub struct UsageStats {
     pub today_messages: u64,
     pub top_model: String,
     pub sessions_today: u64,
-    /// Per-hour cost for the last 24h, for the burn sparkline.
+    /// Rolling-window token totals (input+output+cache) for the de-cluttered card.
+    pub tokens_7d: u64,
+    pub tokens_30d: u64,
+    /// Distinct Claude Code sessions in the last 30 days.
+    pub sessions_30d: u64,
+    /// Per-hour token activity for the last 24h, for the burn graph.
     pub hourly: Vec<u64>,
 }
 
@@ -244,6 +346,8 @@ pub struct AppState {
     pub git: GitStats,
     pub weather: Weather,
     pub usage: UsageStats,
+    pub messages: Messages,
+    pub msg_ui: MsgUi,
     pub cpu_hist: History,
     pub gpu_hist: History,
     pub power_hist: History,
@@ -266,6 +370,8 @@ impl Default for AppState {
             git: GitStats::default(),
             weather: Weather::default(),
             usage: UsageStats::default(),
+            messages: Messages::default(),
+            msg_ui: MsgUi::default(),
             cpu_hist: History::new(120),
             gpu_hist: History::new(120),
             power_hist: History::new(120),

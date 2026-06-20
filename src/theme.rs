@@ -14,21 +14,9 @@ pub const CYAN: Color = Color::Rgb(86, 214, 255);
 pub const PINK: Color = Color::Rgb(255, 110, 199);
 pub const GREEN: Color = Color::Rgb(94, 234, 160);
 pub const YELLOW: Color = Color::Rgb(255, 209, 102);
+#[allow(dead_code)]
 pub const ORANGE: Color = Color::Rgb(255, 154, 90);
 pub const RED: Color = Color::Rgb(255, 95, 109);
-
-/// Heat color for a 0..1 load value: green -> yellow -> orange -> red.
-pub fn heat(t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t < 0.5 {
-        let k = t / 0.5;
-        lerp((94, 234, 160), (255, 209, 102), k)
-    } else {
-        let k = (t - 0.5) / 0.5;
-        lerp((255, 209, 102), (255, 95, 109), k)
-    };
-    Color::Rgb(r, g, b)
-}
 
 /// Funky synthwave ramp for a 0..1 value: blue -> violet -> pink -> white.
 /// Used to give the Apple Silicon gauges + power wave their jazzy look.
