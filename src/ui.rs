@@ -350,15 +350,18 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     // A taller NOW PLAYING card so the album cover renders as a real, legible
     // square (more half-block sub-pixels) instead of a postage stamp.
     const NP_H: u16 = 13;
+    // KEYBINDS sizes to its content so its box flexes as binds come/go; the
+    // trailing Min(0) is the bottom-right slack reserved for the next card.
+    let kbh = keybinds_height(&s.keybinds, body[1].width);
     if show_lyrics {
-        // Cap the lyric band to a tight 9-row block (7 inner rows) and hand the
-        // freed vertical space to the live jazz system graphs — zero dead zone.
+        // Cap the lyric band to a tight 9-row block (7 inner rows).
         const LYRICS_H: u16 = 9;
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(NP_H),
                 Constraint::Length(LYRICS_H),
+                Constraint::Max(kbh),
                 Constraint::Min(0),
             ])
             .split(body[1]);
@@ -370,7 +373,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     } else {
         let right = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(NP_H), Constraint::Min(3)])
+            .constraints([Constraint::Length(NP_H), Constraint::Max(kbh), Constraint::Min(0)])
             .split(body[1]);
         now_playing_row(f, right[0], s, t);
         keybinds_panel(f, right[1], s);
@@ -2853,9 +2856,70 @@ enum KbItem {
     Blank,
 }
 
+const KB_KEYW: usize = 7;
+const KB_COLGAP: usize = 2;
+const KB_COL_MIN: usize = 30;
+
+/// How many balanced columns fit in an inner width of `iw` cells.
+fn keybinds_ncols(iw: usize) -> usize {
+    ((iw + KB_COLGAP) / (KB_COL_MIN + KB_COLGAP)).clamp(1, 3)
+}
+
+/// Pack the keybind groups into `ncols` balanced columns. Each group is an
+/// indivisible block (header + its rows) so a binding is never split from its
+/// heading; columns aim for ~total/ncols rows, last column takes the rest.
+fn keybinds_columns(kb: &crate::state::Keybinds, ncols: usize) -> Vec<Vec<KbItem>> {
+    let blocks: Vec<Vec<KbItem>> = kb
+        .groups
+        .iter()
+        .map(|g| {
+            let mut blk = vec![KbItem::Header(g.name.clone())];
+            for (keys, desc) in &g.binds {
+                blk.push(KbItem::Bind(keys.clone(), desc.clone()));
+            }
+            blk
+        })
+        .collect();
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    let target = total.div_ceil(ncols.max(1));
+    let mut cols: Vec<Vec<KbItem>> = vec![Vec::new()];
+    let mut ch = 0usize; // current column height
+    for blk in blocks {
+        let h = blk.len();
+        let at_last = cols.len() == ncols;
+        if !cols.last().unwrap().is_empty() && !at_last && ch + 1 + h > target {
+            cols.push(Vec::new());
+            ch = 0;
+        }
+        let col = cols.last_mut().unwrap();
+        if !col.is_empty() {
+            col.push(KbItem::Blank); // blank line between stacked groups
+            ch += 1;
+        }
+        col.extend(blk);
+        ch += h;
+    }
+    cols
+}
+
+/// Content height the KEYBINDS card wants for a card of outer width `outer_w`:
+/// borders + the tallest balanced column, so the box flexes as binds come/go.
+fn keybinds_height(kb: &crate::state::Keybinds, outer_w: u16) -> u16 {
+    if !kb.available {
+        return 4; // gate hint
+    }
+    if kb.groups.is_empty() {
+        return 3;
+    }
+    let iw = (outer_w as usize).saturating_sub(4); // 2 borders + 2 padding
+    let ncols = keybinds_ncols(iw);
+    let tallest = keybinds_columns(kb, ncols).iter().map(|c| c.len()).max().unwrap_or(1);
+    (tallest + 2).min(u16::MAX as usize) as u16
+}
+
 /// KEYBINDS card: a live mirror of the Hammerspoon cheat sheet (exported to JSON
-/// on every reload). Groups + rows flow into balanced columns sized to the area,
-/// so it fills the right column the SYSTEM graphs used to occupy.
+/// on every reload). Groups + rows flow into balanced columns, and the box sizes
+/// to its content so it expands/shrinks as bindings come and go.
 fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let kb = &s.keybinds;
 
@@ -2896,52 +2960,14 @@ fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    // Each group is an indivisible block (header + its rows) so a binding is
-    // never detached from its heading across a column break.
-    let blocks: Vec<Vec<KbItem>> = kb
-        .groups
-        .iter()
-        .map(|g| {
-            let mut blk = vec![KbItem::Header(g.name.clone())];
-            for (keys, desc) in &g.binds {
-                blk.push(KbItem::Bind(keys.clone(), desc.clone()));
-            }
-            blk
-        })
-        .collect();
-
-    // Column geometry: balance into as many ~30-cell columns as the width allows.
-    const KEYW: usize = 7;
-    const COLGAP: usize = 2;
-    const COL_MIN: usize = 30;
+    // Same column geometry the height calc uses, so the box hugs the content.
     let iw = inner.width as usize;
-    let ncols = ((iw + COLGAP) / (COL_MIN + COLGAP)).clamp(1, 3);
-    let colw = (iw - COLGAP * (ncols - 1)) / ncols;
-
-    // Greedily pack whole group-blocks into balanced columns: aim each column at
-    // ~total/ncols rows, but never split a group; the last column takes the rest.
-    let total: usize = blocks.iter().map(|b| b.len()).sum();
-    let target = total.div_ceil(ncols);
-    let mut cols: Vec<Vec<KbItem>> = vec![Vec::new()];
-    let mut ch = 0usize; // current column height
-    for blk in blocks {
-        let h = blk.len();
-        let at_last = cols.len() == ncols;
-        if !cols.last().unwrap().is_empty() && !at_last && ch + 1 + h > target {
-            cols.push(Vec::new());
-            ch = 0;
-        }
-        let col = cols.last_mut().unwrap();
-        if !col.is_empty() {
-            col.push(KbItem::Blank); // blank line between stacked groups
-            ch += 1;
-        }
-        col.extend(blk);
-        ch += h;
-    }
+    let ncols = keybinds_ncols(iw);
+    let colw = (iw - KB_COLGAP * (ncols - 1)) / ncols;
+    let cols = keybinds_columns(kb, ncols);
 
     for (ci, col) in cols.iter().enumerate() {
-        let cx = inner.x + (ci * (colw + COLGAP)) as u16;
+        let cx = inner.x + (ci * (colw + KB_COLGAP)) as u16;
         let mut lines: Vec<Line> = Vec::with_capacity(col.len());
         for it in col {
             match it {
@@ -2951,9 +2977,9 @@ fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
                     Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
                 ))),
                 KbItem::Bind(keys, desc) => {
-                    let dw = colw.saturating_sub(KEYW + 1);
+                    let dw = colw.saturating_sub(KB_KEYW + 1);
                     lines.push(Line::from(vec![
-                        Span::styled(pad_width(keys, KEYW), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+                        Span::styled(pad_width(keys, KB_KEYW), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
                         Span::raw(" "),
                         Span::styled(fit_width(desc, dw), Style::default().fg(c::TEXT)),
                     ]));
