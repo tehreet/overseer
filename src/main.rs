@@ -31,6 +31,9 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--diag") {
         return diag();
     }
+    if args.iter().any(|a| a == "--facts") {
+        return facts_diag();
+    }
     if args.iter().any(|a| a == "--cells") {
         return cells(&args);
     }
@@ -45,12 +48,15 @@ fn run() -> Result<()> {
     collectors::spawn_music(shared.clone());
     collectors::spawn_lyrics(shared.clone());
     collectors::spawn_artwork(shared.clone());
+    collectors::spawn_facts(shared.clone());
+    collectors::spawn_queue(shared.clone());
     collectors::spawn_git(shared.clone());
     collectors::spawn_weather(shared.clone());
     collectors::spawn_usage(shared.clone());
     collectors::spawn_messages(shared.clone());
     collectors::spawn_signal(shared.clone());
     collectors::spawn_discord(shared.clone());
+    collectors::spawn_doctor(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;
@@ -355,6 +361,27 @@ fn diag() -> Result<()> {
 }
 
 /// Render a single frame to a text buffer for headless verification:
+fn facts_diag() -> Result<()> {
+    println!("studioboard --facts\n");
+    let (running, _playing, track, artist, album, _dur, _pos) = collectors::probe_music();
+    if !running || track.is_empty() {
+        println!("Apple Music idle — no current track.");
+        return Ok(());
+    }
+    println!("track : {track}\nartist: {artist}\nalbum : {album}\n");
+    println!("gathering liner notes…\n");
+    let fa = collectors::probe_facts(&artist, &track, &album);
+    println!("source: {}", if fa.source.is_empty() { "(none)" } else { &fa.source });
+    if fa.lines.is_empty() {
+        println!("note  : {}", fa.note);
+    } else {
+        for l in &fa.lines {
+            println!("  • {l}");
+        }
+    }
+    Ok(())
+}
+
 ///   studioboard --snapshot [WIDTHxHEIGHT]
 fn snapshot(args: &[String]) -> Result<()> {
     use ratatui::backend::TestBackend;
@@ -404,6 +431,14 @@ fn cells(args: &[String]) -> Result<()> {
     sample_data(&mut st, args.iter().any(|a| a == "--compose"));
     if args.iter().any(|a| a == "--idle") {
         st.music.playing = false;
+    }
+    if args.iter().any(|a| a == "--nolyrics") {
+        st.lyrics = state::Lyrics {
+            lines: Vec::new(),
+            synced: false,
+            track_id: st.music.track_id(),
+            note: "no lyrics found".into(),
+        };
     }
 
     let t = args
@@ -547,17 +582,29 @@ fn sample_data(st: &mut AppState, compose: bool) {
         sampled_at: Instant::now(),
         polled: true,
     };
-    // Synthetic album art (radial gradient) so the snapshot shows the panel.
-    let dim = 64usize;
-    let mut px = Vec::with_capacity(dim * dim);
-    for y in 0..dim {
-        for x in 0..dim {
-            let r = (x * 255 / dim) as u8;
-            let g = (y * 255 / dim) as u8;
-            px.push([r, g, 180]);
-        }
-    }
-    st.album_art = state::AlbumArt { track_id: st.music.track_id(), w: dim, h: dim, px };
+    // Album art: decode the last real dump (so visual-verify exercises the true
+    // sampling path on a real cover); fall back to a radial gradient otherwise.
+    st.album_art = collectors::sample_album_art(st.music.track_id());
+    st.facts = state::MusicFacts {
+        track_id: st.music.track_id(),
+        source: "claude".into(),
+        note: String::new(),
+        lines: vec![
+            "Drake's first solo #1 on the Billboard Hot 100.".into(),
+            "The beat samples Whitney Houston's \"I'm Every Woman\" ad-libs.".into(),
+            "Recorded in a single late-night session in Toronto.".into(),
+            "The phrase became a meme long before the song dropped.".into(),
+        ],
+    };
+    st.queue = state::Queue {
+        fresh: true,
+        source_track_id: st.music.track_id(),
+        items: vec![
+            state::QueueTrack { track: "NEW MAGIC WAND".into(), artist: "Tyler, The Creator".into(), duration: 195.0 },
+            state::QueueTrack { track: "BagBak".into(), artist: "Vince Staples".into(), duration: 160.0 },
+            state::QueueTrack { track: "Surround Sound (feat. 21 Savage & Baby Tate)".into(), artist: "JID".into(), duration: 229.0 },
+        ],
+    };
     st.git = state::GitStats {
         fresh: true,
         ok: true,
@@ -679,37 +726,54 @@ fn sample_data(st: &mut AppState, compose: bool) {
         available: true,
         voice: vec![
             state::VoiceChannel {
-                name: "General".into(),
-                members: vec!["Josh".into(), "Cassie".into(), "Marcin".into()],
+                name: "200 club".into(),
+                members: vec!["Tehreet".into(), "Cassie".into(), "Marcin".into()],
             },
             state::VoiceChannel {
-                name: "Gaming".into(),
+                name: "gaming".into(),
                 members: vec!["Erik".into()],
             },
         ],
         text: vec![
             state::TextChannel {
-                name: "general".into(),
-                author: "Peter Salanki".into(),
-                preview: "anyone around to test the build?".into(),
+                name: "battlestation".into(),
+                author: "mac-doctor".into(),
+                preview: "load spike was a Steam shader compile".into(),
                 rel: "4m".into(),
                 unread: true,
             },
             state::TextChannel {
-                name: "dev".into(),
-                author: "Alex".into(),
-                preview: "pushed the fix, CI is green".into(),
-                rel: "1h".into(),
+                name: "actual-degenery".into(),
+                author: "Tehreet".into(),
+                preview: "[image]".into(),
+                rel: "53m".into(),
                 unread: false,
             },
             state::TextChannel {
-                name: "random".into(),
-                author: "Daniel".into(),
-                preview: "lol 😂".into(),
-                rel: "yd".into(),
+                name: "normies".into(),
+                author: "Tehreet".into(),
+                preview: "[image]".into(),
+                rel: "14h".into(),
                 unread: false,
             },
         ],
+    };
+    // MAC-DOCTOR card preview. Idle by default; STUDIOBOARD_FAKE_DOCTOR=running
+    // previews the in-flight (diagnosing) state.
+    let doc_running = std::env::var("STUDIOBOARD_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false);
+    st.doctor = state::Doctor {
+        available: true,
+        running: doc_running,
+        step: if doc_running { "local triage (qwen2.5:14b)…".into() } else { String::new() },
+        trigger: "runaway: rustc at 356% ≥ 220% · load1 28.0 ≥ 28.0".into(),
+        last_title: "rustc compile burst — self-resolved, system all-clear".into(),
+        last_outcome: "no-action-needed".into(),
+        last_severity: "info".into(),
+        last_model: if doc_running { "sonnet".into() } else { "qwen2.5:14b".into() },
+        last_actions: vec![],
+        last_rel: "12m".into(),
+        today_cost: 0.34,
+        incidents_total: 11,
     };
     // `--compose` previews the inline reply input affordance.
     if compose {

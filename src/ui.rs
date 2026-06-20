@@ -1,7 +1,7 @@
 //! All rendering. Pure function of (state snapshot, animation clock) -> frame.
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
@@ -279,7 +279,8 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             Constraint::Max(card_height(&s.messages, s.msg_ui.active)), // [6] iMESSAGE
             Constraint::Max(card_height(&s.signal, false)),             // [7] SIGNAL
             Constraint::Max(discord_height(&s.discord)),                // [8] DISCORD
-            Constraint::Min(0),     // [9] slack absorbs leftover, keeping cards tight
+            Constraint::Max(doctor_height(&s.doctor)),                  // [9] MAC-DOCTOR
+            Constraint::Min(0),     // [10] slack absorbs leftover, keeping cards tight
         ])
         .split(body[0]);
 
@@ -292,12 +293,16 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     messages_panel(f, left[6], s, t);
     signal_panel(f, left[7], s);
     discord_panel(f, left[8], s);
+    doctor_panel(f, left[9], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
     // actively playing → lyrics; paused/stopped/idle → live system graphs.
     let show_lyrics = !s.music.polled || (s.music.playing && !s.music.track.is_empty());
 
+    // A taller NOW PLAYING card so the album cover renders as a real, legible
+    // square (more half-block sub-pixels) instead of a postage stamp.
+    const NP_H: u16 = 13;
     if show_lyrics {
         // Cap the lyric band to a tight 9-row block (7 inner rows) and hand the
         // freed vertical space to the live jazz system graphs — zero dead zone.
@@ -305,22 +310,22 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9),
+                Constraint::Length(NP_H),
                 Constraint::Length(LYRICS_H),
                 Constraint::Min(0),
             ])
             .split(body[1]);
-        now_playing(f, right[0], s, t);
-        lyrics_panel(f, right[1], s);
+        now_playing_row(f, right[0], s, t);
+        lyrics_row(f, right[1], s, t);
         if right[2].height >= 3 {
             system_panel(f, right[2], s);
         }
     } else {
         let right = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(9), Constraint::Min(3)])
+            .constraints([Constraint::Length(NP_H), Constraint::Min(3)])
             .split(body[1]);
-        now_playing(f, right[0], s, t);
+        now_playing_row(f, right[0], s, t);
         system_panel(f, right[1], s);
     }
 }
@@ -352,10 +357,26 @@ fn bar_spans(frac: f32, width: usize, color: ratatui::style::Color) -> Vec<Span<
 /// the sweep per line so stacked rows don't shimmer in lockstep. Per-character
 /// truecolor blend → buttery, and the band wraps so it never pops.
 fn shimmer_text(text: &str, t: f64, row: f32) -> Line<'static> {
+    Line::from(shimmer_spans(text, t, row, c::DIM, 0.22, 0.07, false))
+}
+
+/// Per-character sheen sweep over `text` from `base` toward a pink-white glint.
+/// `speed` sets how fast the band travels, `sigma` its width (bigger = broader,
+/// more pronounced shimmer), `bold` keeps weight for titles. `row` phase-offsets
+/// stacked lines so they don't shimmer in lockstep.
+fn shimmer_spans(
+    text: &str,
+    t: f64,
+    row: f32,
+    base: Color,
+    speed: f64,
+    sigma: f32,
+    bold: bool,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1);
-    let head = ((t * 0.22 + row as f64 * 0.18).rem_euclid(1.0)) as f32; // 0..1 sweep
-    let sheen = c::jazz(0.88); // pink-white glint
+    let head = ((t * speed + row as f64 * 0.18).rem_euclid(1.0)) as f32; // 0..1 sweep
+    let sheen = c::jazz(0.9); // pink-white glint
     let mut spans = Vec::with_capacity(n);
     for (i, ch) in chars.iter().enumerate() {
         if *ch == ' ' {
@@ -367,19 +388,147 @@ fn shimmer_text(text: &str, t: f64, row: f32) -> Line<'static> {
         if d > 0.5 {
             d = 1.0 - d; // wrap so the glint is continuous
         }
-        let b = (-(d * d) / (2.0 * 0.07 * 0.07)).exp(); // narrow bright band 0..1
-        let col = c::blend(c::DIM, sheen, b); // calm base -> glint
-        spans.push(Span::styled(ch.to_string(), Style::default().fg(col)));
+        let b = (-(d * d) / (2.0 * sigma * sigma)).exp(); // bright band 0..1
+        let col = c::blend(base, sheen, b); // calm base -> glint
+        let mut st = Style::default().fg(col);
+        if bold {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(ch.to_string(), st));
+    }
+    spans
+}
+
+/// Pick which of `n` views to show and its visibility `alpha` (0..1) for a calm
+/// cross-dissolve: hold a view fully, fade it to the background, fade the next
+/// in. Per-frame truecolor blending makes this *sub-frame* smooth — unlike
+/// cell-stepped scrolling, which can only ever jump a whole character at a time.
+fn dissolve_phase(n: usize, t: f64, hold: f64, fade: f64) -> (usize, f32) {
+    if n <= 1 {
+        return (0, 1.0);
+    }
+    let half = (fade * 0.5).max(0.0001);
+    let slot = hold + fade;
+    let x = t.rem_euclid(n as f64 * slot);
+    let idx = ((x / slot).floor() as usize) % n;
+    let w = x - idx as f64 * slot;
+    if w < hold {
+        (idx, 1.0)
+    } else if w < hold + half {
+        (idx, 1.0 - ((w - hold) / half) as f32) // current view fades out
+    } else {
+        ((idx + 1) % n, ((w - hold - half) / half) as f32) // next view fades in
+    }
+}
+
+/// Blend every span's foreground toward the background by `1-alpha` (alpha=1 →
+/// untouched, alpha=0 → invisible) — the per-frame fade used by dissolves.
+fn faded_lines(lines: Vec<Line<'static>>, alpha: f32) -> Vec<Line<'static>> {
+    if alpha >= 0.999 {
+        return lines;
+    }
+    let f = 1.0 - alpha.clamp(0.0, 1.0);
+    lines
+        .into_iter()
+        .map(|ln| {
+            let spans: Vec<Span<'static>> = ln
+                .spans
+                .into_iter()
+                .map(|sp| {
+                    let base = sp.style.fg.unwrap_or(c::TEXT);
+                    let style = sp.style.fg(c::blend(base, c::BG, f));
+                    Span::styled(sp.content, style)
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A metadata line (title / artist · album) that shimmers, and — when it
+/// overflows `width` — gently cross-dissolves between successive windows of the
+/// text instead of cell-scrolling. `lead` is pinned at the left (transport icon).
+fn cycle_dissolve(
+    lead: Vec<Span<'static>>,
+    lead_w: usize,
+    segs: &[(&str, Color, bool)],
+    width: usize,
+    t: f64,
+    row: f32,
+) -> Line<'static> {
+    let mut toks: Vec<(char, Color, bool)> = Vec::new();
+    for (txt, col, bold) in segs {
+        for ch in txt.chars() {
+            toks.push((ch, *col, *bold));
+        }
+    }
+    let avail = width.saturating_sub(lead_w).max(1);
+    if toks.len() <= avail {
+        return shimmer_window(lead, lead_w, &toks, width, t, row, 1.0);
+    }
+    // Window start offsets covering the whole string (slight overlap for context).
+    let max_off = toks.len() - avail;
+    let step = (avail * 3 / 4).max(1);
+    let mut offs: Vec<usize> = Vec::new();
+    let mut o = 0usize;
+    loop {
+        offs.push(o.min(max_off));
+        if o >= max_off {
+            break;
+        }
+        o += step;
+    }
+    let (i, alpha) = dissolve_phase(offs.len(), t, 2.8, 0.85);
+    let off = offs[i];
+    shimmer_window(lead, lead_w, &toks[off..off + avail], width, t, row, alpha)
+}
+
+/// Render a token window with the shimmer sweep and a dissolve `alpha`. The lead
+/// (icon) stays fully opaque; only the text fades.
+fn shimmer_window(
+    lead: Vec<Span<'static>>,
+    lead_w: usize,
+    toks: &[(char, Color, bool)],
+    width: usize,
+    t: f64,
+    row: f32,
+    alpha: f32,
+) -> Line<'static> {
+    let sheen = c::jazz(0.9);
+    let head = ((t * 0.40 + row as f64 * 0.18).rem_euclid(1.0)) as f32;
+    let total_cols = width.max(1) as f32;
+    let f = 1.0 - alpha.clamp(0.0, 1.0);
+    let mut spans = lead;
+    for (k, (ch, base, bold)) in toks.iter().enumerate() {
+        if *ch == ' ' {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+        let p = (lead_w + k) as f32 / total_cols;
+        let mut d = (p - head).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        let b = (-(d * d) / (2.0 * 0.16 * 0.16)).exp();
+        let col = c::blend(c::blend(*base, sheen, b), c::BG, f);
+        let mut st = Style::default().fg(col);
+        if *bold {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(ch.to_string(), st));
     }
     Line::from(spans)
 }
 
 fn panel(title: &str, hot: bool) -> Block<'_> {
-    let border = if hot { c::PANEL_BORDER_HOT } else { c::PANEL_BORDER };
+    // Every card now wears the violet "hot" border — it reads as one cohesive,
+    // lively board. `hot` is kept for callers but no longer dims the frame.
+    let _ = hot;
+    let border = c::PANEL_BORDER_HOT;
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
+        .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
         .title(Span::styled(
             format!(" {title} "),
             Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
@@ -879,7 +1028,203 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     );
 }
 
-fn now_playing(f: &mut Frame, area: Rect, s: &AppState, _t: f64) {
+/// The top band of the right column: NOW PLAYING on the left, a LINER NOTES card
+/// (interesting facts about the track/album/artist) on the right. Splitting the
+/// old full-width player reclaims its dead space for something worth reading.
+fn now_playing_row(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    // Narrow terminals: drop the facts card and let the player keep the row.
+    if area.width < 64 {
+        now_playing(f, area, s, t);
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(area);
+    now_playing(f, cols[0], s, t);
+    facts_panel(f, cols[1], s, t);
+}
+
+/// The lyrics band: LYRICS on the left, the Apple Music QUEUE on the right —
+/// the same 65/35 split as the player row above so the cards line up.
+fn lyrics_row(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    if area.width < 64 {
+        lyrics_panel(f, area, s, t);
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(area);
+    lyrics_panel(f, cols[0], s, t);
+    queue_panel(f, cols[1], s);
+}
+
+/// QUEUE card: the next few tracks Apple Music will play, numbered, with the
+/// artist + length beneath each. Best-effort from the current playlist order.
+fn queue_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let q = &s.queue;
+    let m = &s.music;
+    let block = panel("QUEUE", false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 6 || inner.height < 2 {
+        return;
+    }
+    if !m.running || m.track.is_empty() || q.items.is_empty() {
+        let note = if !m.running || m.track.is_empty() {
+            "♫"
+        } else if !q.fresh {
+            "…"
+        } else {
+            "nothing up next"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(note.to_string(), Style::default().fg(c::DIM)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+    let w = inner.width as usize;
+    let accents = [c::CYAN, c::PINK, c::GREEN];
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, it) in q.items.iter().enumerate() {
+        let col = accents[i % accents.len()];
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}  ", i + 1), Style::default().fg(col).add_modifier(Modifier::BOLD)),
+            Span::styled(truncate(&it.track, w.saturating_sub(3)), Style::default().fg(c::TEXT)),
+        ]));
+        let sub = if it.duration > 0.0 {
+            format!("   {}  ·  {}", it.artist, fmt_clock(it.duration))
+        } else {
+            format!("   {}", it.artist)
+        };
+        lines.push(Line::from(Span::styled(truncate(&sub, w), Style::default().fg(c::DIM))));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The LINER NOTES card: a bulleted list of facts about the current track,
+/// word-wrapped with a hanging indent. Title carries a faint source tag.
+fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    let fa = &s.facts;
+    let block = panel("FACTS", false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 6 || inner.height < 2 {
+        return;
+    }
+
+    // No facts yet: show the status note (or a neutral glyph), centered.
+    let m = &s.music;
+    if fa.lines.is_empty() || fa.track_id != m.track_id() {
+        let note = if !m.running || m.track.is_empty() {
+            "♫"
+        } else if fa.track_id != m.track_id() || fa.note.is_empty() {
+            "gathering liner notes…"
+        } else {
+            &fa.note
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(note.to_string(), Style::default().fg(c::DIM)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let width = inner.width as usize;
+    let max_rows = (inner.height as usize).max(1);
+    let bullets = [c::CYAN, c::PINK, c::GREEN, c::YELLOW, c::ACCENT];
+
+    // Render each fact to its wrapped, bulleted block of lines.
+    let blocks: Vec<Vec<Line>> = fa
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, fact)| {
+            let color = bullets[i % bullets.len()];
+            wrap_text(fact, width.saturating_sub(2).max(4))
+                .into_iter()
+                .enumerate()
+                .map(|(j, seg)| {
+                    if j == 0 {
+                        Line::from(vec![
+                            Span::styled("• ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                            Span::styled(seg, Style::default().fg(c::TEXT)),
+                        ])
+                    } else {
+                        Line::from(vec![Span::raw("  "), Span::styled(seg, Style::default().fg(c::DIM))])
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // Pack whole facts into pages that fit the card height (never split a fact
+    // across a page unless it alone is taller than the card).
+    let mut pages: Vec<Vec<Line>> = Vec::new();
+    let mut cur: Vec<Line> = Vec::new();
+    for blk in blocks {
+        if !cur.is_empty() && cur.len() + blk.len() > max_rows {
+            pages.push(std::mem::take(&mut cur));
+        }
+        cur.extend(blk);
+    }
+    if !cur.is_empty() {
+        pages.push(cur);
+    }
+    if pages.is_empty() {
+        return;
+    }
+
+    // One page → static. Many → buttery cross-dissolve (no cell-stepped scroll).
+    let (pi, alpha) = dissolve_phase(pages.len(), t, 3.4, 0.9);
+    let page = pages.into_iter().nth(pi).unwrap_or_default();
+    f.render_widget(Paragraph::new(faded_lines(page, alpha)), inner);
+}
+
+/// Greedy word-wrap to `width` columns (whitespace-delimited; long words are
+/// hard-split so nothing overflows the card).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > width {
+            // Flush, then hard-split the over-long token.
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if chunk.chars().count() == width {
+                    out.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(ch);
+            }
+            line = chunk;
+            continue;
+        }
+        let need = if line.is_empty() { word.chars().count() } else { line.chars().count() + 1 + word.chars().count() };
+        if need > width {
+            out.push(std::mem::take(&mut line));
+            line.push_str(word);
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let m = &s.music;
     let hot = m.playing;
     let block = panel("NOW PLAYING", hot);
@@ -897,56 +1242,124 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, _t: f64) {
 
     // Square-ish album-art column on the left, inset so it breathes.
     let pad_v: u16 = 1;
-    let art_rows = inner.height.saturating_sub(pad_v * 2).max(1);
-    let art_cols = (art_rows * 2).min(inner.width.saturating_sub(24)).max(1);
+    // Keep the cover square: a terminal cell is ~2:1, so a square needs cols ≈
+    // 2×rows. When the card is narrow (e.g. split beside LINER NOTES) the width
+    // budget wins and we shrink rows to match — never letting it go portrait —
+    // while always reserving room for the text column.
+    let max_rows = inner.height.saturating_sub(pad_v * 2).max(1);
+    let side = (max_rows * 2).min(inner.width.saturating_sub(22)).max(2);
+    let art_cols = side;
+    let art_rows = (side / 2).max(1);
     let art_area = Rect { x: inner.x + 1, y: inner.y + pad_v, width: art_cols, height: art_rows };
     render_art(f, art_area, &s.album_art, m.track_id() == s.album_art.track_id);
 
-    // Text column starts after the art + a 3-cell gap.
-    let gap = art_cols + 4;
+    // Text column starts after the art + a small gap.
+    let gap = art_cols + 3;
     let pos = m.position();
     let frac = if m.duration > 0.0 { (pos / m.duration) as f32 } else { 0.0 };
     let icon = if m.playing { "▶" } else { "❚❚" };
 
-    let title = Line::from(vec![
-        // Transport icon rides the jazz family, not green.
-        Span::styled(format!("{icon} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled(m.track.clone(), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
-    ]);
-    let meta = Line::from(vec![
-        Span::styled(m.artist.clone(), Style::default().fg(c::ACCENT)),
-        Span::styled("  ·  ", Style::default().fg(c::FAINT)),
-        Span::styled(m.album.clone(), Style::default().fg(c::DIM)),
-    ]);
+    // Text column width — needed before we lay out the (possibly scrolling) title.
     let textw = (inner.width.saturating_sub(gap)) as usize;
-    let bw = textw.saturating_sub(16).clamp(8, 90);
-    let mut progress_spans = vec![Span::styled(format!("{} ", fmt_clock(pos)), Style::default().fg(c::CYAN))];
+
+    // Title / artist / album shimmer; a line wider than the column marquee-scrolls
+    // instead of truncating. The transport icon stays pinned at the left.
+    let lead = vec![Span::styled(
+        format!("{icon} "),
+        Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
+    )];
+    let lead_w = icon.chars().count() + 1;
+    let title = cycle_dissolve(lead, lead_w, &[(&m.track, c::TEXT, true)], textw, t, 0.0);
+    let meta = cycle_dissolve(
+        Vec::new(),
+        0,
+        &[
+            (m.artist.as_str(), c::ACCENT, false),
+            ("  ·  ", c::FAINT, false),
+            (m.album.as_str(), c::DIM, false),
+        ],
+        textw,
+        t,
+        1.0,
+    );
+
+    // Progress bar stretches to the right edge of the card: only the two time
+    // labels are reserved, the bar takes everything between them.
+    let pfx = format!("{} ", fmt_clock(pos));
+    let sfx = format!(" {}", fmt_clock(m.duration));
+    let bw = textw.saturating_sub(pfx.chars().count() + sfx.chars().count()).max(8);
+    let mut progress_spans = vec![Span::styled(pfx, Style::default().fg(c::CYAN))];
     progress_spans.extend(bar_spans(frac, bw, c::PINK));
-    progress_spans.push(Span::styled(format!(" {}", fmt_clock(m.duration)), Style::default().fg(c::DIM)));
+    progress_spans.push(Span::styled(sfx, Style::default().fg(c::DIM)));
 
-    // Status row carries an honest, static EQ flourish (no time term, no fake
-    // motion) plus the transport word — fills the column without lying.
-    let status = Line::from(vec![
-        Span::styled(
-            if m.playing { "playing" } else { "paused" },
-            Style::default().fg(c::FAINT),
-        ),
-        Span::styled("   ▁▂▃▃▂▁", Style::default().fg(c::FAINT)),
-    ]);
+    // Transport word only — the dancing spectrum below carries the motion.
+    let status = Line::from(Span::styled(
+        if m.playing { "playing" } else { "paused" },
+        Style::default().fg(c::FAINT),
+    ));
 
+    let tx = inner.x + gap;
+    let tw = inner.width.saturating_sub(gap);
     let body = vec![title, meta, Line::from(""), Line::from(progress_spans), status];
+    let body_h = body.len() as u16;
 
-    // Vertically center the metadata block against the album art so the text and
-    // art share a baseline — no dead rectangle below the text next to tall art.
-    let nblock = body.len() as u16;
-    let top_pad = inner.height.saturating_sub(nblock) / 2;
-    let info = Rect {
-        x: inner.x + gap,
-        y: inner.y + top_pad,
-        width: inner.width.saturating_sub(gap),
-        height: inner.height.saturating_sub(top_pad),
-    };
+    // Text block sits at the top, sharing a baseline with the album art's top.
+    let info = Rect { x: tx, y: inner.y + pad_v, width: tw, height: body_h };
     f.render_widget(Paragraph::new(body), info);
+
+    // The spectrum spans the full text width and its bottom edge lines up with
+    // the bottom of the album art — never overlapping the text block above it.
+    const EQ_H: u16 = 2;
+    let art_bottom = inner.y + pad_v + art_rows; // one past the last art row
+    let eq_y = art_bottom.saturating_sub(EQ_H).max(info.y + body_h);
+    if tw >= 4 && eq_y + EQ_H <= inner.y + inner.height {
+        let eq_area = Rect { x: tx, y: eq_y, width: tw, height: EQ_H };
+        f.render_widget(Paragraph::new(eq_bars(tw as usize, t, m.playing)), eq_area);
+    }
+}
+
+/// A synthetic spectrum-analyzer flourish for the NOW PLAYING card. AppleScript
+/// exposes no real audio levels, so this is an honest *visualizer*, not a
+/// measurement: it only dances while music plays and settles to a flat resting
+/// line when paused — it never pretends to be measured spectrum. Two cells tall
+/// (16 height steps) with a fixed blue→pink positional gradient keeps the motion
+/// buttery and calm (heights move; colours don't strobe).
+fn eq_bars(n: usize, t: f64, playing: bool) -> Vec<Line<'static>> {
+    spectrum(n, 2, t, playing)
+}
+
+/// `n` bars × `rows` cells tall. Bars fill from the bottom; 8 sub-levels per
+/// cell. See `eq_bars` for the honesty note — this is a visualizer, not a real
+/// FFT: it dances only while playing and rests flat when paused.
+fn spectrum(n: usize, rows: usize, t: f64, playing: bool) -> Vec<Line<'static>> {
+    let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let rows = rows.max(1);
+    let tf = t as f32;
+    let denom = (n as f32 - 1.0).max(1.0);
+    let mut grid: Vec<Vec<Span>> = (0..rows).map(|_| Vec::with_capacity(n)).collect();
+    for i in 0..n {
+        let fi = i as f32;
+        let h = if playing {
+            // Bass on the left (slow, tall), treble on the right (fast, flickery)
+            // — a few incommensurate sinusoids so the pattern never visibly loops.
+            let speed = 1.7 + fi * 0.45;
+            let a = (tf * speed + fi * 0.7).sin();
+            let b = (tf * (speed * 0.5 + 1.3) + fi * 1.9).sin();
+            let env = 0.6 + 0.4 * (tf * 0.8 + fi * 0.22).sin();
+            let v = (0.5 + 0.5 * a) * 0.6 + (0.5 + 0.5 * b) * 0.4;
+            (0.12 + v * env).clamp(0.05, 1.0)
+        } else {
+            0.06
+        };
+        let total = (h * (8 * rows) as f32).round() as usize;
+        let col = c::jazz(0.18 + 0.62 * (fi / denom));
+        for (r, line) in grid.iter_mut().enumerate() {
+            let from_bottom = rows - 1 - r; // bottom cell fills first
+            let level = total.saturating_sub(from_bottom * 8).min(8);
+            line.push(Span::styled(glyphs[level].to_string(), Style::default().fg(col)));
+        }
+    }
+    grid.into_iter().map(Line::from).collect()
 }
 
 /// Right-column filler when music isn't playing: three buttery, continuously-
@@ -1019,15 +1432,19 @@ fn render_art(f: &mut Frame, area: Rect, art: &crate::state::AlbumArt, matches: 
     }
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     let have = matches && !art.px.is_empty();
+    // Each cell is one column wide and two half-block rows tall; box-average the
+    // source over each sub-pixel's exact footprint so the downscale stays crisp.
+    let cw = 1.0 / w as f32;
+    let ch = 1.0 / (2.0 * h as f32);
     for row in 0..h {
         let mut spans = Vec::with_capacity(w);
         for col in 0..w {
-            let u = (col as f32 + 0.5) / w as f32;
-            let vt = (2.0 * row as f32 + 0.5) / (2.0 * h as f32);
-            let vb = (2.0 * row as f32 + 1.5) / (2.0 * h as f32);
+            let u0 = col as f32 * cw;
+            let vt0 = 2.0 * row as f32 * ch;
+            let vb0 = (2.0 * row as f32 + 1.0) * ch;
             if have {
-                let top = art.sample(u, vt).unwrap_or([20, 20, 28]);
-                let bot = art.sample(u, vb).unwrap_or([20, 20, 28]);
+                let top = art.sample_area(u0, vt0, u0 + cw, vt0 + ch).unwrap_or([20, 20, 28]);
+                let bot = art.sample_area(u0, vb0, u0 + cw, vb0 + ch).unwrap_or([20, 20, 28]);
                 spans.push(Span::styled(
                     "▀",
                     Style::default()
@@ -1197,7 +1614,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 
     // ----- title with unread badge / all-read tick -----
     let hot = ui.active;
-    let border = if hot { c::PANEL_BORDER_HOT } else { c::PANEL_BORDER };
+    let _ = hot;
+    let border = c::PANEL_BORDER_HOT;
     // Settle: pink "● n unread" crossfades to green "✓ all read" over 300ms.
     let badge_blend = match ui.phase {
         MsgPhase::Advancing if msgs.unread_count == 0 => {
@@ -1246,7 +1664,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
+        .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG));
@@ -1467,7 +1885,7 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(c::PANEL_BORDER))
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG));
@@ -1553,16 +1971,39 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
 const DISCORD_MAX_VOICE: usize = 3;
 const DISCORD_MAX_TEXT: usize = 3;
 
-/// Rows the Discord card needs: occupied voice channels (collapsed entirely when
-/// none), an optional separator, then recent text channels — plus borders.
+/// Overlay an env-gated fake voice member so a join can be previewed live:
+/// `STUDIOBOARD_FAKE_VOICE="200 club:Ghosty"` (or just a bare name → "200 club").
+/// Returns the real list untouched when the env var is unset.
+fn fake_voice(real: &[crate::state::VoiceChannel]) -> Vec<crate::state::VoiceChannel> {
+    use crate::state::VoiceChannel;
+    let mut voice = real.to_vec();
+    let spec = match std::env::var("STUDIOBOARD_FAKE_VOICE") {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return voice,
+    };
+    let (chan, member) = match spec.split_once(':') {
+        Some((c, m)) => (c.trim().to_string(), m.trim().to_string()),
+        None => ("200 club".to_string(), spec),
+    };
+    if let Some(vc) = voice.iter_mut().find(|v| v.name.eq_ignore_ascii_case(&chan)) {
+        vc.members.push(member);
+        vc.members.sort();
+    } else {
+        voice.push(VoiceChannel { name: chan, members: vec![member] });
+    }
+    voice
+}
+
+/// Rows the Discord card needs: one row per occupied voice channel, then the
+/// recent text channels — plus the two border rows. Hugs the content exactly
+/// (no separator) so the bottom border flexes as channels come and go.
 fn discord_height(d: &crate::state::Discord) -> u16 {
     if !d.fresh || !d.available {
         return 4; // gate message
     }
-    let v = d.voice.len().min(DISCORD_MAX_VOICE);
+    let v = fake_voice(&d.voice).len().min(DISCORD_MAX_VOICE);
     let tx = d.text.len().min(DISCORD_MAX_TEXT);
-    let sep = if v > 0 && tx > 0 { 1 } else { 0 };
-    2 + (v + sep + tx).max(1) as u16
+    2 + (v + tx).max(1) as u16
 }
 
 /// DISCORD card: occupied voice channels (each with its members; the whole voice
@@ -1570,20 +2011,20 @@ fn discord_height(d: &crate::state::Discord) -> u16 {
 /// rendered iMessage/Signal-style (channel · "author: last message" · rel · dot).
 fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let d = &s.discord;
-    let in_voice: usize = d.voice.iter().map(|v| v.members.len()).sum();
+    let voice = fake_voice(&d.voice); // real list, plus any env-gated preview join
+    let in_voice: usize = voice.iter().map(|v| v.members.len()).sum();
     let unread_text = d.text.iter().filter(|t| t.unread).count();
 
     // ----- title with voice / unread badge -----
     let mut title_spans = vec![Span::styled(
-        " DISCORD ",
+        " DISCORD  ",
         Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
     )];
     if d.available && d.fresh {
         if in_voice > 0 {
-            title_spans.push(Span::styled(" 🔊 ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
             title_spans.push(Span::styled(
                 format!("{in_voice}"),
-                Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD),
+                Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
             ));
             title_spans.push(Span::styled(" in voice ", Style::default().fg(c::DIM)));
         } else if unread_text > 0 {
@@ -1602,7 +2043,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(c::PANEL_BORDER))
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG));
@@ -1634,7 +2075,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
         );
         return;
     }
-    if d.voice.is_empty() && d.text.is_empty() {
+    if voice.is_empty() && d.text.is_empty() {
         f.render_widget(
             Paragraph::new(Span::styled("✉  all quiet", Style::default().fg(c::FAINT)))
                 .alignment(Alignment::Center),
@@ -1646,20 +2087,25 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let iw = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    // ----- voice section (occupied channels only; collapsed when empty) -----
-    for vc in d.voice.iter().take(DISCORD_MAX_VOICE) {
-        let head = format!("🔊 {}  ", vc.name);
-        let members = vc.members.join(", ");
-        let budget = iw.saturating_sub(dwidth(&head));
-        lines.push(Line::from(vec![
-            Span::styled(head, Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(fit_width(&members, budget), Style::default().fg(c::DIM)),
-        ]));
-    }
+    // Shared column geometry so voice + text rows line up into one clean table:
+    // 2-space indent, an 18-cell name column, a 1-cell gap, then the body.
+    let indent = 2usize;
+    let namew = 18usize;
+    let bodyx = indent + namew + 1;
 
-    // ----- separator between voice and text -----
-    if !d.voice.is_empty() && !d.text.is_empty() {
-        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
+    // ----- voice section (occupied channels only; collapsed when empty) -----
+    // Voice channels read in calm cyan bold — distinct from the dim grey #text
+    // rows below (and tied to the cyan "in voice" count), without the jarring
+    // rainbow shimmer. The member list shares the text channels' preview column;
+    // when too many people are in to fit, the tail collapses to "+N".
+    let memw = iw.saturating_sub(bodyx).max(6);
+    for vc in voice.iter().take(DISCORD_MAX_VOICE) {
+        lines.push(Line::from(vec![
+            Span::raw("  "), // column parity with #text + iMESSAGE/SIGNAL rows
+            Span::styled(pad_width(&vc.name, namew), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(fit_members(&vc.members, memw), Style::default().fg(c::DIM)),
+        ]));
     }
 
     // ----- text channels (iMessage/Signal row style) -----
@@ -1701,6 +2147,182 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+const DOC_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Rows the MAC-DOCTOR card needs. Tight per-state so the box hugs its content:
+/// a gate hint when syswatch isn't installed, 3 inner rows while a run is live
+/// (step · breach · footer), 4 when idle (verdict · trigger · action · footer).
+fn doctor_height(d: &crate::state::Doctor) -> u16 {
+    if !d.available {
+        return 4;
+    }
+    if d.running {
+        5
+    } else {
+        6
+    }
+}
+
+fn severity_color(sev: &str) -> ratatui::style::Color {
+    match sev {
+        "critical" => c::RED,
+        "warn" => c::YELLOW,
+        "info" => c::CYAN,
+        _ => c::DIM,
+    }
+}
+
+/// Friendly label for the raw "[diagnose] …" log line the agent is currently on.
+fn pretty_step(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        "working…".into()
+    } else if s.starts_with("start") {
+        "starting triage…".into()
+    } else if s.starts_with("verdict") {
+        "forming verdict…".into()
+    } else if s.starts_with("stored") || s == "done" {
+        "wrapping up…".into()
+    } else {
+        s.into()
+    }
+}
+
+/// Strip the "start — model=… reasons=" noise and a leading bullet so the breach
+/// reads as a clean phrase.
+fn clean_trigger(s: &str) -> String {
+    let s = s.split("reasons=").last().unwrap_or(s).trim();
+    s.trim_start_matches('•').trim().to_string()
+}
+
+/// MAC-DOCTOR card: live status of the syswatch threshold-triage agent — what
+/// it's doing right now while a run is in flight, or the last verdict + what it
+/// did when idle.
+fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    let d = &s.doctor;
+    let spin = DOC_SPINNER[((t * 12.0) as usize) % DOC_SPINNER.len()];
+
+    // ----- title + status badge -----
+    let mut title_spans = vec![Span::styled(
+        " MAC-DOCTOR ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if d.available {
+        if d.running {
+            title_spans.push(Span::styled(format!(" {spin} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("diagnosing ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)));
+        } else {
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("watching ", Style::default().fg(c::DIM)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 || inner.width < 10 {
+        return;
+    }
+
+    if !d.available {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("⚕ syswatch not installed", Style::default().fg(c::DIM))),
+                Line::from(Span::styled(
+                    "the threshold watchdog isn't running here",
+                    Style::default().fg(c::FAINT),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let trigger = clean_trigger(&d.trigger);
+    let mut lines: Vec<Line> = Vec::new();
+
+    if d.running {
+        // What it's doing right now.
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{spin} "), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                fit_width(&pretty_step(&d.step), iw.saturating_sub(4)),
+                Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        // Why it woke up.
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("breach  ", Style::default().fg(c::PINK)),
+            Span::styled(fit_width(&trigger, iw.saturating_sub(10)), Style::default().fg(c::DIM)),
+        ]));
+    } else {
+        // Verdict of the last run: severity dot + headline, age on the right.
+        let sev = severity_color(&d.last_severity);
+        let title = if d.last_title.is_empty() {
+            "no incidents yet — all clear".to_string()
+        } else {
+            d.last_title.clone()
+        };
+        let rel = if d.last_rel.is_empty() { String::new() } else { format!("{:>5}", d.last_rel) };
+        let titlew = iw.saturating_sub(2 + 2 + dwidth(&rel) + 1).max(6);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("● ", Style::default().fg(sev).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_width(&title, titlew), Style::default().fg(c::TEXT)),
+            Span::raw(" "),
+            Span::styled(rel, Style::default().fg(c::FAINT)),
+        ]));
+        // Why it last woke up (or a heartbeat when nothing's fired).
+        let (lbl, body) = if trigger.is_empty() {
+            ("watching ", "cpu · mem · gpu · disk · thermal".to_string())
+        } else {
+            ("trigger  ", trigger.clone())
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(lbl, Style::default().fg(c::DIM)),
+            Span::styled(fit_width(&body, iw.saturating_sub(2 + dwidth(lbl))), Style::default().fg(c::DIM)),
+        ]));
+        // What it did — concrete commands when it acted, else the outcome.
+        let (atxt, acol) = if !d.last_actions.is_empty() {
+            (format!("ran  {}", d.last_actions.join(", ")), c::GREEN)
+        } else if d.last_outcome.is_empty() {
+            ("standing by".to_string(), c::DIM)
+        } else {
+            (format!("outcome  {}", d.last_outcome), c::DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(fit_width(&atxt, iw.saturating_sub(2)), Style::default().fg(acol)),
+        ]));
+    }
+
+    // Footer: backend model · today's Claude spend · lifetime incident count.
+    let mut footer: Vec<Span> = vec![Span::raw("  ")];
+    if !d.last_model.is_empty() {
+        footer.push(Span::styled(d.last_model.clone(), Style::default().fg(c::ACCENT)));
+        footer.push(Span::styled("  ·  ", Style::default().fg(c::FAINT)));
+    }
+    footer.push(Span::styled(
+        format!("${:.2} today", d.today_cost),
+        Style::default().fg(if d.today_cost > 0.0 { c::CYAN } else { c::DIM }),
+    ));
+    footer.push(Span::styled("  ·  ", Style::default().fg(c::FAINT)));
+    footer.push(Span::styled(format!("{} incidents", d.incidents_total), Style::default().fg(c::DIM)));
+    lines.push(Line::from(footer));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1737,6 +2359,26 @@ fn fit_width(s: &str, max: usize) -> String {
     out
 }
 
+/// Lay out a voice channel's member list into `max` cells: comma-joined names,
+/// and if they don't all fit, show as many as do plus a "+N" overflow tag so a
+/// busy channel never silently hides who's in it.
+fn fit_members(members: &[String], max: usize) -> String {
+    if members.is_empty() {
+        return String::new();
+    }
+    let full = members.join(", ");
+    if dwidth(&full) <= max {
+        return full;
+    }
+    for take in (1..members.len()).rev() {
+        let s = format!("{} +{}", members[..take].join(", "), members.len() - take);
+        if dwidth(&s) <= max {
+            return s;
+        }
+    }
+    fit_width(&format!("{} +{}", members[0], members.len() - 1), max)
+}
+
 /// `fit_width` then right-pad with spaces to exactly `width` display cells.
 fn pad_width(s: &str, width: usize) -> String {
     let mut t = fit_width(s, width);
@@ -1747,9 +2389,9 @@ fn pad_width(s: &str, width: usize) -> String {
     t
 }
 
-fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState) {
+fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let synced = s.lyrics.synced;
-    let block = panel(if synced { "LYRICS ♪ synced" } else { "LYRICS" }, false);
+    let block = panel("LYRICS", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1775,12 +2417,38 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState) {
     }
 
     if ly.lines.is_empty() {
-        let note = if ly.note.is_empty() { "…" } else { &ly.note };
+        // Still fetching → quiet text; it's about to be replaced.
+        if ly.note.contains("loading") || ly.note.is_empty() {
+            let note = if ly.note.is_empty() { "…" } else { &ly.note };
+            f.render_widget(
+                Paragraph::new(Span::styled(note.to_string(), Style::default().fg(c::DIM)))
+                    .alignment(Alignment::Center),
+                inner,
+            );
+            return;
+        }
+        // Genuinely no lyrics: don't leave a lonely note in a big box — keep it
+        // alive with a wide animated spectrum and a caption above it.
+        let h = inner.height as usize;
+        let viz_rows = h.saturating_sub(2).clamp(2, 4);
+        let upper = h.saturating_sub(viz_rows);
+        let caption_y = inner.y + (upper / 2).max(0) as u16;
         f.render_widget(
-            Paragraph::new(Span::styled(note.to_string(), Style::default().fg(c::DIM)))
-                .alignment(Alignment::Center),
-            inner,
+            Paragraph::new(Line::from(vec![
+                Span::styled("♫  ", Style::default().fg(c::FAINT)),
+                Span::styled(ly.note.clone(), Style::default().fg(c::DIM)),
+                Span::styled("  ♫", Style::default().fg(c::FAINT)),
+            ]))
+            .alignment(Alignment::Center),
+            Rect { x: inner.x, y: caption_y, width: inner.width, height: 1 },
         );
+        if inner.width >= 4 && viz_rows >= 1 {
+            let viz_y = inner.y + inner.height - viz_rows as u16;
+            f.render_widget(
+                Paragraph::new(spectrum(inner.width as usize, viz_rows, t, m.playing)),
+                Rect { x: inner.x, y: viz_y, width: inner.width, height: viz_rows as u16 },
+            );
+        }
         return;
     }
 

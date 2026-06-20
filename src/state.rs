@@ -179,6 +179,67 @@ impl AlbumArt {
         let y = ((v.clamp(0.0, 0.999) * self.h as f32) as usize).min(self.h - 1);
         self.px.get(y * self.w + x).copied()
     }
+
+    /// Box-average the source pixels covering the normalized rect [u0,u1)×[v0,v1).
+    /// This is the downscale that keeps a grainy photo legible: every output cell
+    /// integrates its whole footprint instead of picking one aliased source pixel.
+    pub fn sample_area(&self, u0: f32, v0: f32, u1: f32, v1: f32) -> Option<[u8; 3]> {
+        if self.px.is_empty() || self.w == 0 || self.h == 0 {
+            return None;
+        }
+        let w = self.w as f32;
+        let h = self.h as f32;
+        // Pixel-space footprint, clamped to the image, at least one pixel wide/tall.
+        let x0 = (u0.clamp(0.0, 1.0) * w).floor() as usize;
+        let y0 = (v0.clamp(0.0, 1.0) * h).floor() as usize;
+        let x1 = ((u1.clamp(0.0, 1.0) * w).ceil() as usize).max(x0 + 1).min(self.w);
+        let y1 = ((v1.clamp(0.0, 1.0) * h).ceil() as usize).max(y0 + 1).min(self.h);
+        let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+        for y in y0..y1 {
+            let row = y * self.w;
+            for x in x0..x1 {
+                if let Some(p) = self.px.get(row + x) {
+                    r += p[0] as u32;
+                    g += p[1] as u32;
+                    b += p[2] as u32;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return self.sample((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+        }
+        Some([(r / n) as u8, (g / n) as u8, (b / n) as u8])
+    }
+}
+
+/// One upcoming track in Apple Music's queue (next-up from the current playlist).
+#[derive(Clone, Default)]
+pub struct QueueTrack {
+    pub track: String,
+    pub artist: String,
+    pub duration: f64,
+}
+
+/// The next few tracks Apple Music will play (best-effort, by current-playlist
+/// order — AppleScript can't read the true dynamic "Up Next" list). Recomputed
+/// when the current track changes.
+#[derive(Clone, Default)]
+pub struct Queue {
+    pub fresh: bool,
+    pub source_track_id: String, // current track this queue was derived from
+    pub items: Vec<QueueTrack>,  // up to 3 upcoming tracks
+}
+
+/// Curated "interesting facts" about the current track/album/artist for the
+/// LINER NOTES card. Generated off-thread (Claude when a key is present, else a
+/// Wikipedia extract) and cached per track so it never regenerates on seek/pause.
+#[derive(Clone, Default)]
+pub struct MusicFacts {
+    pub track_id: String,   // which track these belong to
+    pub lines: Vec<String>, // one fact per entry
+    pub note: String,       // status when empty: "gathering…" / "no notes"
+    pub source: String,     // "claude" | "wikipedia" (shown faintly in the title)
 }
 
 #[derive(Clone, Default)]
@@ -272,6 +333,26 @@ pub struct Discord {
     pub available: bool,             // bot token present + gateway/REST reachable
     pub voice: Vec<VoiceChannel>,    // only channels with someone in them (else empty)
     pub text: Vec<TextChannel>,      // recent text channels w/ last message
+}
+
+/// mac-doctor / syswatch triage agent status (written by spawn_doctor). The
+/// watchdog samples cheap metrics 24/7 and, on a threshold breach, fires a
+/// diagnosis run (local Ollama triage → optional Claude escalation) that writes
+/// an incident row. This mirrors that state onto the dashboard.
+#[derive(Clone, Default)]
+pub struct Doctor {
+    pub available: bool,        // syswatch.db found / readable
+    pub running: bool,          // diagnose.lock present → a run is in flight right now
+    pub step: String,           // live step from the log tail while running (e.g. "local triage…")
+    pub trigger: String,        // what breached (flattened trigger_reasons of the active/last run)
+    pub last_title: String,     // latest incident's one-line verdict
+    pub last_outcome: String,   // resolved | mitigated | no-action-needed | needs-user | unresolved
+    pub last_severity: String,  // info | warn | critical
+    pub last_model: String,     // qwen2.5:14b | sonnet | …
+    pub last_actions: Vec<String>, // commands the agent ran on the last incident (may be empty)
+    pub last_rel: String,       // "12m" since the last run completed
+    pub today_cost: f64,        // sum of Claude escalation cost today (USD)
+    pub incidents_total: u64,   // lifetime incident count
 }
 
 /// iMessage card data (written by the spawn_messages collector).
@@ -384,6 +465,8 @@ pub struct AppState {
     pub music: MusicStats,
     pub lyrics: Lyrics,
     pub album_art: AlbumArt,
+    pub facts: MusicFacts,
+    pub queue: Queue,
     pub git: GitStats,
     pub weather: Weather,
     pub usage: UsageStats,
@@ -391,6 +474,7 @@ pub struct AppState {
     pub msg_ui: MsgUi,
     pub signal: Messages, // Signal Desktop conversations (read-only; reuses Messages shape)
     pub discord: Discord, // Discord voice presence + recent text channels
+    pub doctor: Doctor,   // mac-doctor / syswatch triage agent status
     pub cpu_hist: History,
     pub gpu_hist: History,
     pub power_hist: History,
@@ -410,6 +494,8 @@ impl Default for AppState {
             music: MusicStats::default(),
             lyrics: Lyrics::default(),
             album_art: AlbumArt::default(),
+            facts: MusicFacts::default(),
+            queue: Queue::default(),
             git: GitStats::default(),
             weather: Weather::default(),
             usage: UsageStats::default(),
@@ -417,6 +503,7 @@ impl Default for AppState {
             msg_ui: MsgUi::default(),
             signal: Messages::default(),
             discord: Discord::default(),
+            doctor: Doctor::default(),
             cpu_hist: History::new(120),
             gpu_hist: History::new(120),
             power_hist: History::new(120),

@@ -394,7 +394,7 @@ pub fn spawn_lyrics(shared: Shared) {
 // ---------------------------------------------------------------------------
 // Album art: dump current track artwork to a temp PNG/JPEG, decode + downscale.
 // ---------------------------------------------------------------------------
-const ART_THUMB: u32 = 64;
+const ART_THUMB: u32 = 160;
 
 fn artwork_script(path: &str) -> String {
     format!(
@@ -482,6 +482,26 @@ pub fn probe_artwork() -> Option<(usize, usize, usize, [u8; 3])> {
     Some((art.w, art.h, art.px.len(), center))
 }
 
+/// Album art for the off-screen visual-verify path (`--cells` / `--snapshot`):
+/// decode the most recent real artwork dump if present, else a radial gradient.
+pub fn sample_album_art(id: String) -> crate::state::AlbumArt {
+    let dump = std::env::temp_dir().join("studioboard_art.dat");
+    if dump.exists() {
+        let art = decode_art(&dump, &id);
+        if !art.px.is_empty() {
+            return art;
+        }
+    }
+    let dim = ART_THUMB as usize;
+    let mut px = Vec::with_capacity(dim * dim);
+    for y in 0..dim {
+        for x in 0..dim {
+            px.push([(x * 255 / dim) as u8, (y * 255 / dim) as u8, 180]);
+        }
+    }
+    crate::state::AlbumArt { track_id: id, w: dim, h: dim, px }
+}
+
 fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
     use image::imageops::FilterType;
     let mut art = crate::state::AlbumArt { track_id: id.to_string(), ..Default::default() };
@@ -489,13 +509,398 @@ fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
     // (Music writes a raw PNG/JPEG to a .dat path).
     if let Ok(bytes) = std::fs::read(path) {
         if let Ok(img) = image::load_from_memory(&bytes) {
-            let small = img.resize_exact(ART_THUMB, ART_THUMB, FilterType::Triangle).to_rgb8();
+            let small = img.resize_exact(ART_THUMB, ART_THUMB, FilterType::Lanczos3).to_rgb8();
             art.w = small.width() as usize;
             art.h = small.height() as usize;
             art.px = small.pixels().map(|p| [p[0], p[1], p[2]]).collect();
         }
     }
     art
+}
+
+// ---------------------------------------------------------------------------
+// QUEUE: the next few tracks Apple Music will play. AppleScript can't read the
+// true dynamic "Up Next" list, so we read the current playlist and take the
+// tracks after the current one (correct for in-order playback; shuffle reorders).
+// ---------------------------------------------------------------------------
+const QUEUE_SCRIPT: &str = r#"
+if application "Music" is running then
+  tell application "Music"
+    try
+      set cp to current playlist
+      set ct to current track
+      set i to index of ct
+      set n to count of tracks of cp
+      set out to ""
+      repeat with k from (i + 1) to (i + 3)
+        if k is less than or equal to n then
+          set tr to track k of cp
+          set out to out & (name of tr) & "\t" & (artist of tr) & "\t" & (duration of tr) & "\n"
+        end if
+      end repeat
+      return out
+    on error
+      return "NOQUEUE"
+    end try
+  end tell
+else
+  return "NOTRUNNING"
+end if
+"#;
+
+pub fn spawn_queue(shared: Shared) {
+    thread::spawn(move || loop {
+        let want = {
+            let s = shared.lock().unwrap();
+            if s.music.running && !s.music.track.is_empty() {
+                Some(s.music.track_id())
+            } else {
+                None
+            }
+        };
+        if let Some(id) = want {
+            // Only re-query when the current track changes (the queue shifts as
+            // playback advances) — cheap and avoids hammering osascript.
+            let stale = {
+                let s = shared.lock().unwrap();
+                s.queue.source_track_id != id || !s.queue.fresh
+            };
+            if stale {
+                let items = read_queue();
+                let mut s = shared.lock().unwrap();
+                if s.music.track_id() == id {
+                    s.queue = crate::state::Queue { fresh: true, source_track_id: id, items };
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1200));
+    });
+}
+
+fn read_queue() -> Vec<crate::state::QueueTrack> {
+    let out = Command::new("osascript").arg("-e").arg(QUEUE_SCRIPT).output();
+    let Ok(o) = out else { return Vec::new() };
+    let raw = String::from_utf8_lossy(&o.stdout);
+    let body = raw.trim();
+    if body == "NOTRUNNING" || body == "NOQUEUE" || body.is_empty() {
+        return Vec::new();
+    }
+    body.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() >= 2 && !f[0].trim().is_empty() {
+                Some(crate::state::QueueTrack {
+                    track: f[0].trim().to_string(),
+                    artist: f[1].trim().to_string(),
+                    duration: f.get(2).and_then(|d| d.trim().parse().ok()).unwrap_or(0.0),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// LINER NOTES: interesting facts about the current track/album/artist. Claude
+// (Haiku) writes punchy trivia when ANTHROPIC_API_KEY is present; otherwise we
+// fall back to a Wikipedia extract so the card is never empty. Cached per track
+// in-memory so it never regenerates on seek/pause. (Persistent disk caching is
+// tracked as a follow-up issue.)
+// ---------------------------------------------------------------------------
+const FACTS_UA: &str = "studioboard/0.1 (https://github.com/tehreet/battlestation)";
+
+pub fn spawn_facts(shared: Shared) {
+    thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(20))
+            .build();
+        let mut cache: std::collections::HashMap<String, crate::state::MusicFacts> =
+            Default::default();
+        let mut current = String::new();
+        loop {
+            let info = {
+                let s = shared.lock().unwrap();
+                if s.music.running && !s.music.track.is_empty() {
+                    Some((
+                        s.music.track_id(),
+                        s.music.artist.clone(),
+                        s.music.track.clone(),
+                        s.music.album.clone(),
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some((id, artist, track, album)) = info {
+                if id != current {
+                    current = id.clone();
+                    if let Some(hit) = cache.get(&id) {
+                        let mut s = shared.lock().unwrap();
+                        if s.music.track_id() == id {
+                            s.facts = hit.clone();
+                        }
+                    } else {
+                        // Show a status line while we gather, scoped to this track.
+                        {
+                            let mut s = shared.lock().unwrap();
+                            if s.music.track_id() == id {
+                                s.facts = crate::state::MusicFacts {
+                                    track_id: id.clone(),
+                                    note: "gathering liner notes…".into(),
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                        let facts = build_facts(&agent, &artist, &track, &album, &id);
+                        cache.insert(id.clone(), facts.clone());
+                        let mut s = shared.lock().unwrap();
+                        if s.music.track_id() == id {
+                            s.facts = facts;
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+    });
+}
+
+/// One-shot facts probe for diagnostics (`studioboard --facts`).
+pub fn probe_facts(artist: &str, track: &str, album: &str) -> crate::state::MusicFacts {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(20))
+        .build();
+    let id = format!("{artist}|{track}|{album}");
+    build_facts(&agent, artist, track, album, &id)
+}
+
+/// Resolve the Anthropic API key without an interactive prompt. Tries the
+/// `ANTHROPIC_API_KEY` env var first, then 1Password via the `op` CLI (zero-
+/// prompt when the service-account token is in the Keychain). The op item must
+/// live in a vault the active credential can read — override the lookup with
+/// `OP_ANTHROPIC_VAULT` / `OP_ANTHROPIC_ITEM` / `OP_ANTHROPIC_FIELD` if needed.
+fn anthropic_key() -> Option<String> {
+    if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+        if !k.trim().is_empty() {
+            return Some(k.trim().to_string());
+        }
+    }
+    let vault = std::env::var("OP_ANTHROPIC_VAULT").unwrap_or_else(|_| "Claude Code".into());
+    let item = std::env::var("OP_ANTHROPIC_ITEM").unwrap_or_else(|_| "Claude Anthropic API Key".into());
+    let field = std::env::var("OP_ANTHROPIC_FIELD").unwrap_or_else(|_| "notesPlain".into());
+    let out = Command::new("op")
+        .args(["item", "get", &item, "--vault", &vault, "--fields", &field, "--reveal"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let k = String::from_utf8_lossy(&out.stdout).trim().trim_matches('"').to_string();
+    if k.is_empty() {
+        None
+    } else {
+        Some(k)
+    }
+}
+
+pub fn build_facts(
+    agent: &ureq::Agent,
+    artist: &str,
+    track: &str,
+    album: &str,
+    id: &str,
+) -> crate::state::MusicFacts {
+    let mut out = crate::state::MusicFacts { track_id: id.to_string(), ..Default::default() };
+    if let Some(key) = anthropic_key() {
+        if let Some(lines) = facts_via_claude(agent, &key, artist, track, album) {
+            if !lines.is_empty() {
+                out.lines = lines;
+                out.source = "claude".into();
+                return out;
+            }
+        }
+    }
+    if let Some(lines) = facts_via_wikipedia(agent, artist, track, album) {
+        if !lines.is_empty() {
+            out.lines = lines;
+            out.source = "wikipedia".into();
+            return out;
+        }
+    }
+    out.note = "no liner notes found".into();
+    out
+}
+
+/// Ask Haiku for a handful of short, surprising, *specific* facts. Best-effort:
+/// returns None on any failure so the Wikipedia fallback takes over.
+fn facts_via_claude(
+    agent: &ureq::Agent,
+    key: &str,
+    artist: &str,
+    track: &str,
+    album: &str,
+) -> Option<Vec<String>> {
+    let system = "You are a music historian writing punchy liner-note trivia for a \
+now-playing dashboard. Output ONLY the facts — one per line, no numbering, no \
+bullets, no preamble, no caveats, no sign-off. NEVER refuse and NEVER add \
+commentary about your confidence. If you are unsure of a hyper-specific detail, \
+give a fact you ARE confident about (the artist, the era, the album's place in \
+their catalog, cultural impact). Every line must be a concrete, surprising fact \
+under 16 words.";
+    let prompt = format!(
+        "Four liner-note facts about the song \"{track}\" from the album \"{album}\" \
+         by {artist}. Favor production, samples/interpolations, hidden references, \
+         chart or record feats, and studio lore — what a superfan would geek out over."
+    );
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 400,
+        "system": system,
+        "messages": [{ "role": "user", "content": prompt }]
+    });
+    let resp: serde_json::Value = agent
+        .post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+        .ok()?
+        .into_json()
+        .ok()?;
+    let text = resp.get("content")?.get(0)?.get("text")?.as_str()?;
+    if looks_like_refusal(text) {
+        return None; // let the Wikipedia fallback take over
+    }
+    let lines: Vec<String> = text
+        .lines()
+        .filter_map(clean_fact)
+        .filter(|l| !looks_like_refusal(l))
+        .take(6)
+        .collect();
+    if lines.len() < 2 {
+        None // too thin to be worth showing — fall back
+    } else {
+        Some(lines)
+    }
+}
+
+/// True when model output reads as a hedge/refusal rather than facts.
+fn looks_like_refusal(s: &str) -> bool {
+    let l = s.to_lowercase();
+    const TELLS: [&str; 9] = [
+        "i'm not confident",
+        "i need to be honest",
+        "i should acknowledge",
+        "i'd recommend checking",
+        "i appreciate",
+        "i don't have",
+        "i cannot",
+        "i can't provide",
+        "as an ai",
+    ];
+    TELLS.iter().any(|t| l.contains(t))
+}
+
+/// Strip leading bullets / numbering / whitespace from a model-emitted fact line.
+fn clean_fact(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_start_matches(|c: char| {
+        c == '-' || c == '*' || c == '•' || c == '·' || c.is_ascii_digit() || c == '.' || c == ')' || c == ' '
+    });
+    let t = t.trim();
+    if t.len() < 4 {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Keyless fallback: stitch a few sentences from the song's and artist's
+/// Wikipedia extracts into standalone facts.
+fn facts_via_wikipedia(
+    agent: &ureq::Agent,
+    artist: &str,
+    track: &str,
+    album: &str,
+) -> Option<Vec<String>> {
+    let mut facts: Vec<String> = Vec::new();
+    // The song article first (most specific); try a couple of title forms.
+    let song = wiki_extract(agent, track)
+        .or_else(|| wiki_extract(agent, &format!("{track} (song)")))
+        .or_else(|| wiki_extract(agent, album));
+    if let Some(ex) = song {
+        facts.extend(sentences(&ex).into_iter().take(3));
+    }
+    // Then a line or two about the artist.
+    if let Some(ex) = wiki_extract(agent, artist) {
+        facts.extend(sentences(&ex).into_iter().take(2));
+    }
+    facts.truncate(5);
+    if facts.is_empty() {
+        None
+    } else {
+        Some(facts)
+    }
+}
+
+/// Fetch the lead extract for a Wikipedia page title (REST summary API). Skips
+/// disambiguation pages and empty/missing results.
+fn wiki_extract(agent: &ureq::Agent, title: &str) -> Option<String> {
+    if title.trim().is_empty() {
+        return None;
+    }
+    let enc: String = title
+        .trim()
+        .chars()
+        .map(|c| match c {
+            ' ' => "_".to_string(),
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-' | '.' | '(' | ')' => c.to_string(),
+            _ => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
+        })
+        .collect();
+    let url = format!("https://en.wikipedia.org/api/rest_v1/page/summary/{enc}");
+    let v: serde_json::Value = agent
+        .get(&url)
+        .set("User-Agent", FACTS_UA)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    if v.get("type").and_then(|x| x.as_str()) == Some("disambiguation") {
+        return None;
+    }
+    let ex = v.get("extract").and_then(|x| x.as_str())?.trim();
+    if ex.is_empty() {
+        None
+    } else {
+        Some(ex.to_string())
+    }
+}
+
+/// Split prose into trimmed, sentence-ish chunks (naive but fine for extracts).
+fn sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        cur.push(c);
+        if c == '.' {
+            // End a sentence on ". " or end-of-text, but not on a decimal like 9.11.
+            let next_space = chars.get(i + 1).map(|n| n.is_whitespace()).unwrap_or(true);
+            let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_digit = chars.get(i + 1).map(|n| n.is_ascii_digit()).unwrap_or(false);
+            if next_space && !(prev_digit && next_digit) {
+                let s = cur.trim().trim_end_matches('.').trim().to_string();
+                if s.len() > 12 {
+                    out.push(s);
+                }
+                cur.clear();
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2124,4 +2529,143 @@ fn fetch_member_name(agent: &ureq::Agent, tok: &str, guild: &str, uid: &str) -> 
         .into_json()
         .ok()?;
     member_display_name(&v)
+}
+
+// ----------------------------------------------------------------------------
+// mac-doctor / syswatch: the on-call triage agent's live status.
+//
+// The watchdog writes everything to ~/Library/Application Support/syswatch:
+//   • diagnose.lock  — a dir that exists only while a diagnosis is in flight
+//   • syswatch.log   — human-readable "[diagnose] <step>" lines as a run proceeds
+//   • syswatch.db    — one `incidents` row per completed run (verdict, cost, …)
+// We poll all three read-only (zero locking contention; WAL handles it).
+// ----------------------------------------------------------------------------
+
+const DOCTOR_SQL: &str = "\
+SELECT COALESCE(severity,''), COALESCE(outcome,''), COALESCE(model,''), \
+REPLACE(REPLACE(COALESCE(title,''),char(9),' '),char(10),' '), \
+REPLACE(REPLACE(COALESCE(trigger_reasons,''),char(9),' '),char(10),' · '), \
+COALESCE(cost_usd,0), \
+REPLACE(REPLACE(COALESCE(actions_taken,'[]'),char(9),' '),char(10),' '), \
+epoch, (SELECT COUNT(*) FROM incidents), \
+(SELECT COALESCE(ROUND(SUM(cost_usd),2),0) FROM incidents WHERE date(ts)=date('now','localtime')) \
+FROM incidents ORDER BY id DESC LIMIT 1;";
+
+fn syswatch_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join("Library/Application Support/syswatch")
+}
+
+/// Last `n` lines of a (possibly large) text file, read from a tail window so we
+/// never slurp the whole log. None if the file is missing.
+fn tail_lines(path: &std::path::Path, n: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(16 * 1024);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text.lines().collect();
+    Some(lines[lines.len().saturating_sub(n)..].join("\n"))
+}
+
+fn rel_short(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+pub fn spawn_doctor(shared: Shared) {
+    thread::spawn(move || loop {
+        let snap = read_doctor();
+        {
+            let mut s = shared.lock().unwrap();
+            s.doctor = snap;
+        }
+        thread::sleep(Duration::from_millis(1500));
+    });
+}
+
+fn read_doctor() -> crate::state::Doctor {
+    use crate::state::Doctor;
+    let dir = syswatch_dir();
+    let db = dir.join("syswatch.db");
+    let mut d = Doctor::default();
+    if !db.exists() {
+        return d; // syswatch not installed → card shows a graceful hint
+    }
+    d.available = true;
+    d.running = dir.join("diagnose.lock").exists();
+
+    // Live step + (while running) the breach that triggered the run, from the log.
+    if let Some(tail) = tail_lines(&dir.join("syswatch.log"), 120) {
+        for line in tail.lines().rev() {
+            let Some(ix) = line.find("[diagnose]") else { continue };
+            let msg = line[ix + "[diagnose]".len()..].trim();
+            if d.step.is_empty() {
+                d.step = msg.to_string();
+            }
+            if d.trigger.is_empty() {
+                if let Some(r) = msg.split("reasons=").nth(1) {
+                    d.trigger = r.trim().to_string();
+                }
+            }
+            if !d.step.is_empty() && !d.trigger.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Latest incident + lifetime/today aggregates, one round-trip.
+    if let Some(out) = Command::new("sqlite3")
+        .args(["-separator", "\t", "-newline", "\n", &db.to_string_lossy(), DOCTOR_SQL])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        let body = String::from_utf8_lossy(&out.stdout);
+        if let Some(line) = body.lines().next() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() >= 10 {
+                d.last_severity = f[0].trim().to_string();
+                d.last_outcome = f[1].trim().to_string();
+                d.last_model = f[2].trim().to_string();
+                d.last_title = f[3].trim().to_string();
+                if d.trigger.is_empty() {
+                    d.trigger = f[4].trim().to_string();
+                }
+                d.last_actions =
+                    serde_json::from_str::<Vec<String>>(f[6].trim()).unwrap_or_default();
+                let epoch: i64 = f[7].trim().parse().unwrap_or(0);
+                d.incidents_total = f[8].trim().parse().unwrap_or(0);
+                d.today_cost = f[9].trim().parse().unwrap_or(0.0);
+                if epoch > 0 {
+                    d.last_rel = rel_short((Local::now().timestamp() - epoch).max(0));
+                }
+            }
+        }
+    }
+
+    // Preview override: STUDIOBOARD_FAKE_DOCTOR=running forces the diagnosing
+    // state live (overlaid on real incident data) so the in-flight card can be
+    // seen without waiting for an actual threshold breach.
+    if std::env::var("STUDIOBOARD_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false) {
+        d.available = true;
+        d.running = true;
+        if d.step.is_empty() {
+            d.step = "local triage (qwen2.5:14b)…".to_string();
+        }
+        if d.trigger.is_empty() {
+            d.trigger = "runaway: rustc at 356% ≥ 220%".to_string();
+        }
+    }
+    d
 }
