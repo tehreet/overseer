@@ -253,16 +253,15 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    header(f, outer[0], s);
-    footer(f, outer[2], s);
+    footer(f, outer[1], s);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(outer[1]);
+        .split(outer[0]);
 
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -318,7 +317,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
         now_playing_row(f, right[0], s, t);
         lyrics_row(f, right[1], s, t);
         if right[2].height >= 3 {
-            system_panel(f, right[2], s);
+            keybinds_panel(f, right[2], s);
         }
     } else {
         let right = Layout::default()
@@ -326,7 +325,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             .constraints([Constraint::Length(NP_H), Constraint::Min(3)])
             .split(body[1]);
         now_playing_row(f, right[0], s, t);
-        system_panel(f, right[1], s);
+        keybinds_panel(f, right[1], s);
     }
 }
 
@@ -535,31 +534,6 @@ fn panel(title: &str, hot: bool) -> Block<'_> {
         ))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG))
-}
-
-fn header(f: &mut Frame, area: Rect, s: &AppState) {
-    let clock = chrono::Local::now().format("%a %b %-d  %H:%M:%S").to_string();
-    let left = Span::styled(
-        "  STUDIOBOARD",
-        Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
-    );
-    let mid = Span::styled(
-        format!("  {}  ·  Apple M4 Max", s.system.hostname),
-        Style::default().fg(c::DIM),
-    );
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-    f.render_widget(Paragraph::new(Line::from(vec![left, mid])), cols[0]);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            format!("{clock}  "),
-            Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD),
-        ))
-        .alignment(Alignment::Right),
-        cols[1],
-    );
 }
 
 fn footer(f: &mut Frame, area: Rect, s: &AppState) {
