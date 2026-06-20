@@ -1880,17 +1880,26 @@ fn fetch_text_channels(
             .unwrap_or("?")
             .to_string();
         let raw = m["content"].as_str().unwrap_or("");
-        let preview = if raw.trim().is_empty() {
-            // Empty content = attachment/embed, or the Message Content intent is off.
-            if m["attachments"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                "[attachment]".to_string()
-            } else if m["embeds"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                "[embed]".to_string()
-            } else {
-                "[no message-content access]".to_string()
-            }
-        } else {
+        let preview = if !raw.trim().is_empty() {
             smart_preview(raw, PREVIEW_BUDGET)
+        } else if let Some(att) = m["attachments"].as_array().and_then(|a| a.first()) {
+            // Media post with no caption — label by attachment kind.
+            let ct = att["content_type"].as_str().unwrap_or("");
+            if ct.starts_with("image/") {
+                "[image]".to_string()
+            } else if ct.starts_with("video/") {
+                "[video]".to_string()
+            } else if ct.starts_with("audio/") {
+                "[audio]".to_string()
+            } else {
+                "[attachment]".to_string()
+            }
+        } else if m["sticker_items"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            "[sticker]".to_string()
+        } else if m["embeds"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+            "[link]".to_string()
+        } else {
+            "[no text]".to_string()
         };
         let ts = m["timestamp"]
             .as_str()
