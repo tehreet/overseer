@@ -2473,7 +2473,7 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         let pos = m.position();
         let frac = if m.duration > 0.0 { pos / m.duration } else { 0.0 };
         let active = ((ly.lines.len() as f64) * frac) as usize;
-        let lines = window(ly, active, center, height, None);
+        let lines = window(ly, active, center, height, band.width as usize, None);
         f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), band);
         return;
     }
@@ -2485,7 +2485,7 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // boundary glyph, so the motion stays buttery.
     let f32frac = frac as f32;
     let ef = f32frac * f32frac * (3.0 - 2.0 * f32frac);
-    let lines = window(ly, active, center, height, Some(ef));
+    let lines = window(ly, active, center, height, band.width as usize, Some(ef));
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), band);
 }
 
@@ -2496,6 +2496,7 @@ fn window(
     active: usize,
     center: usize,
     height: usize,
+    width: usize,
     wipe_frac: Option<f32>,
 ) -> Vec<Line<'static>> {
     let start = active as isize - center as isize;
@@ -2507,17 +2508,19 @@ fn window(
             continue;
         }
         let i = idx as usize;
-        let text = &ly.lines[i].text;
-        if text.is_empty() {
+        if ly.lines[i].text.is_empty() {
             out.push(Line::from(Span::styled("♪", Style::default().fg(c::FAINT))));
             continue;
         }
+        // Truncate to the (possibly narrow) box so centered lines never clip at
+        // the edges — long lyrics get a trailing ellipsis instead.
+        let text = truncate(&ly.lines[i].text, width.max(4));
         if i == active {
             if let Some(frac) = wipe_frac {
-                out.push(karaoke(text, frac));
+                out.push(karaoke(&text, frac));
             } else {
                 out.push(Line::from(Span::styled(
-                    text.clone(),
+                    text,
                     Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
                 )));
             }
@@ -2527,7 +2530,7 @@ fn window(
                 1 => c::DIM,
                 _ => c::FAINT,
             };
-            out.push(Line::from(Span::styled(text.clone(), Style::default().fg(col))));
+            out.push(Line::from(Span::styled(text, Style::default().fg(col))));
         }
     }
     out
