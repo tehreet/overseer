@@ -338,8 +338,8 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     robots_panel(f, left[4], s, t);
     weather_panel(f, left[5], s);
     messages_panel(f, left[6], s, t);
-    signal_panel(f, left[7], s);
-    discord_panel(f, left[8], s);
+    signal_panel(f, left[7], s, t);
+    discord_panel(f, left[8], s, t);
     doctor_panel(f, left[9], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
@@ -582,6 +582,58 @@ fn panel(title: &str, hot: bool) -> Block<'_> {
         ))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG))
+}
+
+/// Box-drawing glyphs we recolor for the shimmer (rounded + any inner tees).
+fn is_box_glyph(s: &str) -> bool {
+    matches!(
+        s,
+        "─" | "│" | "╭" | "╮" | "╰" | "╯" | "┌" | "┐" | "└" | "┘" | "├" | "┤" | "┬" | "┴" | "┼"
+    )
+}
+
+/// Repaint a card's already-drawn border so a bright jazz gradient sweeps around
+/// the perimeter (animated by `t`) — a hard-to-miss "needs attention" shimmer for
+/// unread messages / a voice join / a doctor run. Title text and inner content are
+/// left untouched (only box-drawing glyphs are recolored). Call AFTER rendering the
+/// card's block, gated on the card's alert condition.
+fn shimmer_border(f: &mut Frame, area: Rect, t: f64) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let buf = f.buffer_mut();
+    let (left, right) = (area.left(), area.right() - 1);
+    let (top, bottom) = (area.top(), area.bottom() - 1);
+    let (w, h) = (area.width as f32, area.height as f32);
+    let perim = 2.0 * (w - 1.0) + 2.0 * (h - 1.0);
+    for y in top..=bottom {
+        for x in left..=right {
+            if x != left && x != right && y != top && y != bottom {
+                continue; // interior cell
+            }
+            let Some(cell) = buf.cell_mut((x, y)) else {
+                continue;
+            };
+            if !is_box_glyph(cell.symbol()) {
+                continue; // leave the title / badge text alone
+            }
+            // Perimeter index, clockwise from the top-left corner.
+            let (cx, cy) = ((x - left) as f32, (y - top) as f32);
+            let idx = if y == top {
+                cx
+            } else if x == right {
+                (w - 1.0) + cy
+            } else if y == bottom {
+                (w - 1.0) + (h - 1.0) + ((w - 1.0) - cx)
+            } else {
+                2.0 * (w - 1.0) + (h - 1.0) + ((h - 1.0) - cy)
+            };
+            // Two color cycles around the box, sweeping ~0.55 turns/sec.
+            let phase = ((idx / perim) * 2.0 - t as f32 * 0.55).rem_euclid(1.0);
+            cell.fg = c::jazz(phase);
+            cell.modifier.insert(Modifier::BOLD);
+        }
+    }
 }
 
 fn footer(f: &mut Frame, area: Rect, s: &AppState) {
@@ -1734,6 +1786,12 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Unread → shimmer the border until you've actually checked iMessage (but not
+    // while the brief red send-fail flash is playing).
+    let flashing = ui.send_failed_at.map_or(false, |fa| fa.elapsed().as_secs_f32() < 0.36);
+    if msgs.available && msgs.unread_count > 0 && !flashing {
+        shimmer_border(f, area, t);
+    }
 
     if inner.height < 2 || inner.width < 10 {
         return;
@@ -1924,7 +1982,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 /// SIGNAL card: identical row style to iMESSAGE (sender · preview · rel-time ·
 /// unread dot) and unread-badge title, but read-only — Signal Desktop has no send
 /// API, so there's no focus marker, reply composer, or mark-read interaction.
-fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
+fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let sig = &s.signal;
 
     // ----- title with unread badge / all-read tick (mirrors iMESSAGE) -----
@@ -1945,6 +2003,10 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Unread → shimmer the border until you've checked Signal.
+    if sig.available && sig.unread_count > 0 {
+        shimmer_border(f, area, t);
+    }
 
     if inner.height < 2 || inner.width < 10 {
         return;
@@ -2063,7 +2125,7 @@ fn discord_height(d: &crate::state::Discord) -> u16 {
 /// DISCORD card: occupied voice channels (each with its members; the whole voice
 /// block collapses when everyone's disconnected) above a few recent text channels
 /// rendered iMessage/Signal-style (channel · "author: last message" · rel · dot).
-fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
+fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let d = &s.discord;
     let voice = fake_voice(&d.voice); // real list, plus any env-gated preview join
     let in_voice: usize = voice.iter().map(|v| v.members.len()).sum();
@@ -2103,6 +2165,15 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Shimmer the border on unread text messages (until cleared) or for 20s after
+    // someone joins voice. STUDIOBOARD_FAKE_VOICE also lights it up for previewing.
+    let voice_join = d.voice_join_at.map_or(false, |i| i.elapsed().as_secs_f64() < 20.0);
+    let fake_join = std::env::var("STUDIOBOARD_FAKE_VOICE")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if d.available && (unread_text > 0 || voice_join || fake_join) {
+        shimmer_border(f, area, t);
+    }
 
     if inner.height < 2 || inner.width < 10 {
         return;
@@ -2280,6 +2351,10 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // Shimmer the border while a triage run is in flight.
+    if d.available && d.running {
+        shimmer_border(f, area, t);
+    }
     if inner.height < 2 || inner.width < 10 {
         return;
     }

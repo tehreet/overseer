@@ -2572,11 +2572,11 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                             apply_voice_state(&mut who, &mut names, st);
                         }
                     }
-                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild);
+                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild, false);
                 }
                 "VOICE_STATE_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
                     apply_voice_state(&mut who, &mut names, &v["d"]);
-                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild);
+                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild, true);
                 }
                 _ => {}
             },
@@ -2626,6 +2626,7 @@ fn publish_voice(
     agent: &ureq::Agent,
     tok: &str,
     guild: &str,
+    detect_joins: bool, // true for live VOICE_STATE_UPDATE; false for the GUILD_CREATE snapshot
 ) {
     use crate::state::VoiceChannel;
     use std::collections::BTreeMap;
@@ -2652,6 +2653,24 @@ fn publish_voice(
         })
         .collect();
     let mut s = shared.lock().unwrap();
+    // A new name present now that wasn't connected before = a join → 20s shimmer.
+    // Only on live updates; the GUILD_CREATE snapshot would otherwise fire on every
+    // (re)connect.
+    if detect_joins {
+        let prev: std::collections::HashSet<String> = s
+            .discord
+            .voice
+            .iter()
+            .flat_map(|c| c.members.iter().cloned())
+            .collect();
+        let joined = voice
+            .iter()
+            .flat_map(|c| &c.members)
+            .any(|m| !prev.contains(m));
+        if joined {
+            s.discord.voice_join_at = Some(Instant::now());
+        }
+    }
     s.discord.voice = voice;
 }
 

@@ -333,6 +333,7 @@ pub struct Discord {
     pub available: bool,             // bot token present + gateway/REST reachable
     pub voice: Vec<VoiceChannel>,    // only channels with someone in them (else empty)
     pub text: Vec<TextChannel>,      // recent text channels w/ last message
+    pub voice_join_at: Option<Instant>, // when someone last JOINED voice → 20s border shimmer
 }
 
 /// mac-doctor / syswatch triage agent status (written by spawn_doctor). The

@@ -779,6 +779,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
                 unread: false,
             },
         ],
+        voice_join_at: None,
     };
     // MAC-DOCTOR card preview. Idle by default; STUDIOBOARD_FAKE_DOCTOR=running
     // previews the in-flight (diagnosing) state.
