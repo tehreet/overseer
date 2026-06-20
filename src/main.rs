@@ -49,6 +49,7 @@ fn run() -> Result<()> {
     collectors::spawn_weather(shared.clone());
     collectors::spawn_usage(shared.clone());
     collectors::spawn_messages(shared.clone());
+    collectors::spawn_signal(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;
@@ -256,24 +257,28 @@ fn focused_handle(s: &AppState) -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
-/// Mark the focused unread message read (UI-side only — we keep chat.db strictly
-/// read-only/immutable) and advance to the next unread.
+/// Mark the focused unread conversation read — flip it in our snapshot for an
+/// instant response, and persist to chat.db so the next poll doesn't resurrect
+/// it — then advance to the next unread conversation.
 fn advance_queue(s: &mut AppState) {
-    // Find the rowid of the focused unread, then flip it read in our snapshot.
+    // Find the focused unread conversation, flip it read in our snapshot.
     let target = s
         .messages
         .items
         .iter()
         .filter(|i| i.unread)
         .nth(s.msg_ui.queue_pos)
-        .map(|i| i.rowid);
-    if let Some(rowid) = target {
+        .map(|i| (i.chat_id, i.is_shortcode));
+    if let Some((chat_id, is_shortcode)) = target {
         for it in s.messages.items.iter_mut() {
-            if it.rowid == rowid {
+            if it.chat_id == chat_id {
                 it.unread = false;
             }
         }
-        s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
+        if !is_shortcode {
+            s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
+        }
+        collectors::mark_chat_read(chat_id);
     }
     // queue_pos stays at the front of the (now shorter) unread list.
     let remaining = s.messages.items.iter().filter(|i| i.unread).count();
@@ -594,43 +599,80 @@ fn sample_data(st: &mut AppState, compose: bool) {
     st.messages = state::Messages {
         fresh: true,
         available: true,
-        unread_count: 3,
+        unread_count: 2,
+        // Contacts-only, most-recent-first, capped at 5 (matches the collector).
+        // (sender, handle, text, rel, rich, unread, from_me, shortcode)
         items: vec![
             ("Mom", "+15555550111",
              "can you call me when you get a chance? want to talk about the trip next month and what time works for everyone",
-             "2m", false, true),
-            ("Alex Rivera", "alex@example.com", "sounds good, see you then", "8m", false, true),
-            ("Sarah", "+15555550133", "[rich message]", "1h", true, true),
-            ("Topping Support", "support@topping.example",
-             "your RMA has been received and is in processing", "3h", false, false),
-            ("Best Buy", "+15550022", "your order is ready for pickup", "yd", false, false),
-            ("Dad", "dad@example.com", "ok 👍", "yd", false, false),
+             "2m", false, true, false, false),
+            ("Family", "", "Dad: who's picking up grandma sunday?", "8m", false, true, false, false),
+            ("🦧 The Crew", "", "Josh: check mate 😎", "4h", false, false, false, false),
+            ("Alex Rivera", "alex@example.com", "sounds good, see you then", "12m", false, false, false, false),
+            ("Dad", "dad@example.com", "ok 👍", "yd", false, false, true, false),
         ]
         .into_iter()
-        .map(|(sender, handle, text, rel, rich, unread): (&str, &str, &str, &str, bool, bool)| {
+        .enumerate()
+        .map(|(i, (sender, handle, text, rel, rich, unread, from_me, shortcode)): (usize, (&str, &str, &str, &str, bool, bool, bool, bool))| {
+            let preview = {
+                let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let flat = if flat.chars().count() <= 96 {
+                    flat
+                } else {
+                    let cut: String = flat.chars().take(95).collect();
+                    format!("{cut}…")
+                };
+                if from_me { format!("You: {flat}") } else { flat }
+            };
             state::MessageItem {
-                rowid: 0,
+                chat_id: i as i64,
+                rowid: i as i64,
                 sender: sender.into(),
                 handle: handle.into(),
-                preview: {
-                    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if flat.chars().count() <= 96 {
-                        flat
-                    } else {
-                        let cut: String = flat.chars().take(95).collect();
-                        format!("{cut}…")
-                    }
-                },
+                preview,
                 full_text: text.into(),
                 ts_unix: 0.0,
                 rel: rel.into(),
                 is_rich: rich,
                 unread,
+                from_me,
+                is_shortcode: shortcode,
             }
         })
         .collect(),
     };
     st.msg_ui = state::MsgUi { active: true, queue_pos: 0, ..Default::default() };
+    st.signal = state::Messages {
+        fresh: true,
+        available: true,
+        unread_count: 1,
+        // Signal conversations — read-only, same row style. (sender,text,rel,unread,from_me)
+        items: vec![
+            ("Marcin W", "I miss hacking on cars man", "3m", true, false),
+            ("The Other CW Back Channel", "Elijah: Nice! 🔥", "1h", false, false),
+            ("Peter Salanki", "You: Very smooth", "5h", false, true),
+            ("Alex Stalmakov", "You: but yes i am streaming from my pc", "8h", false, true),
+            ("Erik Gomez", "You: 💀", "yd", false, true),
+        ]
+        .into_iter()
+        .map(|(sender, text, rel, unread, from_me): (&str, &str, &str, bool, bool)| {
+            state::MessageItem {
+                chat_id: 0,
+                rowid: 0,
+                sender: sender.into(),
+                handle: String::new(),
+                preview: text.into(),
+                full_text: text.into(),
+                ts_unix: 0.0,
+                rel: rel.into(),
+                is_rich: false,
+                unread,
+                from_me,
+                is_shortcode: false,
+            }
+        })
+        .collect(),
+    };
     // `--compose` previews the inline reply input affordance.
     if compose {
         st.msg_ui.composing = true;

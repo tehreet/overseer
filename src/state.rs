@@ -229,18 +229,22 @@ pub struct Weather {
     pub temp_strip: Vec<u64>,
 }
 
-/// One recent inbound iMessage/SMS row, newest-first in `Messages.items`.
+/// One conversation (chat), newest-active first in `Messages.items`. Grouped like
+/// the iPhone Messages list: one row per chat, previewing its most recent message.
 #[derive(Clone, Default)]
 pub struct MessageItem {
-    pub rowid: i64,
-    pub sender: String,    // resolved contact name or raw handle
-    pub handle: String,    // raw handle (phone/email) for the AppleScript reply target
-    pub preview: String,   // display text: real text, summarized, or smart-truncated
-    pub full_text: String, // untruncated text (summarize input / send context)
-    pub ts_unix: f64,      // unix seconds
-    pub rel: String,       // "2m" "1h" "yesterday"
-    pub is_rich: bool,     // attributedBody-only → "[rich message]" marker
-    pub unread: bool,      // is_from_me=0 AND is_read=0
+    pub chat_id: i64,        // conversation id (chat.ROWID) — mark-read / reply target
+    pub rowid: i64,          // latest message's ROWID in this conversation
+    pub sender: String,      // contact name · group-chat name · pretty handle
+    pub handle: String,      // 1:1 reply target (phone/email); empty for group chats
+    pub preview: String,     // latest message: real text, summarized, or truncated
+    pub full_text: String,   // untruncated latest text (summarize input / send context)
+    pub ts_unix: f64,        // unix seconds of the latest message
+    pub rel: String,         // "2m" "1h" "yesterday"
+    pub is_rich: bool,       // attributedBody-only → "[rich message]" marker
+    pub unread: bool,        // conversation has >=1 unread inbound message
+    pub from_me: bool,       // latest message is outbound → preview prefixed "You: "
+    pub is_shortcode: bool,  // 5-6 digit shortcode (e.g. 32665) — excluded from badge
 }
 
 /// iMessage card data (written by the spawn_messages collector).
@@ -248,8 +252,8 @@ pub struct MessageItem {
 pub struct Messages {
     pub fresh: bool,        // first poll completed
     pub available: bool,    // chat.db readable (Full Disk Access granted)?
-    pub unread_count: u32,  // is_from_me=0 AND is_read=0
-    pub items: Vec<MessageItem>, // recent inbound, newest-first
+    pub unread_count: u32,  // conversations w/ recent unread inbound (excl. shortcodes)
+    pub items: Vec<MessageItem>, // recent conversations, newest-active first
 }
 
 /// Phase of the iMessage card's interaction animation.
@@ -358,6 +362,7 @@ pub struct AppState {
     pub usage: UsageStats,
     pub messages: Messages,
     pub msg_ui: MsgUi,
+    pub signal: Messages, // Signal Desktop conversations (read-only; reuses Messages shape)
     pub cpu_hist: History,
     pub gpu_hist: History,
     pub power_hist: History,
@@ -382,6 +387,7 @@ impl Default for AppState {
             usage: UsageStats::default(),
             messages: Messages::default(),
             msg_ui: MsgUi::default(),
+            signal: Messages::default(),
             cpu_hist: History::new(120),
             gpu_hist: History::new(120),
             power_hist: History::new(120),

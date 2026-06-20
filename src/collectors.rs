@@ -913,26 +913,45 @@ fn short_model(m: &str) -> String {
 // Anthropic Haiku API when ANTHROPIC_API_KEY is present (best-effort, cached).
 // ---------------------------------------------------------------------------
 
-/// Recent inbound messages, newest first. `quote(attributedBody)` emits a single
-/// `X'..'` hex literal so no embedded tab/newline from the BLOB can break TSV
-/// parsing. We only fetch the hex when `text` is empty (modern macOS stores the
-/// real string in attributedBody for ~9% of messages).
+/// Recent conversations, newest-active first — one row per chat, previewing the
+/// chat's latest message (either direction), exactly like the iPhone Messages
+/// list. We join each chat to its single most-recent message and carry an
+/// unread-inbound count for the dot/badge.
+///
+/// `text` is flattened (newlines/tabs → spaces) in SQL so a multi-line body can't
+/// split a TSV row. `quote(attributedBody)` emits one `X'..'` hex literal, so the
+/// BLOB likewise can't break parsing. Hex is only fetched when `text` is empty
+/// (modern macOS stores the real string in attributedBody for ~9% of messages).
 const MSG_SQL: &str = "\
-SELECT m.ROWID, \
+SELECT c.ROWID AS chat_id, \
+       m.ROWID AS msg_rowid, \
        (m.date/1000000000.0 + 978307200) AS ts, \
-       m.is_read, \
-       COALESCE(h.id,'') AS handle, \
-       COALESCE(m.text,'') AS text, \
+       m.is_from_me, \
+       COALESCE(c.display_name,'') AS display_name, \
+       COALESCE(c.chat_identifier,'') AS chat_ident, \
+       replace(replace(replace(COALESCE(m.text,''), char(10),' '), char(13),' '), char(9),' ') AS text, \
        CASE WHEN (m.text IS NULL OR m.text='') AND m.attributedBody IS NOT NULL \
-            THEN quote(m.attributedBody) ELSE '' END AS ab \
-FROM message m \
-LEFT JOIN handle h ON m.handle_id = h.ROWID \
-WHERE m.is_from_me = 0 \
+            THEN quote(m.attributedBody) ELSE '' END AS ab, \
+       (SELECT count(*) FROM chat_message_join j2 JOIN message m2 ON m2.ROWID=j2.message_id \
+        WHERE j2.chat_id=c.ROWID AND m2.is_from_me=0 AND m2.is_read=0) AS unread_n, \
+       COALESCE(sh.id,'') AS sender_handle \
+FROM chat c \
+JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID \
+JOIN message m ON m.ROWID = cmj.message_id \
+LEFT JOIN handle sh ON sh.ROWID = m.handle_id \
+JOIN (SELECT j.chat_id AS cid, MAX(mm.date) AS maxd \
+      FROM chat_message_join j JOIN message mm ON mm.ROWID=j.message_id \
+      GROUP BY j.chat_id) latest ON latest.cid=c.ROWID AND m.date=latest.maxd \
 ORDER BY m.date DESC \
 LIMIT 40;";
 
-const UNREAD_SQL: &str =
-    "SELECT count(*) FROM message WHERE is_from_me=0 AND is_read=0;";
+/// "Recent" window for the unread badge: a conversation only counts toward the
+/// badge if its latest message landed within this many seconds. Keeps stale
+/// never-cleared read-flags from inflating the count.
+const UNREAD_RECENT_SECS: f64 = 30.0 * 86400.0;
+
+/// How many recent conversations the card shows (a glance, not a full inbox).
+const SHOWN_CONVERSATIONS: usize = 5;
 
 /// Beyond this many display chars a preview is summarized (if a key is present)
 /// or smart-truncated to keep the card readable.
@@ -951,8 +970,19 @@ pub fn spawn_messages(shared: Shared) {
             .build();
         let mut summary_cache: std::collections::HashMap<i64, String> = Default::default();
 
+        // Contact names change rarely; load once and refresh every ~50 polls.
+        let mut contacts = load_contacts();
+        let mut poll = 0u32;
+
         loop {
-            match read_messages(&uri) {
+            poll = poll.wrapping_add(1);
+            if poll % 50 == 0 {
+                let fresh = load_contacts();
+                if !fresh.is_empty() {
+                    contacts = fresh;
+                }
+            }
+            match read_messages(&uri, &contacts) {
                 Some((mut items, unread)) => {
                     // Best-effort summarization of long previews (gated on key).
                     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -997,9 +1027,13 @@ pub fn spawn_messages(shared: Shared) {
     });
 }
 
-/// Run the two queries; return (items newest-first, unread_count). None if the
-/// DB can't be read (no Full Disk Access) so the panel shows a graceful hint.
-fn read_messages(uri: &str) -> Option<(Vec<crate::state::MessageItem>, u32)> {
+/// Run the conversation query; return (items newest-active-first, unread_count).
+/// `contacts` maps normalized handles → display names (empty if no AddressBook
+/// access). None if chat.db can't be read so the panel shows a graceful hint.
+fn read_messages(
+    uri: &str,
+    contacts: &std::collections::HashMap<String, String>,
+) -> Option<(Vec<crate::state::MessageItem>, u32)> {
     use crate::state::MessageItem;
     let out = Command::new("sqlite3")
         .args(["-separator", "\t", "-newline", "\n", uri, MSG_SQL])
@@ -1016,19 +1050,28 @@ fn read_messages(uri: &str) -> Option<(Vec<crate::state::MessageItem>, u32)> {
 
     let now = Local::now().timestamp() as f64;
     let mut items = Vec::new();
+    let mut seen_chats = std::collections::HashSet::new();
     for line in body.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 6 {
+        if f.len() < 10 {
             continue;
         }
-        let rowid: i64 = f[0].parse().unwrap_or(0);
-        let ts: f64 = f[1].parse().unwrap_or(0.0);
-        let is_read: i64 = f[2].parse().unwrap_or(1);
-        let handle = f[3].to_string();
-        let text = f[4].to_string();
-        let ab = f[5];
+        let chat_id: i64 = f[0].parse().unwrap_or(0);
+        // A chat can tie on MAX(date) across two messages; keep the first only.
+        if !seen_chats.insert(chat_id) {
+            continue;
+        }
+        let rowid: i64 = f[1].parse().unwrap_or(0);
+        let ts: f64 = f[2].parse().unwrap_or(0.0);
+        let from_me = f[3].trim() == "1";
+        let display_name = f[4].trim().to_string();
+        let chat_ident = f[5].to_string();
+        let text = f[6].to_string();
+        let ab = f[7];
+        let unread_n: u32 = f[8].trim().parse().unwrap_or(0);
+        let sender_handle = f[9].trim();
 
-        let (full_text, is_rich) = if !text.trim().is_empty() {
+        let (body_text, is_rich) = if !text.trim().is_empty() {
             (text, false)
         } else if !ab.is_empty() {
             match decode_attributed_body(ab) {
@@ -1039,36 +1082,83 @@ fn read_messages(uri: &str) -> Option<(Vec<crate::state::MessageItem>, u32)> {
             ("[rich message]".to_string(), true)
         };
 
-        let sender = pretty_handle(&handle);
-        let preview = smart_preview(&full_text, PREVIEW_BUDGET);
+        // Group chats: GUID-style chat_identifier ("chat3889…"); reply target n/a.
+        let is_group = chat_ident.starts_with("chat");
+        // Shortcode: a short all-digits 1:1 sender (32665, 91703 — banks, spam).
+        let digit_count = chat_ident.chars().filter(|c| c.is_ascii_digit()).count();
+        let all_digits = !chat_ident.is_empty()
+            && chat_ident.chars().all(|c| c.is_ascii_digit() || c == '+');
+        let is_shortcode = !is_group && all_digits && digit_count > 0 && digit_count <= 6;
+
+        // Contacts-only: keep 1:1 chats that resolve to a real AddressBook
+        // contact, plus named group chats. Drops shortcodes, unknown numbers,
+        // and business/notification SMS senders (Google, Coinbase, verif codes…).
+        let contact = if is_group {
+            None
+        } else {
+            contacts.get(&norm_handle(&chat_ident)).cloned()
+        };
+        let named_group = is_group && !display_name.is_empty();
+        if contact.is_none() && !named_group {
+            continue;
+        }
+
+        let sender = if is_group {
+            display_name
+        } else {
+            contact.clone().unwrap_or_else(|| pretty_handle(&chat_ident))
+        };
+
+        let preview = {
+            let p = smart_preview(&body_text, PREVIEW_BUDGET);
+            if from_me {
+                format!("You: {p}")
+            } else if is_group && !sender_handle.is_empty() {
+                // iPhone-style "<who>: <message>" prefix for group previews.
+                let who = contacts
+                    .get(&norm_handle(sender_handle))
+                    .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
+                    .unwrap_or_else(|| pretty_handle(sender_handle));
+                format!("{who}: {p}")
+            } else {
+                p
+            }
+        };
+        let unread = unread_n > 0;
         items.push(MessageItem {
+            chat_id,
             rowid,
             sender,
-            handle,
+            handle: if is_group { String::new() } else { chat_ident },
             preview,
-            full_text,
+            full_text: body_text,
             ts_unix: ts,
             rel: fmt_rel((now - ts).max(0.0)),
             is_rich,
-            unread: is_read == 0,
+            unread,
+            from_me,
+            is_shortcode,
         });
     }
 
-    // Unread count (cheap separate query; cap to keep the badge sane).
-    let unread = Command::new("sqlite3")
-        .args([uri, UNREAD_SQL])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
-        .unwrap_or_else(|| items.iter().filter(|i| i.unread).count() as u32);
-
+    // Just the most recent few conversations — the card is a glance, not an inbox.
+    items.truncate(SHOWN_CONVERSATIONS);
+    let unread = unread_badge_count(&items, now);
     Some((items, unread))
 }
 
-/// Make a raw handle (phone/email) friendlier. We don't have AddressBook access
-/// here; keep the email local-part or the last digits of a phone number so the
-/// fixed sender column reads cleanly.
+/// Badge count: conversations with an unread inbound message whose latest activity
+/// is recent, excluding shortcode/notification senders. Matches what a person
+/// would actually call "unread" (not every stale never-cleared flag).
+fn unread_badge_count(items: &[crate::state::MessageItem], now: f64) -> u32 {
+    items
+        .iter()
+        .filter(|i| i.unread && !i.is_shortcode && (now - i.ts_unix) <= UNREAD_RECENT_SECS)
+        .count() as u32
+}
+
+/// Make a raw handle (phone/email) friendlier when no contact name is known:
+/// email local-part, or a US-formatted phone like (920) 555-1212.
 fn pretty_handle(h: &str) -> String {
     if h.is_empty() {
         return "Unknown".into();
@@ -1076,7 +1166,86 @@ fn pretty_handle(h: &str) -> String {
     if let Some((user, _dom)) = h.split_once('@') {
         return user.to_string();
     }
-    h.to_string()
+    let digits: String = h.chars().filter(|c| c.is_ascii_digit()).collect();
+    let d = if digits.len() == 11 && digits.starts_with('1') {
+        &digits[1..]
+    } else {
+        &digits
+    };
+    if d.len() == 10 {
+        format!("({}) {}-{}", &d[0..3], &d[3..6], &d[6..10])
+    } else {
+        h.to_string()
+    }
+}
+
+/// Normalize a handle for contact lookup: emails lowercased; phones reduced to
+/// their last 10 digits so +1 / spacing / punctuation variants all match.
+fn norm_handle(h: &str) -> String {
+    let h = h.trim();
+    if h.contains('@') {
+        return h.to_lowercase();
+    }
+    let digits: String = h.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() > 10 {
+        digits[digits.len() - 10..].to_string()
+    } else {
+        digits
+    }
+}
+
+/// Build a normalized-handle → contact-name map from the macOS AddressBook
+/// sources (same Full Disk Access that unlocks chat.db). Best-effort: a missing
+/// or unreadable AddressBook just yields an empty map (we fall back to handles).
+fn load_contacts() -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let Some(home) = dirs::home_dir() else { return map };
+    let root = home.join("Library/Application Support/AddressBook/Sources");
+    let Ok(sources) = std::fs::read_dir(&root) else { return map };
+
+    // name = "First Last", falling back to organization; key = normalized handle.
+    const PHONE_SQL: &str = "SELECT COALESCE(r.ZFIRSTNAME,''), COALESCE(r.ZLASTNAME,''), \
+        COALESCE(r.ZORGANIZATION,''), p.ZFULLNUMBER FROM ZABCDRECORD r \
+        JOIN ZABCDPHONENUMBER p ON p.ZOWNER=r.Z_PK WHERE p.ZFULLNUMBER IS NOT NULL;";
+    const EMAIL_SQL: &str = "SELECT COALESCE(r.ZFIRSTNAME,''), COALESCE(r.ZLASTNAME,''), \
+        COALESCE(r.ZORGANIZATION,''), e.ZADDRESS FROM ZABCDRECORD r \
+        JOIN ZABCDEMAILADDRESS e ON e.ZOWNER=r.Z_PK WHERE e.ZADDRESS IS NOT NULL;";
+
+    for src in sources.flatten() {
+        let db = src.path().join("AddressBook-v22.abcddb");
+        if !db.exists() {
+            continue;
+        }
+        let uri = format!("file:{}?immutable=1", db.display());
+        for sql in [PHONE_SQL, EMAIL_SQL] {
+            let Ok(out) = Command::new("sqlite3")
+                .args(["-separator", "\t", "-newline", "\n", &uri, sql])
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 4 {
+                    continue;
+                }
+                let name = format!("{} {}", f[0].trim(), f[1].trim());
+                let name = name.trim();
+                let name = if name.is_empty() { f[2].trim() } else { name };
+                let key = norm_handle(f[3]);
+                if name.is_empty() || key.is_empty() {
+                    continue;
+                }
+                // First write wins so the earlier source isn't clobbered by junk.
+                map.entry(key).or_insert_with(|| name.to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Best-effort decode of an Apple typedstream `attributedBody` blob delivered as
@@ -1128,42 +1297,65 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Scan a byte buffer for the longest contiguous run of printable UTF-8 text.
+/// A printable run that's actually typedstream scaffolding (class names, attribute
+/// keys), not the message body — e.g. `__kIMBaseWritingDirectionAttributeName`,
+/// `NSDictionary`. Rejected so a formatting-only message reads as "[rich message]"
+/// instead of leaking metadata, and so a real body run is preferred over these.
+fn is_typedstream_artifact(s: &str) -> bool {
+    let t = s.trim();
+    t.contains("kIM")
+        || t.contains("AttributeName")
+        || t.contains("streamtyped")
+        || t.starts_with("NS")
+        || t.starts_with("__")
+        || t.starts_with('$') // attachment/transfer GUID placeholder ($<UUID>)
+        || t == "+"
+        || is_uuid_like(t)
+}
+
+/// A bare UUID (optionally `$`-prefixed) — a message-part / attachment id, never
+/// readable body. Pattern: 32 hex digits split by dashes (8-4-4-4-12).
+fn is_uuid_like(s: &str) -> bool {
+    let s = s.strip_prefix('$').unwrap_or(s);
+    let stripped: String = s.chars().filter(|&c| c != '-').collect();
+    stripped.len() == 32 && stripped.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Scan a byte buffer for the longest contiguous run of printable UTF-8 text,
+/// ignoring typedstream scaffolding runs (class names / attribute keys).
 fn longest_printable_run(bytes: &[u8]) -> Option<String> {
     let s = String::from_utf8_lossy(bytes);
-    let mut best = "";
-    let mut cur_start = 0usize;
-    let mut in_run = false;
-    let mut run_start = 0usize;
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
     let printable = |c: char| c == ' ' || (!c.is_control() && c != '\u{fffd}');
-    for &(idx, ch) in &chars {
+    let mut best: Option<&str> = None;
+    let mut start = 0usize;
+    let mut active = false;
+    for (idx, ch) in s.char_indices() {
         if printable(ch) {
-            if !in_run {
-                in_run = true;
-                run_start = idx;
-                cur_start = idx;
+            if !active {
+                active = true;
+                start = idx;
             }
-        } else if in_run {
-            in_run = false;
-            let run = &s[run_start..idx];
-            if run.trim().len() > best.trim().len() {
-                best = &s[cur_start..idx];
+            continue;
+        }
+        if active {
+            active = false;
+            let run = &s[start..idx];
+            if !is_typedstream_artifact(run)
+                && best.map(|b| b.trim().len()).unwrap_or(0) < run.trim().len()
+            {
+                best = Some(run);
             }
         }
     }
-    if in_run {
-        let run = &s[run_start..];
-        if run.trim().len() > best.trim().len() {
-            best = run;
+    if active {
+        let run = &s[start..];
+        if !is_typedstream_artifact(run)
+            && best.map(|b| b.trim().len()).unwrap_or(0) < run.trim().len()
+        {
+            best = Some(run);
         }
     }
-    let t = best.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
-    }
+    best.map(|b| b.trim().to_string())
 }
 
 /// Single-line smart truncation: collapse newlines, cap to `max` chars with an
@@ -1224,6 +1416,28 @@ pub fn send_imessage(handle: &str, body: &str) {
         .spawn();
 }
 
+/// Mark every unread inbound message in one conversation read, persisting to
+/// chat.db so the next poll doesn't resurrect the unread state. Fire-and-forget
+/// and tightly scoped (one chat, inbound only); a busy DB just no-ops this round.
+pub fn mark_chat_read(chat_id: i64) {
+    let Some(home) = dirs::home_dir() else { return };
+    let db = home.join("Library/Messages/chat.db");
+    let now_unix = Local::now().timestamp();
+    let now_ns = (now_unix - 978307200) * 1_000_000_000;
+    let sql = format!(
+        "PRAGMA busy_timeout=3000; \
+         UPDATE message SET is_read=1, date_read={now_ns} \
+         WHERE is_from_me=0 AND is_read=0 AND ROWID IN \
+           (SELECT message_id FROM chat_message_join WHERE chat_id={chat_id});"
+    );
+    let _ = Command::new("sqlite3")
+        .arg(db.as_os_str())
+        .arg(sql)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 /// Summarize a long message to <=8 words via Anthropic Haiku. Best-effort:
 /// returns None on any failure so the truncation fallback stays in control.
 fn summarize(agent: &ureq::Agent, key: &str, text: &str) -> Option<String> {
@@ -1274,4 +1488,273 @@ fn walk_jsonl(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Signal Desktop: read recent conversations from the SQLCipher-encrypted
+// db.sqlite. The DB key is wrapped (Chromium safeStorage "v10") with a secret in
+// the macOS Keychain; we unwrap it via `security` + `openssl` (PBKDF2-HMAC-SHA1 →
+// AES-128-CBC), then read with the `sqlcipher` CLI. All shell-outs, mirroring the
+// iMessage collector — no new crates. Read-only: Signal Desktop exposes no send
+// API, so this card never writes (no reply / mark-read).
+// ---------------------------------------------------------------------------
+
+/// Latest real message per active conversation, newest-active first. Names come
+/// from Signal's own profile data; group previews carry the sender's first name.
+const SIGNAL_SQL: &str = "\
+SELECT COALESCE(NULLIF(TRIM(c.name),''), NULLIF(TRIM(c.profileFullName),''), \
+                NULLIF(TRIM(COALESCE(c.profileName,'')||' '||COALESCE(c.profileFamilyName,'')),''), \
+                c.e164, 'Unknown') AS who, \
+       c.type AS ctype, \
+       m.type AS dir, \
+       (m.sent_at/1000.0) AS ts, \
+       (SELECT count(*) FROM messages mu WHERE mu.conversationId=c.id \
+        AND mu.type='incoming' AND mu.seenStatus=0) AS unread_n, \
+       COALESCE(NULLIF(TRIM(sc.profileFullName),''), NULLIF(TRIM(sc.name),''), '') AS src, \
+       m.hasVisualMediaAttachments AS vis, \
+       m.hasAttachments AS att, \
+       replace(replace(replace(COALESCE(m.body,''), char(10),' '), char(13),' '), char(9),' ') AS body \
+FROM conversations c \
+JOIN messages m ON m.rowid = (SELECT rowid FROM messages mm \
+     WHERE mm.conversationId=c.id AND mm.type IN ('incoming','outgoing') \
+     ORDER BY mm.received_at DESC LIMIT 1) \
+LEFT JOIN conversations sc ON sc.serviceId = m.sourceServiceId \
+WHERE c.active_at IS NOT NULL \
+ORDER BY c.active_at DESC \
+LIMIT 40;";
+
+pub fn spawn_signal(shared: Shared) {
+    thread::spawn(move || {
+        let Some(home) = dirs::home_dir() else { return };
+        let src_db = home.join("Library/Application Support/Signal/sql/db.sqlite");
+        let tmp_db = std::env::temp_dir().join("studioboard-signal.sqlite");
+
+        // Derive the SQLCipher key once; re-derive only after a failed read (in
+        // case the keychain secret rotated). Without it the card shows "locked".
+        let mut key: Option<String> = None;
+
+        loop {
+            if key.is_none() {
+                key = signal_db_key();
+            }
+            let result = key.as_ref().and_then(|k| {
+                if !src_db.exists() {
+                    return None;
+                }
+                // Snapshot the live DB (Signal keeps it open in WAL mode).
+                std::fs::copy(&src_db, &tmp_db).ok()?;
+                read_signal(tmp_db.to_str()?, k)
+            });
+            let failed = result.is_none();
+            {
+                let mut s = shared.lock().unwrap();
+                s.signal.fresh = true;
+                match result {
+                    Some((items, unread)) => {
+                        s.signal.available = true;
+                        s.signal.unread_count = unread;
+                        s.signal.items = items;
+                    }
+                    None => s.signal.available = false,
+                }
+            }
+            if failed {
+                key = None; // re-derive next round (torn copy or rotated secret)
+            }
+            thread::sleep(Duration::from_secs(15));
+        }
+    });
+}
+
+/// Run the conversation query against the SQLCipher DB copy; parse into the same
+/// `MessageItem` shape the iMessage card uses. None if the key/DB/tool is unusable.
+fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageItem>, u32)> {
+    use crate::state::MessageItem;
+    let script = format!("PRAGMA key=\"x'{key}'\";{SIGNAL_SQL}");
+    let out = Command::new(resolved_tool("sqlcipher"))
+        .args(["-separator", "\t", "-newline", "\n", db_copy, &script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let now = Local::now().timestamp() as f64;
+    let mut items = Vec::new();
+    for line in body.lines() {
+        // The PRAGMA emits a lone "ok" line (no tabs) → caught by the field guard.
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 9 {
+            continue;
+        }
+        let who = f[0].to_string();
+        let is_group = f[1] == "group";
+        let from_me = f[2] == "outgoing";
+        let ts: f64 = f[3].parse().unwrap_or(0.0);
+        let unread_n: u32 = f[4].trim().parse().unwrap_or(0);
+        let src = f[5].trim();
+        let has_vis = f[6].trim() == "1";
+        let has_att = f[7].trim() == "1";
+        let raw_body = f[8].to_string();
+
+        let (text, is_rich) = if !raw_body.trim().is_empty() {
+            (raw_body, false)
+        } else if has_vis {
+            ("[photo]".to_string(), true)
+        } else if has_att {
+            ("[attachment]".to_string(), true)
+        } else {
+            ("[message]".to_string(), true)
+        };
+
+        let preview = {
+            let p = smart_preview(&text, PREVIEW_BUDGET);
+            if from_me {
+                format!("You: {p}")
+            } else if is_group && !src.is_empty() {
+                let who_first = src.split_whitespace().next().unwrap_or(src);
+                format!("{who_first}: {p}")
+            } else {
+                p
+            }
+        };
+
+        items.push(MessageItem {
+            chat_id: 0,
+            rowid: 0,
+            sender: who,
+            handle: String::new(), // read-only: no reply target
+            preview,
+            full_text: text,
+            ts_unix: ts,
+            rel: fmt_rel((now - ts).max(0.0)),
+            is_rich,
+            unread: unread_n > 0,
+            from_me,
+            is_shortcode: false,
+        });
+    }
+    items.truncate(SHOWN_CONVERSATIONS);
+    let unread = unread_badge_count(&items, now);
+    Some((items, unread))
+}
+
+/// Unwrap Signal's SQLCipher key: read `encryptedKey` from config.json, fetch the
+/// Keychain secret, PBKDF2-derive the AES-128 key, and AES-CBC-decrypt — all via
+/// the `security` and `openssl` CLIs. Returns the 64-hex-char key, or None.
+fn signal_db_key() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let base = home.join("Library/Application Support/Signal");
+    let cfg = std::fs::read_to_string(base.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&cfg).ok()?;
+    let enc = v.get("encryptedKey")?.as_str()?;
+    // Strip the "v10" prefix (3 bytes = 6 hex chars) and hex-decode the ciphertext.
+    let cipher = hex_decode(enc.get(6..)?)?;
+    let cipher_path = std::env::temp_dir().join("studioboard-signal-cipher.bin");
+    std::fs::write(&cipher_path, &cipher).ok()?;
+
+    // Keychain secret Chromium's safeStorage used to wrap the DB key.
+    let pw_out = Command::new("security")
+        .args(["find-generic-password", "-ws", "Signal Safe Storage"])
+        .output()
+        .ok()?;
+    if !pw_out.status.success() {
+        return None;
+    }
+    let pw = String::from_utf8_lossy(&pw_out.stdout);
+    let pw = pw.trim();
+    if pw.is_empty() {
+        return None;
+    }
+
+    // PBKDF2-HMAC-SHA1(pw, "saltysalt", 1003) → 16-byte AES-128 key. macOS system
+    // openssl is LibreSSL (no `kdf` subcommand), so we resolve the Homebrew one.
+    let openssl = resolved_tool("openssl");
+    let kdf = Command::new(&openssl)
+        .args([
+            "kdf",
+            "-keylen",
+            "16",
+            "-binary",
+            "-kdfopt",
+            "digest:SHA1",
+            "-kdfopt",
+            &format!("pass:{pw}"),
+            "-kdfopt",
+            "salt:saltysalt",
+            "-kdfopt",
+            "iter:1003",
+            "PBKDF2",
+        ])
+        .output()
+        .ok()?;
+    if !kdf.status.success() || kdf.stdout.len() != 16 {
+        return None;
+    }
+    let aes_hex = hex_encode(&kdf.stdout);
+
+    // AES-128-CBC decrypt (IV = 16×0x20); plaintext is the hex key + PKCS7 pad.
+    let iv = "20".repeat(16);
+    let dec = Command::new(&openssl)
+        .args([
+            "enc",
+            "-aes-128-cbc",
+            "-d",
+            "-K",
+            &aes_hex,
+            "-iv",
+            &iv,
+            "-nopad",
+            "-in",
+            cipher_path.to_str()?,
+        ])
+        .output()
+        .ok()?;
+    if !dec.status.success() {
+        return None;
+    }
+    let plain = String::from_utf8_lossy(&dec.stdout);
+    let key: String = plain.chars().filter(|c| c.is_ascii_hexdigit()).take(64).collect();
+    (key.len() == 64).then_some(key)
+}
+
+/// Prefer a Homebrew-installed CLI (Apple/Intel paths) over PATH lookup — the
+/// system openssl is LibreSSL and lacks `kdf`, and sqlcipher isn't a system tool.
+fn resolved_tool(bin: &str) -> String {
+    for p in [format!("/opt/homebrew/bin/{bin}"), format!("/usr/local/bin/{bin}")] {
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    bin.to_string()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let b = s.as_bytes();
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i + 1 < b.len() {
+        out.push((val(b[i])? << 4) | val(b[i + 1])?);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
 }

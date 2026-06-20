@@ -9,6 +9,8 @@ use ratatui::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use chrono::{Local, Timelike};
+
 use crate::state::AppState;
 use crate::theme as c;
 
@@ -271,7 +273,12 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
             Constraint::Length(10), // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
             Constraint::Length(7),  // [5] WEATHER       (jazzed, +data)
-            Constraint::Min(9),     // [6] iMESSAGE
+            // The two message cards size to their content (no trailing gap) and
+            // shrink first under height pressure — keeping ROBOTS rigid above so
+            // its bottom-row burn chart is never the thing that gets clipped.
+            Constraint::Max(card_height(&s.messages, s.msg_ui.active)), // [6] iMESSAGE
+            Constraint::Max(card_height(&s.signal, false)),             // [7] SIGNAL
+            Constraint::Min(0),     // [8] slack absorbs leftover, keeping cards tight
         ])
         .split(body[0]);
 
@@ -282,6 +289,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     robots_panel(f, left[4], s, t);
     weather_panel(f, left[5], s);
     messages_panel(f, left[6], s, t);
+    signal_panel(f, left[7], s);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
@@ -789,7 +797,16 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             // "burn" label padded to the value-label width (8+1) so the bars
             // begin in the same column as the today/week/month numbers above.
             let mut burn = vec![Span::styled(format!("{:<8} ", "burn"), Style::default().fg(c::DIM))];
-            burn.extend(jazz_spark(&u.hourly, (lw as usize).saturating_sub(9)));
+            // Window today's per-hour burn so it ENDS at the current hour — the
+            // live hour is the rightmost bar. Showing the raw tail of the 24h
+            // array would render the empty late-day/future hours (all blank).
+            let today_so_far = if u.hourly.is_empty() {
+                &u.hourly[..]
+            } else {
+                let hh = (Local::now().hour() as usize).min(u.hourly.len() - 1);
+                &u.hourly[..=hh]
+            };
+            burn.extend(jazz_spark(today_so_far, (lw as usize).saturating_sub(9)));
             f.render_widget(
                 Paragraph::new(Line::from(burn)),
                 Rect { x: inner.x, y: inner.y + inner.height - 1, width: lw, height: 1 },
@@ -1155,6 +1172,18 @@ fn night_icon(icon: &str, sunrise: &str, sunset: &str) -> String {
     }
 }
 
+/// Exact rows a message card needs for its content (incl. borders) so the layout
+/// can size it tight — no trailing gap below the last conversation. `active` adds
+/// the focused iMESSAGE footer (separator + keybind hint).
+fn card_height(m: &crate::state::Messages, active: bool) -> u16 {
+    if !m.fresh || !m.available {
+        return 4; // graceful gate message (1-2 lines + borders)
+    }
+    let n = m.items.len().clamp(1, 5) as u16;
+    let footer = if active { 2 } else { 0 };
+    2 + n + footer
+}
+
 /// iMESSAGE card: unread badge in the title, a list of recent inbound messages
 /// (focus marker · sender · preview · rel-time · unread dot), and an inline reply
 /// input that wipes open on a double-press. All motion is interpolated each
@@ -1263,8 +1292,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // message rows above it never reflow. Reserve 1 row while opening/open.
     let composer_open = ui.composing || ui.phase == MsgPhase::Opening;
     let composer_rows = if composer_open { 1usize } else { 0 };
-    // One row for the separator+footer summary when there's room.
-    let want_footer = ih > msgs.items.len() + composer_rows + 1;
+    // One row for the separator + keybind hint, only while focused and with room.
+    let want_footer = ui.active && ih > msgs.items.len() + composer_rows + 1;
     let footer_rows = if want_footer { 2 } else { 0 };
     let list_rows = ih
         .saturating_sub(composer_rows)
@@ -1281,8 +1310,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         .collect();
     let focus_idx = unread_indices.get(ui.queue_pos).copied();
 
-    // Reserved column budget: marker(2) + sender(16) + gap(1) + reltime(4) + dot(2).
-    let prevw = iw.saturating_sub(2 + 16 + 1 + 4 + 2).max(6);
+    // Reserved column budget: marker(2) + sender(18) + gap(1) + reltime(4) + dot(2).
+    let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
 
     let mut lines: Vec<Line> = Vec::with_capacity(ih);
     for (i, m) in msgs.items.iter().take(shown).enumerate() {
@@ -1311,13 +1340,13 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         } else {
             Span::raw("  ")
         };
-        let sender = format!("{:<16}", truncate(&m.sender, 16));
+        let sender = pad_width(&m.sender, 18);
         let sender_style = if m.unread && adv < 0.5 {
             Style::default().fg(sender_col).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(sender_col)
         };
-        let preview = truncate(&m.preview, prevw);
+        let preview = pad_width(&m.preview, prevw);
         let prev_style = if m.is_rich {
             Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)
         } else {
@@ -1332,22 +1361,19 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             marker,
             Span::styled(sender, sender_style),
             Span::raw(" "),
-            Span::styled(format!("{preview:<width$}", width = prevw), prev_style),
+            Span::styled(preview, prev_style),
             Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)),
             dot,
         ]));
     }
 
-    // ----- separator + tail summary -----
+    // ----- separator + keybind hint (only while focused) -----
     if want_footer {
         lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
-        let earlier = msgs.items.len().saturating_sub(shown);
-        let hint = if ui.active {
-            "  m: read · mm: reply".to_string()
-        } else {
-            format!("read · {earlier} earlier")
-        };
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(c::FAINT))));
+        lines.push(Line::from(Span::styled(
+            "  m: read · mm: reply",
+            Style::default().fg(c::FAINT),
+        )));
     }
 
     // ----- inline reply composer (vertical-wipe open / close) -----
@@ -1411,6 +1437,117 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// SIGNAL card: identical row style to iMESSAGE (sender · preview · rel-time ·
+/// unread dot) and unread-badge title, but read-only — Signal Desktop has no send
+/// API, so there's no focus marker, reply composer, or mark-read interaction.
+fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let sig = &s.signal;
+
+    // ----- title with unread badge / all-read tick (mirrors iMESSAGE) -----
+    let mut title_spans = vec![Span::styled(
+        " SIGNAL ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if sig.available && sig.fresh {
+        if sig.unread_count > 0 {
+            title_spans.push(Span::styled(" ● ", Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(
+                format!("{}", sig.unread_count),
+                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+            ));
+            title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
+        } else {
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("all read ", Style::default().fg(c::DIM)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 10 {
+        return;
+    }
+
+    // ----- graceful gating states (mirror iMESSAGE) -----
+    if !sig.fresh {
+        f.render_widget(
+            Paragraph::new(Span::styled("reading Signal…", Style::default().fg(c::DIM))),
+            inner,
+        );
+        return;
+    }
+    if !sig.available {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("✉  Signal locked", Style::default().fg(c::DIM))),
+                Line::from(Span::styled(
+                    "needs Keychain access + sqlcipher",
+                    Style::default().fg(c::FAINT),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+    if sig.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("✉  inbox clear", Style::default().fg(c::FAINT)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let ih = inner.height as usize;
+    // Same reserved columns as iMESSAGE: marker(2)+sender(18)+gap(1)+rel(4)+dot(2).
+    let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
+    let shown = ih.min(sig.items.len());
+
+    let mut lines: Vec<Line> = Vec::with_capacity(ih);
+    for m in sig.items.iter().take(shown) {
+        let (sender_col, prev_col, dot_col) = if m.unread {
+            (c::TEXT, c::TEXT, c::PINK)
+        } else {
+            (c::DIM, c::FAINT, c::FAINT)
+        };
+        let sender = pad_width(&m.sender, 18);
+        let sender_style = if m.unread {
+            Style::default().fg(sender_col).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(sender_col)
+        };
+        let preview = pad_width(&m.preview, prevw);
+        let prev_style = if m.is_rich {
+            Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(prev_col)
+        };
+        let dot = if m.unread {
+            Span::styled(" ●", Style::default().fg(dot_col).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "), // marker column kept for alignment parity (no focus)
+            Span::styled(sender, sender_style),
+            Span::raw(" "),
+            Span::styled(preview, prev_style),
+            Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)),
+            dot,
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1418,6 +1555,43 @@ fn truncate(s: &str, max: usize) -> String {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
     }
+}
+
+/// Display width in terminal cells (emoji / CJK count as 2), so columns line up.
+fn dwidth(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// Truncate to a display width of `max` cells, appending '…' if anything is cut.
+/// Width-aware so a wide glyph can't overrun the column by a cell.
+fn fit_width(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if dwidth(s) <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// `fit_width` then right-pad with spaces to exactly `width` display cells.
+fn pad_width(s: &str, width: usize) -> String {
+    let mut t = fit_width(s, width);
+    let w = dwidth(&t);
+    if w < width {
+        t.push_str(&" ".repeat(width - w));
+    }
+    t
 }
 
 fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState) {

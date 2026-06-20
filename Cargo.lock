@@ -1062,6 +1062,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "unicode-width 0.1.14",
  "ureq",
 ]
 
