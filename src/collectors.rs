@@ -1768,6 +1768,16 @@ fn hex_encode(b: &[u8]) -> String {
 const DISCORD_INTENTS: u64 = 1 | (1 << 7); // GUILDS | GUILD_VOICE_STATES
 const DISCORD_TEXT_SHOWN: usize = 3; // text channels surfaced on the card
 
+/// Only these voice channels are shown (when occupied); everything else ignored.
+const DISCORD_VOICE_CHANNELS: &[&str] = &["200 club", "grind time", "Back 2 Work", "WHERE STREAM"];
+/// Only these text channels are surfaced, newest-active first.
+const DISCORD_TEXT_CHANNELS: &[&str] = &["actual-degenery", "battlestation", "normies"];
+
+/// Case-insensitive membership test for the channel allowlists.
+fn name_allowed(list: &[&str], name: &str) -> bool {
+    list.iter().any(|x| x.eq_ignore_ascii_case(name))
+}
+
 fn discord_token() -> Option<String> {
     keychain_secret("studioboard-discord-bot")
 }
@@ -1838,10 +1848,11 @@ fn fetch_text_channels(
         .ok()?;
     let arr = chans.as_array()?;
 
-    // Text channels (type 0), most-recently-active first by last_message_id.
+    // Allowlisted text channels (type 0), most-recently-active first.
     let mut text: Vec<(&serde_json::Value, u64)> = arr
         .iter()
         .filter(|c| c["type"].as_u64() == Some(0))
+        .filter(|c| name_allowed(DISCORD_TEXT_CHANNELS, c["name"].as_str().unwrap_or("")))
         .map(|c| {
             let last = c["last_message_id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             (c, last)
@@ -2068,16 +2079,19 @@ fn publish_voice(
 ) {
     use crate::state::VoiceChannel;
     use std::collections::BTreeMap;
-    // Group members by channel, ordered by channel name for stable rendering.
+    // Group members by channel (allowlisted only), ordered by name for stability.
     let mut by_chan: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (uid, cid) in who.iter() {
+        let cname = chan.get(cid).cloned().unwrap_or_else(|| "voice".to_string());
+        if !name_allowed(DISCORD_VOICE_CHANNELS, &cname) {
+            continue; // ignore voice channels we don't care about
+        }
         if !names.contains_key(uid) {
             if let Some(n) = fetch_member_name(agent, tok, guild, uid) {
                 names.insert(uid.clone(), n);
             }
         }
         let who_name = names.get(uid).cloned().unwrap_or_else(|| "someone".to_string());
-        let cname = chan.get(cid).cloned().unwrap_or_else(|| "voice".to_string());
         by_chan.entry(cname).or_default().push(who_name);
     }
     let voice: Vec<VoiceChannel> = by_chan
