@@ -2050,7 +2050,7 @@ SELECT COALESCE(NULLIF(TRIM(c.name),''), NULLIF(TRIM(c.profileFullName),''), \
        m.type AS dir, \
        (m.sent_at/1000.0) AS ts, \
        (SELECT count(*) FROM messages mu WHERE mu.conversationId=c.id \
-        AND mu.type='incoming' AND mu.seenStatus=0) AS unread_n, \
+        AND mu.type='incoming' AND mu.seenStatus=1) AS unread_n, \
        COALESCE(NULLIF(TRIM(sc.profileFullName),''), NULLIF(TRIM(sc.name),''), '') AS src, \
        m.hasVisualMediaAttachments AS vis, \
        m.hasAttachments AS att, \
@@ -2068,7 +2068,6 @@ pub fn spawn_signal(shared: Shared) {
     thread::spawn(move || {
         let Some(home) = dirs::home_dir() else { return };
         let src_db = home.join("Library/Application Support/Signal/sql/db.sqlite");
-        let tmp_db = std::env::temp_dir().join("studioboard-signal.sqlite");
 
         // Derive the SQLCipher key once; re-derive only after a failed read (in
         // case the keychain secret rotated). Without it the card shows "locked".
@@ -2082,9 +2081,12 @@ pub fn spawn_signal(shared: Shared) {
                 if !src_db.exists() {
                     return None;
                 }
-                // Snapshot the live DB (Signal keeps it open in WAL mode).
-                std::fs::copy(&src_db, &tmp_db).ok()?;
-                read_signal(tmp_db.to_str()?, k)
+                // Read the live DB in place WITH its WAL (mode=ro), not a -wal-less
+                // copy: Signal leaves freshly-received messages in db.sqlite-wal until
+                // checkpoint, so a plain copy reads a stale snapshot (old previews +
+                // "all read"). mode=ro sees the latest, no lock on Signal.
+                let uri = format!("file:{}?mode=ro", src_db.display());
+                read_signal(&uri, k)
             });
             let failed = result.is_none();
             {
@@ -2178,6 +2180,63 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
     items.truncate(SHOWN_CONVERSATIONS);
     let unread = unread_badge_count(&items, now);
     Some((items, unread))
+}
+
+/// `--diag-signal`: dump how recent INCOMING Signal messages are flagged so we can
+/// see which column/value actually marks "unread" on this Signal Desktop schema
+/// (the unread badge depends on getting this right).
+pub fn diag_signal() {
+    let Some(home) = dirs::home_dir() else {
+        println!("no home");
+        return;
+    };
+    let src_db = home.join("Library/Application Support/Signal/sql/db.sqlite");
+    println!("studioboard --diag-signal\n");
+    let Some(key) = signal_db_key() else {
+        println!("could not derive Signal key (keychain/openssl).");
+        return;
+    };
+    if !src_db.exists() {
+        println!("Signal db not found: {}", src_db.display());
+        return;
+    }
+    // Read the LIVE db in place with the WAL (mode=ro), not a -wal-less copy.
+    let uri = format!("file:{}?mode=ro", src_db.display());
+    let run = |label: &str, sql: &str| {
+        let script = format!("PRAGMA key=\"x'{key}'\";{sql}");
+        println!("--- {label} ---");
+        match Command::new(resolved_tool("sqlcipher"))
+            .args(["-separator", "\t", "-newline", "\n", &uri, &script])
+            .output()
+        {
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.trim().is_empty() {
+                    println!("  stderr: {}", err.trim());
+                }
+                for l in String::from_utf8_lossy(&o.stdout).lines() {
+                    if l == "ok" {
+                        continue; // PRAGMA echo
+                    }
+                    println!("  {l}");
+                }
+            }
+            Err(e) => println!("  sqlcipher failed: {e}"),
+        }
+    };
+    run(
+        "incoming counts by seenStatus / readStatus",
+        "SELECT 'seen='||COALESCE(seenStatus,-1), count(*) FROM messages WHERE type='incoming' GROUP BY seenStatus \
+         UNION ALL \
+         SELECT 'read='||COALESCE(readStatus,-1), count(*) FROM messages WHERE type='incoming' GROUP BY readStatus;",
+    );
+    run(
+        "12 most-recent incoming: body | readStatus | seenStatus | when",
+        "SELECT substr(replace(COALESCE(body,'[media]'),char(10),' '),1,30), \
+                COALESCE(readStatus,-1), COALESCE(seenStatus,-1), \
+                datetime(received_at/1000,'unixepoch','localtime') \
+         FROM messages WHERE type='incoming' ORDER BY received_at DESC LIMIT 12;",
+    );
 }
 
 /// Unwrap Signal's SQLCipher key: read `encryptedKey` from config.json, fetch the

@@ -36,6 +36,10 @@ fn main() -> Result<()> {
         collectors::diag_messages();
         return Ok(());
     }
+    if args.iter().any(|a| a == "--diag-signal") {
+        collectors::diag_signal();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--facts") {
         return facts_diag();
     }
