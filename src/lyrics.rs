@@ -1,12 +1,21 @@
-//! Time-synced lyrics via LRCLIB (https://lrclib.net) — free, open, no key.
+//! Time-synced lyrics via a small provider chain — all free, no key.
+//!
+//!   1. **LRCLIB** (https://lrclib.net) — primary; exact `/api/get` and fuzzy
+//!      `/api/search` race **concurrently** and we return the instant *either*
+//!      yields synced lyrics (no waiting on the slow one).
+//!   2. **NetEase Cloud Music** (unofficial endpoints) — backup behind LRCLIB
+//!      for the tracks its crowd-sourced catalog hasn't covered yet (e.g.
+//!      "MTBTTF" by Clipse). Synced when NetEase has it, plain otherwise.
 //!
 //! Speed strategy:
-//!   * exact `/api/get` and fuzzy `/api/search` race **concurrently**; we
-//!     return the instant *either* yields synced lyrics (no waiting on the
-//!     slow one),
 //!   * a shared pooled `ureq::Agent` avoids per-call TLS handshakes,
 //!   * synced results are cached to disk (`~/.cache/studioboard/lyrics`), so a
 //!     song heard once loads instantly forever — even across restarts.
+//!
+//! Misses don't vanish: every track we fail to resolve is appended to a JSONL
+//! miss log (`~/.cache/studioboard/misses.jsonl`) with the sources tried, so the
+//! LYRICS card can surface a count and a reconcile pass can retry them later
+//! (catalogs grow — a miss today may hit next week).
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -55,7 +64,8 @@ pub fn fetch(
         });
     }
 
-    // Take the first synced result from either source.
+    // Take the first synced result from either LRCLIB source. On a hit we clear
+    // any logged miss for this track (it's resolved now) before returning.
     let mut exact: Option<serde_json::Value> = None;
     let deadline = Instant::now() + FETCH_BUDGET;
     let mut received = 0;
@@ -70,11 +80,13 @@ pub fn fetch(
                 if let Some(ev) = &v {
                     if ev.get("instrumental").and_then(|x| x.as_bool()).unwrap_or(false) {
                         out.note = "🎵 instrumental".into();
+                        clear_miss(track_id);
                         return out;
                     }
                     if let Some(lines) = synced_from(ev) {
                         out.lines = lines;
                         out.synced = true;
+                        clear_miss(track_id);
                         return out;
                     }
                 }
@@ -85,6 +97,7 @@ pub fn fetch(
                 if let Some(lines) = v {
                     out.lines = lines;
                     out.synced = true;
+                    clear_miss(track_id);
                     return out;
                 }
             }
@@ -92,7 +105,17 @@ pub fn fetch(
         }
     }
 
-    // No synced anywhere — fall back to plain from the exact record.
+    // LRCLIB whiffed on synced. Try the backup source (NetEase) *before* settling
+    // for LRCLIB's plain text — a synced NetEase hit reads far better than plain.
+    if let Some(lines) = netease_synced(agent, artist, track, duration) {
+        out.lines = lines;
+        out.synced = true;
+        out.note = "synced · netease".into();
+        clear_miss(track_id);
+        return out;
+    }
+
+    // No synced anywhere — fall back to plain from LRCLIB's exact record…
     if let Some(ev) = &exact {
         if let Some(p) = ev.get("plainLyrics").and_then(|x| x.as_str()) {
             if !p.trim().is_empty() {
@@ -101,10 +124,22 @@ pub fn fetch(
                     .map(|l| LyricLine { t: -1.0, text: l.trim().to_string() })
                     .collect();
                 out.note = "plain (no synced found)".into();
+                clear_miss(track_id);
                 return out;
             }
         }
     }
+    // …then plain from NetEase, the last shot before we record a real miss.
+    if let Some(lines) = netease_plain(agent, artist, track) {
+        out.lines = lines;
+        out.note = "plain · netease".into();
+        clear_miss(track_id);
+        return out;
+    }
+
+    // Genuinely nothing. Don't drop it on the floor — log the miss (artist ·
+    // title · album · when · sources tried) so it's countable and retryable.
+    log_miss(artist, track, album, track_id, "lrclib,netease");
     out.note = "no lyrics found".into();
     out
 }
@@ -321,6 +356,272 @@ fn search_once(
     best.map(|(_, l)| l)
 }
 
+// --- NetEase Cloud Music backup ------------------------------------------
+// LRCLIB is crowd-sourced and has real holes (e.g. Clipse · "MTBTTF"). NetEase
+// has a huge synced catalog reachable via its unofficial, no-key web endpoints.
+// We search for the track, take the best artist-matching song, then pull its
+// synced `.lrc`. Same cleaning + duration/artist ranking we use for LRCLIB so a
+// wrong-artist cover can't win.
+
+const NETEASE_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) studioboard";
+
+/// Best synced lyrics from NetEase, or `None`.
+fn netease_synced(agent: &ureq::Agent, artist: &str, track: &str, duration: f64) -> Option<Vec<LyricLine>> {
+    let id = netease_song_id(agent, artist, track, duration)?;
+    let lrc = netease_lyric_raw(agent, id)?;
+    let lines = parse_lrc(&strip_lrc_metadata(&lrc));
+    if lines.iter().any(|l| l.t >= 0.0) {
+        // Keep only the timestamped (synced) lines.
+        Some(lines.into_iter().filter(|l| l.t >= 0.0).collect())
+    } else {
+        None
+    }
+}
+
+/// Plain (unsynced) NetEase lyrics as a last resort — every line `t == -1.0`.
+fn netease_plain(agent: &ureq::Agent, artist: &str, track: &str) -> Option<Vec<LyricLine>> {
+    let id = netease_song_id(agent, artist, track, 0.0)?;
+    let lrc = netease_lyric_raw(agent, id)?;
+    let lines: Vec<LyricLine> = strip_lrc_metadata(&lrc)
+        .lines()
+        .filter_map(|l| {
+            // Strip any leading [..] tags, keep the bare text.
+            let mut rest = l;
+            while rest.starts_with('[') {
+                match rest.find(']') {
+                    Some(c) => rest = &rest[c + 1..],
+                    None => break,
+                }
+            }
+            let t = rest.trim();
+            (!t.is_empty()).then(|| LyricLine { t: -1.0, text: t.to_string() })
+        })
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Resolve `artist`/`track` to the best NetEase song id. Ranks candidates by
+/// artist agreement first, then duration closeness (NetEase reports ms).
+fn netease_song_id(agent: &ureq::Agent, artist: &str, track: &str, duration: f64) -> Option<i64> {
+    let primary = primary_artist(artist);
+    let ct = clean_title(track);
+    let query = format!("{primary} {ct}");
+    let url = format!(
+        "https://music.163.com/api/search/get?s={}&type=1&limit=8",
+        urlencode(&query)
+    );
+    let v: serde_json::Value = agent
+        .get(&url)
+        .set("User-Agent", NETEASE_UA)
+        .set("Referer", "https://music.163.com")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let songs = v.get("result")?.get("songs")?.as_array()?;
+    let pl = primary.to_lowercase();
+    let mut best: Option<(f64, i64)> = None;
+    for s in songs {
+        let id = s.get("id").and_then(|x| x.as_i64())?;
+        let rdur = s.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0) / 1000.0;
+        let rartist = s
+            .get("artists")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                    .to_lowercase()
+            })
+            .unwrap_or_default();
+        let artist_ok = pl.is_empty() || rartist.contains(&pl) || pl.contains(&rartist);
+        // Same scoring shape as LRCLIB: artist mismatch dwarfs any duration gap;
+        // a zero duration (plain-only path) leaves artist as the sole signal.
+        let dgap = if duration > 0.0 { (rdur - duration).abs() } else { 0.0 };
+        let score = dgap + if artist_ok { 0.0 } else { 10_000.0 };
+        match &best {
+            Some((bscore, _)) if *bscore <= score => {}
+            _ => best = Some((score, id)),
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Fetch the raw `.lrc` blob for a NetEase song id.
+fn netease_lyric_raw(agent: &ureq::Agent, id: i64) -> Option<String> {
+    let url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
+    let v: serde_json::Value = agent
+        .get(&url)
+        .set("User-Agent", NETEASE_UA)
+        .set("Referer", "https://music.163.com")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let lrc = v.get("lrc")?.get("lyric")?.as_str()?.to_string();
+    (!lrc.trim().is_empty()).then_some(lrc)
+}
+
+/// Drop NetEase's non-lyric `.lrc` metadata lines (作词/作曲 credit tags, and the
+/// "纯音乐，请欣赏" instrumental marker) so they don't pollute the karaoke wipe.
+fn strip_lrc_metadata(lrc: &str) -> String {
+    lrc.lines()
+        .filter(|l| {
+            let low = l.to_lowercase();
+            !(low.contains("作词")
+                || low.contains("作曲")
+                || low.contains("编曲")
+                || low.contains("纯音乐")
+                || low.contains(": 作")
+                || low.contains("by ：")
+                || low.contains("制作人")
+                || low.contains("混音"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Minimal percent-encoding for a query string (NetEase's search `s` param).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+// --- miss log --------------------------------------------------------------
+// Every track we can't resolve is appended to a JSONL file so misses are visible
+// and retryable instead of silently set to "no lyrics found" and forgotten. The
+// log is keyed by `track_id`; `clear_miss` removes a row the moment a later fetch
+// (a new catalog upload, the reconcile pass) finally lands lyrics for it.
+
+const MISS_FILE: &str = "misses.jsonl";
+
+/// One logged lyrics miss.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Miss {
+    pub track_id: String,
+    pub artist: String,
+    pub track: String,
+    pub album: String,
+    pub ts: i64,         // unix seconds, when first/last logged
+    pub tried: String,   // comma-joined source list, e.g. "lrclib,netease"
+    #[serde(default)]
+    pub retries: u32,    // how many reconcile passes have re-tried this one
+}
+
+fn miss_path() -> Option<std::path::PathBuf> {
+    Some(crate::cache::root()?.join(MISS_FILE))
+}
+
+/// Read every logged miss (deduped by `track_id`, last entry wins). Fails soft to
+/// an empty list on any I/O / parse error.
+pub fn load_misses() -> Vec<Miss> {
+    let Some(p) = miss_path() else { return Vec::new() };
+    let Ok(body) = std::fs::read_to_string(&p) else { return Vec::new() };
+    let mut by_id: std::collections::HashMap<String, Miss> = Default::default();
+    let mut order: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(m) = serde_json::from_str::<Miss>(line) {
+            if !by_id.contains_key(&m.track_id) {
+                order.push(m.track_id.clone());
+            }
+            by_id.insert(m.track_id.clone(), m);
+        }
+    }
+    order.into_iter().filter_map(|id| by_id.remove(&id)).collect()
+}
+
+/// How many distinct tracks are currently in the miss log.
+pub fn miss_count() -> usize {
+    load_misses().len()
+}
+
+/// Append a miss row (best-effort). De-dup happens on read, so re-logging the
+/// same track just refreshes its timestamp/retry count.
+pub fn log_miss(artist: &str, track: &str, album: &str, track_id: &str, tried: &str) {
+    let Some(root) = crate::cache::root() else { return };
+    let _ = std::fs::create_dir_all(&root);
+    // Carry forward the prior retry count if this track was already logged.
+    let retries = load_misses()
+        .iter()
+        .find(|m| m.track_id == track_id)
+        .map(|m| m.retries)
+        .unwrap_or(0);
+    let m = Miss {
+        track_id: track_id.to_string(),
+        artist: artist.to_string(),
+        track: track.to_string(),
+        album: album.to_string(),
+        ts: now_secs(),
+        tried: tried.to_string(),
+        retries,
+    };
+    if let Ok(line) = serde_json::to_string(&m) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(root.join(MISS_FILE)) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Drop a track from the miss log — called the instant any source resolves it.
+/// Rewrites the file without that `track_id` (no-op if it wasn't logged).
+pub fn clear_miss(track_id: &str) {
+    let Some(p) = miss_path() else { return };
+    let misses = load_misses();
+    if !misses.iter().any(|m| m.track_id == track_id) {
+        return;
+    }
+    let kept: Vec<String> = misses
+        .into_iter()
+        .filter(|m| m.track_id != track_id)
+        .filter_map(|m| serde_json::to_string(&m).ok())
+        .collect();
+    let body = if kept.is_empty() { String::new() } else { format!("{}\n", kept.join("\n")) };
+    let _ = std::fs::write(p, body);
+}
+
+/// Bump the retry counter for a track after a reconcile pass re-queries it (kept
+/// even when it's still a miss, so we can back off chronic offenders later).
+pub fn bump_retry(track_id: &str) {
+    let Some(p) = miss_path() else { return };
+    let mut misses = load_misses();
+    let mut changed = false;
+    for m in &mut misses {
+        if m.track_id == track_id {
+            m.retries = m.retries.saturating_add(1);
+            m.ts = now_secs();
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    let body: String = misses
+        .into_iter()
+        .filter_map(|m| serde_json::to_string(&m).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(p, if body.is_empty() { body } else { format!("{body}\n") });
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn synced_from(v: &serde_json::Value) -> Option<Vec<LyricLine>> {
     let s = v.get("syncedLyrics").and_then(|x| x.as_str())?;
     if s.trim().is_empty() {
@@ -459,5 +760,35 @@ mod net_tests {
         let ly = fetch(&agent, "Travis Scott", "FE!N (feat. Playboi Carti)", "UTOPIA", 191.0, "t1");
         println!("synced={} lines={} note={:?}", ly.synced, ly.lines.len(), ly.note);
         assert!(ly.synced && !ly.lines.is_empty(), "expected synced lyrics, got note={:?}", ly.note);
+    }
+
+    // Acceptance for issue #7: Clipse · "MTBTTF" must resolve (LRCLIB fuzzy or the
+    // NetEase backup). Run with: cargo test --release -- --ignored e2e_mtbttf
+    #[test]
+    #[ignore]
+    fn e2e_mtbttf_resolves() {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(4))
+            .timeout_read(std::time::Duration::from_secs(13))
+            .build();
+        let ly = fetch(&agent, "Clipse", "MTBTTF", "Let God Sort Em Out", 156.0, "mtbttf");
+        println!("synced={} lines={} note={:?}", ly.synced, ly.lines.len(), ly.note);
+        if let Some(first) = ly.lines.iter().find(|l| !l.text.is_empty()) {
+            println!("first line: {:?}", first.text);
+        }
+        assert!(!ly.lines.is_empty(), "expected lyrics for MTBTTF, got note={:?}", ly.note);
+    }
+
+    // NetEase backup in isolation: a track LRCLIB lacks but NetEase has synced.
+    #[test]
+    #[ignore]
+    fn e2e_netease_backup() {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(4))
+            .timeout_read(std::time::Duration::from_secs(13))
+            .build();
+        let lines = netease_synced(&agent, "Clipse", "MTBTTF", 156.0);
+        println!("netease synced lines: {}", lines.as_ref().map(|l| l.len()).unwrap_or(0));
+        assert!(lines.map(|l| !l.is_empty()).unwrap_or(false), "netease should have synced MTBTTF");
     }
 }

@@ -339,6 +339,12 @@ pub fn spawn_lyrics(shared: Shared) {
             .build();
         let mut cache: std::collections::HashMap<String, crate::state::Lyrics> = Default::default();
         let mut current = String::new();
+        // Seed the "N missing" badge from whatever's already on disk so the count
+        // is live the instant the board opens.
+        {
+            let n = lyrics::miss_count();
+            shared.lock().unwrap().lyrics_misses = n;
+        }
         loop {
             let info = {
                 let s = shared.lock().unwrap();
@@ -386,14 +392,63 @@ pub fn spawn_lyrics(shared: Shared) {
                         let lyr = lyrics::fetch(&agent, &artist, &track, &album, dur, &id);
                         lyrics::cache_save(&id, &lyr); // persist synced for instant replays
                         cache.insert(id.clone(), lyr.clone());
+                        // fetch() may have logged a miss or cleared one — refresh
+                        // the badge count off the (now-updated) log.
+                        let misses = lyrics::miss_count();
                         let mut s = shared.lock().unwrap();
                         if s.music.track_id() == id {
                             s.lyrics = lyr;
                         }
+                        s.lyrics_misses = misses;
                     }
                 }
             }
             thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
+/// Periodically re-queries logged lyric misses. Catalogs grow (LRCLIB is crowd-
+/// sourced; NetEase keeps uploading), so a track that whiffed today may resolve
+/// next week. A success writes the `.lrc` to the same disk cache the live fetch
+/// uses and `fetch()` clears the miss; the badge count then ticks down on its
+/// own. Runs cool and off the hot path: a small batch every few minutes, gentle
+/// so it never competes with the now-playing fetch.
+pub fn spawn_lyrics_reconcile(shared: Shared) {
+    thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(13))
+            .build();
+        // Let the board settle before the first sweep.
+        thread::sleep(Duration::from_secs(45));
+        loop {
+            // Oldest-logged first; cap the batch so a long backlog drains calmly
+            // over several passes instead of hammering both APIs at once.
+            let batch: Vec<lyrics::Miss> = lyrics::load_misses().into_iter().take(4).collect();
+            for m in batch {
+                // Skip if it landed in the disk cache since we logged it.
+                if lyrics::cache_load(&m.track_id).is_some() {
+                    lyrics::clear_miss(&m.track_id);
+                    continue;
+                }
+                lyrics::bump_retry(&m.track_id);
+                let lyr = lyrics::fetch(&agent, &m.artist, &m.track, &m.album, 0.0, &m.track_id);
+                if !lyr.lines.is_empty() {
+                    lyrics::cache_save(&m.track_id, &lyr); // captured for instant replay
+                    // If the freshly-resolved track is the one playing right now,
+                    // swap it in live so the wipe starts immediately.
+                    let mut s = shared.lock().unwrap();
+                    if s.music.track_id() == m.track_id {
+                        s.lyrics = lyr;
+                    }
+                }
+                // Refresh the badge after each attempt (fetch may have cleared it).
+                let n = lyrics::miss_count();
+                shared.lock().unwrap().lyrics_misses = n;
+                thread::sleep(Duration::from_secs(2)); // be a good API citizen
+            }
+            thread::sleep(Duration::from_secs(180)); // sweep every ~3 min
         }
     });
 }

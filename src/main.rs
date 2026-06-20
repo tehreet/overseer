@@ -59,6 +59,7 @@ fn run() -> Result<()> {
     collectors::spawn_macmon(shared.clone());
     collectors::spawn_music(shared.clone());
     collectors::spawn_lyrics(shared.clone());
+    collectors::spawn_lyrics_reconcile(shared.clone());
     collectors::spawn_artwork(shared.clone());
     collectors::spawn_facts(shared.clone());
     collectors::spawn_queue(shared.clone());

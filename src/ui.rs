@@ -2675,7 +2675,27 @@ fn pad_width(s: &str, width: usize) -> String {
 
 fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let synced = s.lyrics.synced;
-    let block = panel("LYRICS", false);
+    // Title with an on-palette miss-count badge (same custom-span build the QUEUE
+    // card uses) so the backlog of un-resolved tracks is visible and actionable —
+    // it ticks down on its own as the reconcile pass chases each one down.
+    let mut title_spans = vec![Span::styled(
+        " LYRICS  ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if s.lyrics_misses > 0 {
+        title_spans.push(Span::styled(
+            format!("{}", s.lyrics_misses),
+            Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+        ));
+        title_spans.push(Span::styled(" missing ", Style::default().fg(c::DIM)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

@@ -486,6 +486,9 @@ pub struct AppState {
     pub proc_samples: VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>,
     pub music: MusicStats,
     pub lyrics: Lyrics,
+    /// How many distinct tracks are sitting in the lyrics miss log waiting to be
+    /// reconciled — surfaced as the "N missing" badge on the LYRICS card.
+    pub lyrics_misses: usize,
     pub album_art: AlbumArt,
     pub facts: MusicFacts,
     pub queue: Queue,
@@ -517,6 +520,7 @@ impl Default for AppState {
             proc_samples: VecDeque::new(),
             music: MusicStats::default(),
             lyrics: Lyrics::default(),
+            lyrics_misses: 0,
             album_art: AlbumArt::default(),
             facts: MusicFacts::default(),
             queue: Queue::default(),
