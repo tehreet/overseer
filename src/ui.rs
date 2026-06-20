@@ -1264,7 +1264,12 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let max_rows = (inner.height as usize).max(1);
     let bullets = [c::CYAN, c::PINK, c::GREEN, c::YELLOW, c::ACCENT];
 
-    // Render each fact to its wrapped, bulleted block of lines.
+    // Render each fact to its wrapped, bulleted block of lines. Every line —
+    // not just the first — gets the brushed-metal shimmer, with a per-line phase
+    // offset (running row index) so stacked lines glint out of lockstep rather
+    // than pulsing together. Continuation lines sit on a calmer base so the
+    // bulleted head still reads as the fact's start.
+    let mut row: f32 = 0.0;
     let blocks: Vec<Vec<Line>> = fa
         .lines
         .iter()
@@ -1275,14 +1280,15 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
                 .into_iter()
                 .enumerate()
                 .map(|(j, seg)| {
-                    if j == 0 {
-                        Line::from(vec![
-                            Span::styled("• ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                            Span::styled(seg, Style::default().fg(c::TEXT)),
-                        ])
+                    let base = if j == 0 { c::TEXT } else { c::DIM };
+                    let mut spans = if j == 0 {
+                        vec![Span::styled("• ", Style::default().fg(color).add_modifier(Modifier::BOLD))]
                     } else {
-                        Line::from(vec![Span::raw("  "), Span::styled(seg, Style::default().fg(c::DIM))])
-                    }
+                        vec![Span::raw("  ")]
+                    };
+                    spans.extend(shimmer_spans(&seg, t, row, base, 0.22, 0.07, false));
+                    row += 1.0;
+                    Line::from(spans)
                 })
                 .collect()
         })
