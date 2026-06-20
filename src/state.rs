@@ -480,6 +480,10 @@ pub struct AppState {
     /// Timestamped Apple-Silicon metrics for smooth, delayed gauges. Indices:
     /// [gpu%, all_power, cpu_temp, gpu_temp, cpu_power, gpu_power, sys_power].
     pub silicon_samples: VecDeque<(Instant, Vec<f32>)>,
+    /// Timestamped top-process snapshots for delay-interpolated playback: the
+    /// proc_panel eases each process's cpu%/mem and slides rows toward their new
+    /// rank between samples, keyed by name (same pattern as cpu_samples).
+    pub proc_samples: VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>,
     pub music: MusicStats,
     pub lyrics: Lyrics,
     pub album_art: AlbumArt,
@@ -510,6 +514,7 @@ impl Default for AppState {
             cpu_samples: VecDeque::new(),
             net_samples: VecDeque::new(),
             silicon_samples: VecDeque::new(),
+            proc_samples: VecDeque::new(),
             music: MusicStats::default(),
             lyrics: Lyrics::default(),
             album_art: AlbumArt::default(),

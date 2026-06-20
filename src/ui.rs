@@ -1633,11 +1633,89 @@ fn render_art(f: &mut Frame, area: Rect, art: &crate::state::AlbumArt, matches: 
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// One process row, eased for delayed playback: cpu%/mem glide between samples
+/// and `rank` is a *fractional* position so rows slide toward their new slot
+/// rather than snapping. Keyed by name across samples.
+struct EasedProc {
+    name: String,
+    cpu: f32,
+    mem: f32,
+    uptime: u64,
+    rank: f32, // fractional rank at the playback instant — sort key
+    fade: f32, // 0..1 appearance weight (1 = fully present)
+}
+
+/// Build the delay-interpolated proc list at `target` time from `proc_samples`,
+/// the same playback the gauges/EQ use. Membership is taken from the destination
+/// (newer) bracketing sample so the list never flickers; each process's cpu%/mem
+/// ease via Catmull-Rom and its row rank lerps so reorders slide. Processes that
+/// just appeared/dropped fade in/out via `fade` instead of popping.
+fn eased_procs(samples: &VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>, target: Instant) -> Vec<EasedProc> {
+    let m = samples.len();
+    if m == 0 {
+        return Vec::new();
+    }
+    // Bracketing segment [i, i+1] around target (clamped to the ends).
+    let (i, u) = if m == 1 || target <= samples[0].0 {
+        (0usize, 0.0f32)
+    } else if target >= samples[m - 1].0 {
+        (m - 1, 0.0)
+    } else {
+        let mut idx = m - 2;
+        for j in 0..m - 1 {
+            if samples[j].0 <= target && target < samples[j + 1].0 {
+                idx = j;
+                break;
+            }
+        }
+        let span = (samples[idx + 1].0 - samples[idx].0).as_secs_f32().max(1e-3);
+        (idx, ((target - samples[idx].0).as_secs_f32() / span).clamp(0.0, 1.0))
+    };
+    let j = (i + 1).min(m - 1); // destination sample index
+    // Rank/value lookups keyed by name. Rank = index in that sample (lower = top).
+    let look = |idx: usize, name: &str| -> Option<(usize, &(String, f32, u64, u64))> {
+        samples[idx].1.iter().enumerate().find(|(_, p)| p.0 == name)
+    };
+    // Catmull endpoints for value easing: one sample either side of [i, j].
+    let i0 = i.saturating_sub(1);
+    let i3 = (j + 1).min(m - 1);
+    let dest = &samples[j].1;
+    let n = dest.len();
+    let mut out = Vec::with_capacity(n);
+    for (rj, p) in dest.iter().enumerate() {
+        let name = &p.0;
+        // Value at each of the four spline points (fall back to nearest known).
+        let cpu_at = |idx: usize| look(idx, name).map(|(_, q)| q.1).unwrap_or(p.1);
+        let mem_at = |idx: usize| look(idx, name).map(|(_, q)| q.2 as f32).unwrap_or(p.2 as f32);
+        let cpu = catmull(cpu_at(i0), cpu_at(i), cpu_at(j), cpu_at(i3), u).max(0.0);
+        let mem = catmull(mem_at(i0), mem_at(i), mem_at(j), mem_at(i3), u).max(0.0);
+        // Rank lerp: where this process sat in the *from* sample → its slot now.
+        // Newcomers start one row below the bottom and slide up; `fade` mirrors it.
+        let (rank, fade) = match look(i, name) {
+            Some((ri, _)) => (ri as f32 + (rj as f32 - ri as f32) * u, 1.0),
+            None => (n as f32 - (n as f32 - rj as f32) * u, u),
+        };
+        out.push(EasedProc { name: name.clone(), cpu, mem, uptime: p.3, rank, fade });
+    }
+    // Render in eased-rank order; as a process crosses a half-row its slot swaps,
+    // producing the slide. Stable tie-break on name keeps equal ranks from jitter.
+    out.sort_by(|a, b| {
+        a.rank
+            .partial_cmp(&b.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
 fn proc_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = panel("TOP PROCESSES", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let procs = &s.system.top_procs;
+    // Delay-interpolated playback (now - EQ_DELAY) so cpu%/mem glide and rows
+    // slide toward their new rank — identical pattern to the gauges/EQ.
+    let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
+    let procs = eased_procs(&s.proc_samples, target);
     if procs.is_empty() || inner.height < 2 || inner.width < 8 {
         if !procs.is_empty() {
             // Too short to render rows gracefully — skip rather than clip.
@@ -1658,15 +1736,21 @@ fn proc_panel(f: &mut Frame, area: Rect, s: &AppState) {
         Style::default().fg(c::DIM).add_modifier(Modifier::BOLD),
     )));
     let rows = avail.saturating_sub(lines.len()).min(procs.len());
-    for (name, cpu, mem, uptime) in procs.iter().take(rows) {
+    for p in procs.iter().take(rows) {
+        // Fade newcomers/leavers in by dimming toward the background.
+        let fade = p.fade.clamp(0.0, 1.0);
+        let cpu_col = c::blend(c::BG, c::jazz((p.cpu / 100.0).min(1.0)), fade);
+        let mem_col = c::blend(c::BG, c::DIM, fade);
+        let up_col = c::blend(c::BG, c::FAINT, fade);
+        let name_col = c::blend(c::BG, c::TEXT, fade);
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:>5.1}%", cpu),
-                Style::default().fg(c::jazz((*cpu / 100.0).min(1.0))).add_modifier(Modifier::BOLD),
+                format!("{:>5.1}%", p.cpu),
+                Style::default().fg(cpu_col).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {:>6}", fmt_bytes(*mem)), Style::default().fg(c::DIM)),
-            Span::styled(format!("   {:>6}", fmt_dur_short(*uptime)), Style::default().fg(c::FAINT)),
-            Span::styled(format!("  {}", truncate(name, namew)), Style::default().fg(c::TEXT)),
+            Span::styled(format!("  {:>6}", fmt_bytes(p.mem as u64)), Style::default().fg(mem_col)),
+            Span::styled(format!("   {:>6}", fmt_dur_short(p.uptime)), Style::default().fg(up_col)),
+            Span::styled(format!("  {}", truncate(&p.name, namew)), Style::default().fg(name_col)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);

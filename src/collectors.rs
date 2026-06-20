@@ -103,6 +103,13 @@ pub fn spawn_system(shared: Shared) {
                 while s.net_samples.len() > 16 {
                     s.net_samples.pop_front();
                 }
+                // Top-process snapshot for the proc card's delayed, interpolated
+                // playback (eased cpu%/mem + sliding row reorder, keyed by name).
+                let proc_snap = s.system.top_procs.clone();
+                s.proc_samples.push_back((now, proc_snap));
+                while s.proc_samples.len() > 16 {
+                    s.proc_samples.pop_front();
+                }
                 s.net_rx_hist.push((rx_bps / 1024.0) as u64);
                 s.net_tx_hist.push((tx_bps / 1024.0) as u64);
                 // If macmon isn't feeding silicon CPU%, mirror sysinfo's.
