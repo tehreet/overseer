@@ -244,6 +244,66 @@ fn sampled_cores(samples: &VecDeque<(Instant, Vec<f32>)>, target: Instant) -> Ve
     out
 }
 
+/// Row heights for the 11-slot left column given the available height `avail`.
+///
+/// The six system cards [0..6) are rigid — ROBOTS' bottom-row burn chart is never
+/// clipped. The four messaging cards [6..10) size to their content when there's
+/// room, but keep a guaranteed floor so they never collapse to zero under height
+/// pressure (the old `Max(..)` constraints shrank them all the way to nothing on
+/// shorter terminals, which made iMessage/Signal/Discord silently disappear).
+/// Order of sacrifice under pressure: trailing slack → messaging content above its
+/// floor (bottom-up) → WEATHER gives a couple rows → and only an extreme-tiny
+/// terminal clips further (bottom-up, last resort).
+fn left_card_heights(avail: u16, s: &AppState) -> [u16; 11] {
+    // [0..6) system (rigid), [6..10) messaging (content), [10] slack.
+    let mut h = [9u16, 9, 11, 9, 10, 7, 0, 0, 0, 0, 0];
+    let want = [
+        card_height(&s.messages, s.msg_ui.active),
+        card_height(&s.signal, false),
+        discord_height(&s.discord),
+        doctor_height(&s.doctor),
+    ];
+    for (i, &w) in want.iter().enumerate() {
+        h[6 + i] = w;
+    }
+
+    let sum: u16 = h.iter().sum();
+    if sum <= avail {
+        h[10] = avail - sum; // slack absorbs the remainder; cards stay content-tight
+        return h;
+    }
+    let mut deficit = sum - avail;
+
+    // 1) shrink messaging cards from content toward a small floor, bottom-up so the
+    //    most important (iMESSAGE) keeps its content longest.
+    for i in [9usize, 8, 7, 6] {
+        if deficit == 0 {
+            break;
+        }
+        let floor = want[i - 6].min(5); // title + unread badge + a line or two
+        let take = h[i].saturating_sub(floor).min(deficit);
+        h[i] -= take;
+        deficit -= take;
+    }
+    // 2) let WEATHER give a couple rows before we start sacrificing the floors.
+    if deficit > 0 {
+        let take = h[5].saturating_sub(5).min(deficit);
+        h[5] -= take;
+        deficit -= take;
+    }
+    // 3) extreme-tiny terminal: clip bottom-up through the floors, then the system
+    //    cards, so the column never overflows.
+    for i in [9usize, 8, 7, 6, 5, 4, 3, 2, 1, 0] {
+        if deficit == 0 {
+            break;
+        }
+        let take = h[i].min(deficit);
+        h[i] -= take;
+        deficit -= take;
+    }
+    h
+}
+
 pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     let area = f.area();
     f.render_widget(
@@ -263,24 +323,12 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(outer[0]);
 
+    // Heights are computed (not fixed constraints) so the four messaging cards keep
+    // a guaranteed floor and never collapse to zero on shorter terminals.
+    let lh = left_card_heights(body[0].height, s);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),  // [0] CPU equalizer
-            Constraint::Length(9),  // [1] MEM · DISK · NET
-            Constraint::Length(11), // [2] APPLE SILICON
-            Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
-            Constraint::Length(10), // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
-            Constraint::Length(7),  // [5] WEATHER       (jazzed, +data)
-            // The two message cards size to their content (no trailing gap) and
-            // shrink first under height pressure — keeping ROBOTS rigid above so
-            // its bottom-row burn chart is never the thing that gets clipped.
-            Constraint::Max(card_height(&s.messages, s.msg_ui.active)), // [6] iMESSAGE
-            Constraint::Max(card_height(&s.signal, false)),             // [7] SIGNAL
-            Constraint::Max(discord_height(&s.discord)),                // [8] DISCORD
-            Constraint::Max(doctor_height(&s.doctor)),                  // [9] MAC-DOCTOR
-            Constraint::Min(0),     // [10] slack absorbs leftover, keeping cards tight
-        ])
+        .constraints(lh.map(Constraint::Length))
         .split(body[0]);
 
     cpu_eq_panel(f, left[0], s);
