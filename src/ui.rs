@@ -1558,39 +1558,19 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     let mut lines: Vec<Line> = vec![big, detail, atmos];
 
-    // bottom: hourly temp chart (next ~12h of forecast temps, jazz-colored). It's
-    // grown to fill the card's dead space — full inner width and as many rows tall
-    // as the card has left over (up to 3) — with the location label flush-left on
-    // the chart's top row. Falls back to the slim single-row strip when the card is
-    // too short to give the chart its own rows.
-    let chart_h = h.saturating_sub(3); // rows left below the three info rows
-    if chart_h >= 2 && !w.temp_strip.is_empty() && iw > 0 {
-        let loc_w = w.location.chars().count() + 1; // label + a space gutter
-        for (i, row) in jazz_spark_rows(&w.temp_strip, iw, chart_h).into_iter().enumerate() {
-            // Overlay the location label onto the chart's first row so the chart
-            // still owns the full width on the rows beneath it.
-            if i == 0 && loc_w < iw {
-                let mut spans = vec![
-                    Span::styled(w.location.clone(), Style::default().fg(c::FAINT)),
-                    Span::raw(" "),
-                ];
-                spans.extend(row.into_iter().skip(loc_w));
-                lines.push(Line::from(spans));
-            } else {
-                lines.push(Line::from(row));
-            }
-        }
-    } else {
-        // Tight fallback: location flush-left, single-row strip flush-right.
-        let remaining = iw.saturating_sub(w.location.chars().count());
-        let mut bottom = vec![Span::styled(w.location.clone(), Style::default().fg(c::FAINT))];
-        if !w.temp_strip.is_empty() && remaining > 0 {
-            bottom.extend(jazz_spark(&w.temp_strip, remaining));
-        }
-        if h > 3 {
+    // bottom: hourly temp chart (next ~12h of forecast temps, jazz-colored),
+    // grown to fill the card's dead space — full inner width, as many rows tall as
+    // the card has left over. A blank spacer row keeps the chart off the pressure
+    // line so the graph isn't crammed against the text.
+    let spacer = if h > 4 { 1 } else { 0 };
+    let chart_h = h.saturating_sub(3 + spacer); // rows left below the info rows (+spacer)
+    if chart_h >= 1 && !w.temp_strip.is_empty() && iw > 0 {
+        if spacer == 1 {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(bottom));
+        for row in jazz_spark_rows(&w.temp_strip, iw, chart_h) {
+            lines.push(Line::from(row));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), inner);
@@ -1629,7 +1609,7 @@ fn card_height(m: &crate::state::Messages, active: bool) -> u16 {
 
 /// Shared unread/all-read title badge for the iMESSAGE and SIGNAL cards so the
 /// glyph, color and spacing stay congruent. `dot` lets the caller animate the
-/// unread bullet color (iMESSAGE crossfades pink→green on settle); Signal passes
+/// unread bullet color (iMESSAGE crossfades pink→violet on settle); Signal passes
 /// a flat pink.
 fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'static>> {
     if unread_count > 0 {
@@ -1643,7 +1623,7 @@ fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'stat
         ]
     } else {
         vec![
-            Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(" ✓ ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled("all read ", Style::default().fg(c::DIM)),
         ]
     }
@@ -1680,7 +1660,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
     )];
     if msgs.available && msgs.fresh {
-        let dot = c::blend(c::PINK, c::GREEN, badge_blend);
+        let dot = c::blend(c::PINK, c::ACCENT, badge_blend);
         title_spans.extend(unread_badge(msgs.unread_count, dot));
     }
 
@@ -2061,7 +2041,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
             ));
             title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
         } else {
-            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD)));
             title_spans.push(Span::styled("idle ", Style::default().fg(c::DIM)));
         }
     }
