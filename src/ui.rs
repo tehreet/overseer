@@ -1620,24 +1620,66 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let eq_y = art_bottom.saturating_sub(EQ_H).max(info.y + body_h);
     if tw >= 4 && eq_y + EQ_H <= inner.y + inner.height {
         let eq_area = Rect { x: tx, y: eq_y, width: tw, height: EQ_H };
-        f.render_widget(Paragraph::new(eq_bars(tw as usize, t, m.playing)), eq_area);
+        let real = real_spectrum(s, tw as usize);
+        f.render_widget(Paragraph::new(eq_bars(tw as usize, t, m.playing, real.as_deref())), eq_area);
     }
 }
 
-/// A synthetic spectrum-analyzer flourish for the NOW PLAYING card. AppleScript
-/// exposes no real audio levels, so this is an honest *visualizer*, not a
-/// measurement: it only dances while music plays and settles to a flat resting
-/// line when paused — it never pretends to be measured spectrum. Two cells tall
-/// (16 height steps) with a fixed blue→pink positional gradient keeps the motion
-/// buttery and calm (heights move; colours don't strobe).
-fn eq_bars(n: usize, t: f64, playing: bool) -> Vec<Line<'static>> {
-    spectrum(n, 2, t, playing)
+/// Resample the captured audio spectrum (issue #13) to `n` column heights,
+/// played back delay-interpolated like the EQ so the bars glide between FFT
+/// frames instead of stepping. Returns `None` when the Core Audio tap isn't
+/// live or its last frame is stale — in which case the caller falls back to the
+/// honest synthetic flourish below. Each captured band is itself Catmull-Rom
+/// interpolated through time, then linearly spread/averaged across `n` columns.
+fn real_spectrum(s: &AppState, n: usize) -> Option<Vec<f32>> {
+    if !s.audio_live || n == 0 {
+        return None;
+    }
+    let samples = &s.audio_samples;
+    let last = samples.back()?;
+    // Bail to the synthetic dance if capture has gone quiet (paused/stopped) —
+    // a flatlined real spectrum would read as a dead card.
+    if last.0.elapsed() > Duration::from_millis(700) {
+        return None;
+    }
+    let bands = last.1.len();
+    if bands == 0 {
+        return None;
+    }
+    // Time-smoothed band values via the same delayed Catmull-Rom playback the
+    // gauges/EQ use: glides each band between FFT frames at frame rate.
+    let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
+    let vals: Vec<f32> = (0..bands).map(|b| sampled_channel(samples, b, target)).collect();
+
+    // Spread `bands` source bands across `n` output columns. Box-blur a touch so
+    // neighbouring bars share motion (buttery, never jagged).
+    let out: Vec<f32> = (0..n)
+        .map(|x| {
+            let pos = x as f32 / (n.max(2) - 1) as f32 * (bands - 1) as f32;
+            let i = pos.floor() as usize;
+            let f = pos - i as f32;
+            let a = vals[i.min(bands - 1)];
+            let b = vals[(i + 1).min(bands - 1)];
+            a + (b - a) * f
+        })
+        .collect();
+    Some(smoothed(&out, 1, 2))
 }
 
-/// `n` bars × `rows` cells tall. Bars fill from the bottom; 8 sub-levels per
-/// cell. See `eq_bars` for the honesty note — this is a visualizer, not a real
-/// FFT: it dances only while playing and rests flat when paused.
-fn spectrum(n: usize, rows: usize, t: f64, playing: bool) -> Vec<Line<'static>> {
+/// The NOW PLAYING spectrum. When the Core Audio tap is live (issue #13) this is
+/// a *real* FFT of what's playing — `bars` carries the measured, glide-smoothed
+/// band heights. When it isn't, it falls back to an honest synthetic visualizer:
+/// it only dances while music plays and settles flat when paused, never
+/// pretending to be measured spectrum. Two cells tall, blue→pink positional
+/// gradient; heights move, colours don't strobe.
+fn eq_bars(n: usize, t: f64, playing: bool, bars: Option<&[f32]>) -> Vec<Line<'static>> {
+    spectrum(n, 2, t, playing, bars)
+}
+
+/// `n` bars × `rows` cells tall, filling from the bottom with 8 sub-levels per
+/// cell. If `bars` is `Some`, those measured heights (0..1) are drawn directly
+/// (real audio); otherwise the synthetic dance fills in — see `eq_bars`.
+fn spectrum(n: usize, rows: usize, t: f64, playing: bool, bars: Option<&[f32]>) -> Vec<Line<'static>> {
     let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let rows = rows.max(1);
     let tf = t as f32;
@@ -1645,7 +1687,10 @@ fn spectrum(n: usize, rows: usize, t: f64, playing: bool) -> Vec<Line<'static>> 
     let mut grid: Vec<Vec<Span>> = (0..rows).map(|_| Vec::with_capacity(n)).collect();
     for i in 0..n {
         let fi = i as f32;
-        let h = if playing {
+        let h = if let Some(b) = bars {
+            // Real measured band height. A small floor keeps the baseline alive.
+            (b.get(i).copied().unwrap_or(0.0)).clamp(0.0, 1.0).max(0.04)
+        } else if playing {
             // Bass on the left (slow, tall), treble on the right (fast, flickery)
             // — a few incommensurate sinusoids so the pattern never visibly loops.
             let speed = 1.7 + fi * 0.45;
@@ -2881,8 +2926,9 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         );
         if inner.width >= 4 && viz_rows >= 1 {
             let viz_y = inner.y + inner.height - viz_rows as u16;
+            let real = real_spectrum(s, inner.width as usize);
             f.render_widget(
-                Paragraph::new(spectrum(inner.width as usize, viz_rows, t, m.playing)),
+                Paragraph::new(spectrum(inner.width as usize, viz_rows, t, m.playing, real.as_deref())),
                 Rect { x: inner.x, y: viz_y, width: inner.width, height: viz_rows as u16 },
             );
         }

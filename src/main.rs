@@ -5,6 +5,8 @@
 //! karaoke lyric wipe move every frame).
 #![allow(dead_code)] // full palette + helpers kept available for tweaking
 
+#[cfg(target_os = "macos")]
+mod audio;
 mod cache;
 mod collectors;
 mod lyrics;
@@ -40,6 +42,11 @@ fn main() -> Result<()> {
         collectors::diag_signal();
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--diag-audio") {
+        audio::diag();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--facts") {
         return facts_diag();
     }
@@ -71,6 +78,7 @@ fn run() -> Result<()> {
     collectors::spawn_discord(shared.clone());
     collectors::spawn_doctor(shared.clone());
     collectors::spawn_keybinds(shared.clone());
+    collectors::spawn_audio(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;

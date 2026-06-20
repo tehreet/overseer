@@ -548,6 +548,15 @@ pub struct AppState {
     /// proc_panel eases each process's cpu%/mem and slides rows toward their new
     /// rank between samples, keyed by name (same pattern as cpu_samples).
     pub proc_samples: VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>,
+    /// Timestamped log-spaced audio spectrum bands (each 0..1) captured from a
+    /// real Core Audio process tap of the system output. Fed to the NOW PLAYING
+    /// / LYRICS spectrum the same delay-interpolated way the EQ plays back, so
+    /// the bars glide between FFT frames instead of stepping. Empty until the
+    /// audio thread produces a frame; `audio_live` flips true once it does.
+    pub audio_samples: VecDeque<(Instant, Vec<f32>)>,
+    /// True once the audio tap is capturing (the visualizer then reflects real
+    /// sound); false keeps the honest synthetic resting flourish.
+    pub audio_live: bool,
     pub music: MusicStats,
     pub lyrics: Lyrics,
     /// How many distinct tracks are sitting in the lyrics miss log waiting to be
@@ -590,6 +599,8 @@ impl Default for AppState {
             net_samples: VecDeque::new(),
             silicon_samples: VecDeque::new(),
             proc_samples: VecDeque::new(),
+            audio_samples: VecDeque::new(),
+            audio_live: false,
             music: MusicStats::default(),
             lyrics: Lyrics::default(),
             lyrics_misses: 0,

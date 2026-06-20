@@ -152,6 +152,43 @@ pub fn spawn_system(shared: Shared) {
 }
 
 // ---------------------------------------------------------------------------
+// Real audio spectrum (issue #13): a Core Audio process tap of the system
+// output feeds a windowed FFT → log-spaced bands → AppState::audio_samples,
+// which the NOW PLAYING / LYRICS spectrum plays back delay-interpolated so the
+// bars glide with whatever is actually playing. If the tap can't be created
+// (pre-14.4, or blocked in this environment), we leave audio_live=false and the
+// honest synthetic visualizer keeps dancing — never a broken card.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+pub fn spawn_audio(shared: Shared) {
+    thread::spawn(move || loop {
+        // `AudioCapture` owns raw HAL objects (not Send), so it lives entirely
+        // inside this thread; the realtime IO proc writes bands on its own.
+        match crate::audio::start(shared.clone()) {
+            Some(_cap) => {
+                // Hold the tap open. Park until the process exits; on the rare
+                // chance the device tears down we retry after the sleep below.
+                loop {
+                    thread::sleep(Duration::from_secs(3600));
+                }
+            }
+            None => {
+                // No tap this round — make sure the visualizer stays honest and
+                // retry occasionally (the user may grant audio access / start
+                // playing through a device the tap can reach).
+                if let Ok(mut s) = shared.lock() {
+                    s.audio_live = false;
+                }
+                thread::sleep(Duration::from_secs(30));
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_audio(_shared: Shared) {}
+
+// ---------------------------------------------------------------------------
 // Apple Silicon metrics: stream `macmon pipe` as newline-delimited JSON.
 // ---------------------------------------------------------------------------
 pub fn spawn_macmon(shared: Shared) {

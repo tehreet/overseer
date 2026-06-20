@@ -21,6 +21,17 @@ anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 unicode-width = "0.1"
 tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rustfft = "6"
+
+# Real system-audio capture for the spectrum EQ (issue #13): a Core Audio
+# process tap (macOS 14.4+) of the global output → aggregate device → IO proc.
+# No virtual device, no kext — just a private tap of what's already playing.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSValue", "NSDictionary"] }
+objc2-core-audio = "0.3"  # defaults pull in AudioHardware + objc2-foundation + types
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFBase", "CFNumber", "CFArray", "CFDictionary"] }
 
 [profile.release]
 opt-level = 3
