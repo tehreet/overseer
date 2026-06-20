@@ -270,7 +270,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             Constraint::Length(11), // [2] APPLE SILICON
             Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
             Constraint::Length(10), // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
-            Constraint::Length(8),  // [5] WEATHER       (jazzed, +data)
+            Constraint::Length(7),  // [5] WEATHER       (jazzed, +data)
             Constraint::Min(9),     // [6] iMESSAGE
         ])
         .split(body[0]);
@@ -1078,16 +1078,21 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let iw = inner.width as usize;
     let h = inner.height as usize;
 
-    // row 0 — big readout on the left, sunrise/sunset flush-right.
-    let left_txt = format!("{} {}°F  {}", w.icon, w.temp_f, w.desc);
+    // night-aware: a clear-sky sun becomes a moon once the local clock is past
+    // sunset / before sunrise.
+    let icon = night_icon(&w.icon, &w.sunrise, &w.sunset);
+
+    // row 0 — big readout (icon · temp · desc · feels) on the left, sunrise/sunset flush-right.
+    let left_txt = format!("{} {}°F  {}  feels {}°", icon, w.temp_f, w.desc, w.feels_f);
     let right_txt = format!("☀ {}  ☾ {}", w.sunrise, w.sunset);
     let pad = iw
         .saturating_sub(left_txt.chars().count() + right_txt.chars().count())
         .max(1);
     let big = Line::from(vec![
-        Span::styled(format!("{} ", w.icon), Style::default().fg(c::YELLOW)),
+        Span::styled(format!("{} ", icon), Style::default().fg(c::YELLOW)),
         Span::styled(format!("{}°F", w.temp_f), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", w.desc), Style::default().fg(c::TEXT)),
+        Span::styled(format!("  feels {}°", w.feels_f), Style::default().fg(c::DIM)),
         Span::raw(" ".repeat(pad)),
         Span::styled(
             format!("☀ {}  ☾ {}", w.sunrise, w.sunset),
@@ -1095,9 +1100,8 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
         ),
     ]);
 
-    // row 1 — feels / hi-lo (warm up = pink, cool down = cyan) / hum / UV.
+    // row 1 — hi-lo (warm up = pink, cool down = cyan) / hum / UV.
     let detail = Line::from(vec![
-        Span::styled(format!("feels {}°  ", w.feels_f), Style::default().fg(c::DIM)),
         Span::styled(format!("↑{}°", w.hi_f), Style::default().fg(c::PINK)),
         Span::styled(" ", Style::default().fg(c::FAINT)),
         Span::styled(format!("↓{}°", w.lo_f), Style::default().fg(c::CYAN)),
@@ -1106,30 +1110,49 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
         Span::styled(format!("{}", w.uv), Style::default().fg(c::jazz((w.uv as f32 / 11.0).clamp(0.0, 1.0)))),
     ]);
 
-    // row 2 — atmosphere: wind / precip chance / pressure.
+    // row 2 — atmosphere: wind / chance of rain / barometric pressure.
     let atmos = Line::from(vec![
         Span::styled(format!("💨 {} {} mph", w.wind_dir, w.wind_mph), Style::default().fg(c::CYAN)),
-        Span::styled("   ☔ ", Style::default().fg(c::DIM)),
+        Span::styled("   ☔ rain ", Style::default().fg(c::DIM)),
         Span::styled(format!("{}%", w.precip_chance), Style::default().fg(c::jazz((w.precip_chance as f32 / 100.0).clamp(0.0, 1.0)))),
-        Span::styled(format!("   ◧ {} mb", w.pressure_mb), Style::default().fg(c::DIM)),
+        Span::styled(format!("   {} mb", w.pressure_mb), Style::default().fg(c::DIM)),
     ]);
 
     let mut lines: Vec<Line> = vec![big, detail, atmos];
 
-    // row 3 — thin jazz rule for rhythm.
-    if h > 4 {
-        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
+    // bottom row: location flush-left, hourly temp strip (next ~12h of forecast
+    // temps, jazz-colored) flush-right on the same line — preceded by one blank
+    // line so it sits pinned to the card's bottom edge.
+    let remaining = iw.saturating_sub(w.location.chars().count());
+    let mut bottom = vec![Span::styled(w.location.clone(), Style::default().fg(c::FAINT))];
+    if !w.temp_strip.is_empty() && remaining > 0 {
+        bottom.extend(jazz_spark(&w.temp_strip, remaining));
     }
-    // row 4 — tiny hourly temp strip (real forecast temps, jazz-colored).
-    if h > 5 && !w.temp_strip.is_empty() {
-        let mut strip = vec![Span::styled("", Style::default())];
-        strip.extend(jazz_spark(&w.temp_strip, iw));
-        lines.push(Line::from(strip));
+    if h > 3 {
+        lines.push(Line::from(""));
     }
-    // last row — location.
-    lines.push(Line::from(Span::styled(w.location.clone(), Style::default().fg(c::FAINT))));
+    lines.push(Line::from(bottom));
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Swap a clear-sky sun for a moon when the local clock is past sunset or before
+/// sunrise. Any other condition icon (cloud, rain, fog, …) is returned unchanged.
+fn night_icon(icon: &str, sunrise: &str, sunset: &str) -> String {
+    use chrono::Timelike;
+    if icon != "☀" {
+        return icon.to_string();
+    }
+    let to_min = |s: &str| -> Option<u32> {
+        let (h, m) = s.split_once(':')?;
+        Some(h.trim().parse::<u32>().ok()? * 60 + m.trim().parse::<u32>().ok()?)
+    };
+    let now = chrono::Local::now();
+    let now_min = now.hour() * 60 + now.minute();
+    match (to_min(sunrise), to_min(sunset)) {
+        (Some(sr), Some(ss)) if now_min < sr || now_min >= ss => "🌙".to_string(),
+        _ => icon.to_string(),
+    }
 }
 
 /// iMESSAGE card: unread badge in the title, a list of recent inbound messages
