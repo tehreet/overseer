@@ -29,6 +29,9 @@ pub fn spawn_system(shared: Shared) {
             System::os_version().unwrap_or_default()
         );
         let mut last_net = Instant::now();
+        // Names currently shown in the TOP PROCESSES card, kept across iterations
+        // so membership can be sticky (hysteresis) — see the selection below.
+        let mut shown_procs: Vec<String> = Vec::new();
 
         loop {
             sys.refresh_cpu_usage();
@@ -84,8 +87,22 @@ pub fn spawn_system(shared: Shared) {
                     )
                 })
                 .collect();
+            // Membership hysteresis: a process already on screen gets a small CPU
+            // bonus when we pick the top 6, so the bottom rows don't churn every
+            // second as near-tied low-CPU procs swap in and out (that churn showed
+            // up as the last row fading in/out nonstop). A genuinely busier process
+            // still beats the bonus and takes the slot. Selection uses the bonus;
+            // display order stays honest (raw CPU descending).
+            const SHOW: usize = 6;
+            const STICKY_BONUS: f32 = 2.0; // %cpu margin an incumbent must lose by
+            procs.sort_by(|a, b| {
+                let sa = a.1 + if shown_procs.contains(&a.0) { STICKY_BONUS } else { 0.0 };
+                let sb = b.1 + if shown_procs.contains(&b.0) { STICKY_BONUS } else { 0.0 };
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            procs.truncate(SHOW);
             procs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            procs.truncate(6);
+            shown_procs = procs.iter().map(|p| p.0.clone()).collect();
 
             {
                 let mut s = shared.lock().unwrap();
@@ -728,15 +745,28 @@ if application "Music" is running then
     try
       set cp to current playlist
       set ct to current track
-      set i to index of ct
-      set n to count of tracks of cp
+      set ctid to database ID of ct
+      set trks to tracks of cp
+      set n to count of trks
+      -- `index of current track` is unreliable (it can return the library index,
+      -- not the position in the current playlist), so find the real position by
+      -- matching the database ID — this is what makes "up next" actually resolve.
+      set pos to 0
+      repeat with k from 1 to n
+        if database ID of (item k of trks) is ctid then
+          set pos to k
+          exit repeat
+        end if
+      end repeat
+      if pos is 0 then return "NOQUEUE"
       set out to ""
-      repeat with k from (i + 1) to (i + 3)
+      repeat with k from (pos + 1) to (pos + 3)
         if k is less than or equal to n then
-          set tr to track k of cp
+          set tr to item k of trks
           set out to out & (name of tr) & "\t" & (artist of tr) & "\t" & (duration of tr) & "\n"
         end if
       end repeat
+      if out is "" then return "NOQUEUE"
       return out
     on error
       return "NOQUEUE"
