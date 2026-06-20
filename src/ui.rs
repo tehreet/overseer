@@ -852,11 +852,12 @@ fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     }
 }
 
-/// Merged "ROBOTS WORKING" card: left column = Claude token throughput
-/// (today/week/month) + 30-day sessions + the burn bar chart; right column =
-/// the most-recently-active local git branch's pulse. A shimmery jazz divider
-/// sweeps between them.
+/// Merged "ROBOTS WORKING" card: left = Claude token throughput
+/// (today/week/month/sessions) crowned by a per-hour burn chart for today;
+/// right = the most-recently-active local git branch's pulse. The two halves
+/// are grouped by a soft, static gradient rule rather than a hard split.
 fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    let _ = t;
     let block = panel("ROBOTS WORKING", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -875,24 +876,19 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let rx = div_x + 2; // 1-col gutter after the divider
     let rw = (inner.x + inner.width).saturating_sub(rx);
 
-    // ----- shimmery jazz divider: a base blue→pink gradient down the line with
-    // a bright white-pink glint that sweeps downward over time -----
-    let head = ((t * 0.5).rem_euclid(1.0)) as f32;
+    // ----- soft grouping rule: a calm, static blue→violet gradient down the
+    // line, drawn with the light "│" glyph and kept dim so it reads as a gentle
+    // seam between the two halves rather than a jarring hard split.
     for r in 0..h {
         let p = r as f32 / h.max(1) as f32;
-        let mut d = (p - head).abs();
-        if d > 0.5 {
-            d = 1.0 - d;
-        }
-        let glint = (-(d * d) / (2.0 * 0.13 * 0.13)).exp();
-        let col = c::blend(c::jazz(0.22 + 0.58 * p), c::jazz(0.97), glint);
+        let col = c::blend(c::FAINT, c::jazz(0.18 + 0.30 * p), 0.45);
         f.render_widget(
-            Paragraph::new(Span::styled("│", Style::default().fg(col))),
+            Paragraph::new(Span::styled("╎", Style::default().fg(col))),
             Rect { x: div_x, y: inner.y + r as u16, width: 1, height: 1 },
         );
     }
 
-    // ----- left: token windows + burn bar chart -----
+    // ----- left: per-hour burn chart on top, token windows beneath -----
     if !u.fresh {
         f.render_widget(
             Paragraph::new(Span::styled("scanning ~/.claude…", Style::default().fg(c::DIM))),
@@ -906,37 +902,69 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
                 Span::styled(val, Style::default().fg(col).add_modifier(Modifier::BOLD)),
             ])
         };
-        let text = vec![
-            row("today", fmt_tokens(tot_today), c::CYAN),
-            row("week", fmt_tokens(u.tokens_7d), c::ACCENT),
-            row("month", fmt_tokens(u.tokens_30d), c::PINK),
-            row("sessions", format!("{}", u.sessions_30d), c::TEXT),
+        let windows = [
+            ("today", fmt_tokens(tot_today), c::CYAN),
+            ("week", fmt_tokens(u.tokens_7d), c::ACCENT),
+            ("month", fmt_tokens(u.tokens_30d), c::PINK),
+            ("sessions", format!("{}", u.sessions_30d), c::TEXT),
         ];
-        let tlen = text.len() as u16;
+        // Window today's per-hour burn so it ENDS at the current hour — the live
+        // hour is the rightmost bar. Showing the raw tail of the 24h array would
+        // render the empty late-day/future hours (all blank).
+        let cur_hour = Local::now().hour() as usize;
+        let today_so_far: &[u64] = if u.hourly.is_empty() {
+            &u.hourly[..]
+        } else {
+            &u.hourly[..=cur_hour.min(u.hourly.len() - 1)]
+        };
+        let peak = today_so_far.iter().copied().max().unwrap_or(0);
+        let peak_hr = today_so_far
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| **v)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // The burn chart is the card's anchor: a multi-row per-hour bar chart of
+        // today's token spend, filling the rows above the four window numbers so
+        // there's no dead gap and the whole left half reads as one unit.
+        let wlen = windows.len() as u16;
+        let chart_h = inner.height.saturating_sub(wlen + 1); // +1 header row
+        let chart_w = lw as usize;
+        if chart_h >= 1 && chart_w > 0 && peak > 0 {
+            // Header: what the chart is + its peak, so it communicates at a glance.
+            let header = Line::from(vec![
+                Span::styled("burn/hr ", Style::default().fg(c::DIM)),
+                Span::styled(
+                    format!("peak {} @{:02}:00", fmt_tokens(peak), peak_hr),
+                    Style::default().fg(c::FAINT),
+                ),
+            ]);
+            f.render_widget(
+                Paragraph::new(header),
+                Rect { x: inner.x, y: inner.y, width: lw, height: 1 },
+            );
+            for (i, srow) in jazz_spark_rows(today_so_far, chart_w, chart_h as usize)
+                .into_iter()
+                .enumerate()
+            {
+                f.render_widget(
+                    Paragraph::new(Line::from(srow)),
+                    Rect { x: inner.x, y: inner.y + 1 + i as u16, width: lw, height: 1 },
+                );
+            }
+        }
+
+        // Token windows pinned to the bottom of the left column, under the chart.
+        let text: Vec<Line> = windows
+            .iter()
+            .map(|(l, v, c)| row(l, v.clone(), *c))
+            .collect();
+        let wy = inner.y + inner.height.saturating_sub(wlen);
         f.render_widget(
             Paragraph::new(text),
-            Rect { x: inner.x, y: inner.y, width: lw, height: tlen.min(inner.height) },
+            Rect { x: inner.x, y: wy, width: lw, height: wlen.min(inner.height) },
         );
-        // The loved burn bar chart, pinned to the bottom row of the left column.
-        if inner.height > tlen {
-            // "burn" label padded to the value-label width (8+1) so the bars
-            // begin in the same column as the today/week/month numbers above.
-            let mut burn = vec![Span::styled(format!("{:<8} ", "burn"), Style::default().fg(c::DIM))];
-            // Window today's per-hour burn so it ENDS at the current hour — the
-            // live hour is the rightmost bar. Showing the raw tail of the 24h
-            // array would render the empty late-day/future hours (all blank).
-            let today_so_far = if u.hourly.is_empty() {
-                &u.hourly[..]
-            } else {
-                let hh = (Local::now().hour() as usize).min(u.hourly.len() - 1);
-                &u.hourly[..=hh]
-            };
-            burn.extend(jazz_spark(today_so_far, (lw as usize).saturating_sub(9)));
-            f.render_widget(
-                Paragraph::new(Line::from(burn)),
-                Rect { x: inner.x, y: inner.y + inner.height - 1, width: lw, height: 1 },
-            );
-        }
     }
 
     // ----- right: the active git branch's pulse -----
@@ -2709,5 +2737,127 @@ fn fmt_dur_short(secs: u64) -> String {
         format!("{m}m")
     } else {
         format!("{s}s")
+    }
+}
+
+/// One renderable row of the KEYBINDS card.
+#[derive(Clone)]
+enum KbItem {
+    Header(String),
+    Bind(String, String),
+    Blank,
+}
+
+/// KEYBINDS card: a live mirror of the Hammerspoon cheat sheet (exported to JSON
+/// on every reload). Groups + rows flow into balanced columns sized to the area,
+/// so it fills the right column the SYSTEM graphs used to occupy.
+fn keybinds_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let kb = &s.keybinds;
+
+    let mut title_spans = vec![Span::styled(
+        " KEYBINDS ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if kb.available && !kb.hyper.is_empty() {
+        title_spans.push(Span::styled(
+            format!("· Hyper = {} ", kb.hyper),
+            Style::default().fg(c::DIM),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 || inner.width < 12 {
+        return;
+    }
+
+    if !kb.available {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("⌘ waiting for Hammerspoon…", Style::default().fg(c::DIM))),
+                Line::from(Span::styled(
+                    "reload Hammerspoon (Ctrl+Alt+R) to populate",
+                    Style::default().fg(c::FAINT),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    // Each group is an indivisible block (header + its rows) so a binding is
+    // never detached from its heading across a column break.
+    let blocks: Vec<Vec<KbItem>> = kb
+        .groups
+        .iter()
+        .map(|g| {
+            let mut blk = vec![KbItem::Header(g.name.clone())];
+            for (keys, desc) in &g.binds {
+                blk.push(KbItem::Bind(keys.clone(), desc.clone()));
+            }
+            blk
+        })
+        .collect();
+
+    // Column geometry: balance into as many ~30-cell columns as the width allows.
+    const KEYW: usize = 7;
+    const COLGAP: usize = 2;
+    const COL_MIN: usize = 30;
+    let iw = inner.width as usize;
+    let ncols = ((iw + COLGAP) / (COL_MIN + COLGAP)).clamp(1, 3);
+    let colw = (iw - COLGAP * (ncols - 1)) / ncols;
+
+    // Greedily pack whole group-blocks into balanced columns: aim each column at
+    // ~total/ncols rows, but never split a group; the last column takes the rest.
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    let target = total.div_ceil(ncols);
+    let mut cols: Vec<Vec<KbItem>> = vec![Vec::new()];
+    let mut ch = 0usize; // current column height
+    for blk in blocks {
+        let h = blk.len();
+        let at_last = cols.len() == ncols;
+        if !cols.last().unwrap().is_empty() && !at_last && ch + 1 + h > target {
+            cols.push(Vec::new());
+            ch = 0;
+        }
+        let col = cols.last_mut().unwrap();
+        if !col.is_empty() {
+            col.push(KbItem::Blank); // blank line between stacked groups
+            ch += 1;
+        }
+        col.extend(blk);
+        ch += h;
+    }
+
+    for (ci, col) in cols.iter().enumerate() {
+        let cx = inner.x + (ci * (colw + COLGAP)) as u16;
+        let mut lines: Vec<Line> = Vec::with_capacity(col.len());
+        for it in col {
+            match it {
+                KbItem::Blank => lines.push(Line::from("")),
+                KbItem::Header(name) => lines.push(Line::from(Span::styled(
+                    fit_width(name, colw),
+                    Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+                ))),
+                KbItem::Bind(keys, desc) => {
+                    let dw = colw.saturating_sub(KEYW + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled(pad_width(keys, KEYW), Style::default().fg(c::CYAN).add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::styled(fit_width(desc, dw), Style::default().fg(c::TEXT)),
+                    ]));
+                }
+            }
+        }
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect { x: cx, y: inner.y, width: colw as u16, height: inner.height },
+        );
     }
 }
