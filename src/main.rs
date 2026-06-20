@@ -5,6 +5,7 @@
 //! karaoke lyric wipe move every frame).
 #![allow(dead_code)] // full palette + helpers kept available for tweaking
 
+mod cache;
 mod collectors;
 mod lyrics;
 mod state;
@@ -33,6 +34,9 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--facts") {
         return facts_diag();
+    }
+    if args.iter().any(|a| a == "--clear-cache") {
+        return clear_cache();
     }
     if args.iter().any(|a| a == "--cells") {
         return cells(&args);
@@ -379,6 +383,19 @@ fn facts_diag() -> Result<()> {
         for l in &fa.lines {
             println!("  • {l}");
         }
+    }
+    Ok(())
+}
+
+/// Wipe the persistent disk cache (`~/.cache/studioboard/{lyrics,facts,art}`) and
+/// report what was removed, so a song re-fetches lyrics + facts + art next play.
+fn clear_cache() -> Result<()> {
+    println!("studioboard --clear-cache\n");
+    if let Some(root) = cache::root() {
+        println!("cache root: {}", root.display());
+    }
+    for line in cache::clear() {
+        println!("  {line}");
     }
     Ok(())
 }

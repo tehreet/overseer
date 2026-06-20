@@ -234,7 +234,7 @@ pub struct Queue {
 /// Curated "interesting facts" about the current track/album/artist for the
 /// LINER NOTES card. Generated off-thread (Claude when a key is present, else a
 /// Wikipedia extract) and cached per track so it never regenerates on seek/pause.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MusicFacts {
     pub track_id: String,   // which track these belong to
     pub lines: Vec<String>, // one fact per entry

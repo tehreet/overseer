@@ -8,9 +8,6 @@
 //!   * synced results are cached to disk (`~/.cache/studioboard/lyrics`), so a
 //!     song heard once loads instantly forever — even across restarts.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -338,24 +335,16 @@ fn synced_from(v: &serde_json::Value) -> Option<Vec<LyricLine>> {
 }
 
 // --- disk cache ------------------------------------------------------------
+// Stored as standard `.lrc` files under `~/.cache/studioboard/lyrics/`, keyed by
+// the shared track hash (see `crate::cache`) so a song heard once loads instantly
+// forever — even across restarts.
 
-fn cache_dir() -> Option<PathBuf> {
-    let d = dirs::cache_dir()?.join("studioboard").join("lyrics");
-    std::fs::create_dir_all(&d).ok()?;
-    Some(d)
-}
-
-fn cache_path(track_id: &str) -> Option<PathBuf> {
-    let mut h = DefaultHasher::new();
-    track_id.hash(&mut h);
-    Some(cache_dir()?.join(format!("{:016x}.lrc", h.finish())))
-}
+const KIND: &str = "lyrics";
 
 /// Load synced lyrics for a track from disk, if present.
 pub fn cache_load(track_id: &str) -> Option<Lyrics> {
-    let path = cache_path(track_id)?;
-    let body = std::fs::read_to_string(path).ok()?;
-    let lines = parse_lrc(&body);
+    let body = crate::cache::get_bytes(KIND, track_id, "lrc")?;
+    let lines = parse_lrc(&String::from_utf8_lossy(&body));
     if lines.is_empty() {
         return None;
     }
@@ -367,14 +356,13 @@ pub fn cache_save(track_id: &str, ly: &Lyrics) {
     if !ly.synced || ly.lines.is_empty() {
         return;
     }
-    let Some(path) = cache_path(track_id) else { return };
     let mut body = String::new();
     for l in &ly.lines {
         let m = (l.t / 60.0).floor() as i64;
         let s = l.t - (m as f64) * 60.0;
         body.push_str(&format!("[{:02}:{:05.2}]{}\n", m, s, l.text));
     }
-    let _ = std::fs::write(path, body);
+    crate::cache::put_bytes(KIND, track_id, "lrc", body.as_bytes());
 }
 
 /// Parse an LRC blob: lines like `[01:23.45] text`, possibly multiple tags

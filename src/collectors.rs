@@ -441,18 +441,26 @@ pub fn spawn_artwork(shared: Shared) {
             if let Some(id) = id {
                 if id != current {
                     current = id.clone();
-                    let out = Command::new("osascript")
-                        .arg("-e")
-                        .arg(artwork_script(&path_str))
-                        .output();
-                    let ok = out
-                        .as_ref()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "OK")
-                        .unwrap_or(false);
-                    let art = if ok {
-                        decode_art(&path, &id)
+                    // Warm from the disk cache first so a song heard once shows its
+                    // cover instantly, with no AppleScript/decode on replay.
+                    let art = if let Some(cached) = load_art_cache(&id) {
+                        cached
                     } else {
-                        crate::state::AlbumArt { track_id: id.clone(), ..Default::default() }
+                        let out = Command::new("osascript")
+                            .arg("-e")
+                            .arg(artwork_script(&path_str))
+                            .output();
+                        let ok = out
+                            .as_ref()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "OK")
+                            .unwrap_or(false);
+                        if ok {
+                            let decoded = decode_art(&path, &id);
+                            save_art_cache(&id, &decoded);
+                            decoded
+                        } else {
+                            crate::state::AlbumArt { track_id: id.clone(), ..Default::default() }
+                        }
                     };
                     let mut s = shared.lock().unwrap();
                     if s.music.track_id() == id {
@@ -500,6 +508,39 @@ pub fn sample_album_art(id: String) -> crate::state::AlbumArt {
         }
     }
     crate::state::AlbumArt { track_id: id, w: dim, h: dim, px }
+}
+
+/// Persist the downscaled RGB thumb to `~/.cache/studioboard/art/<hash>.bin`.
+/// Format: little-endian u32 `w`, u32 `h`, then `w*h*3` raw RGB bytes. Skips
+/// empty thumbs so a failed decode isn't cached as a permanent blank.
+fn save_art_cache(id: &str, art: &crate::state::AlbumArt) {
+    if art.px.is_empty() || art.w == 0 || art.h == 0 {
+        return;
+    }
+    let mut buf = Vec::with_capacity(8 + art.px.len() * 3);
+    buf.extend_from_slice(&(art.w as u32).to_le_bytes());
+    buf.extend_from_slice(&(art.h as u32).to_le_bytes());
+    for p in &art.px {
+        buf.extend_from_slice(p);
+    }
+    crate::cache::put_bytes("art", id, "bin", &buf);
+}
+
+/// Load a cached album-art thumb, if present. Fails soft to `None` on a missing,
+/// truncated, or size-mismatched file so the caller regenerates from AppleScript.
+fn load_art_cache(id: &str) -> Option<crate::state::AlbumArt> {
+    let buf = crate::cache::get_bytes("art", id, "bin")?;
+    if buf.len() < 8 {
+        return None;
+    }
+    let w = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    let h = u32::from_le_bytes(buf[4..8].try_into().ok()?) as usize;
+    let body = &buf[8..];
+    if w == 0 || h == 0 || body.len() != w * h * 3 {
+        return None; // truncated/corrupt — regenerate
+    }
+    let px = body.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    Some(crate::state::AlbumArt { track_id: id.to_string(), w, h, px })
 }
 
 fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
@@ -605,8 +646,9 @@ fn read_queue() -> Vec<crate::state::QueueTrack> {
 // LINER NOTES: interesting facts about the current track/album/artist. Claude
 // (Haiku) writes punchy trivia when ANTHROPIC_API_KEY is present; otherwise we
 // fall back to a Wikipedia extract so the card is never empty. Cached per track
-// in-memory so it never regenerates on seek/pause. (Persistent disk caching is
-// tracked as a follow-up issue.)
+// in-memory AND on disk (~/.cache/studioboard/facts/) so it never regenerates on
+// seek/pause and a song heard once loads its facts instantly across restarts —
+// with zero network/LLM calls on replay.
 // ---------------------------------------------------------------------------
 const FACTS_UA: &str = "studioboard/0.1 (https://github.com/tehreet/battlestation)";
 
@@ -636,10 +678,15 @@ pub fn spawn_facts(shared: Shared) {
             if let Some((id, artist, track, album)) = info {
                 if id != current {
                     current = id.clone();
-                    if let Some(hit) = cache.get(&id) {
+                    // Warm from the in-memory cache first, then disk (survives
+                    // restarts), before spending a network/LLM call.
+                    let warm = cache.get(&id).cloned().or_else(|| load_facts_cache(&id));
+                    if let Some(mut hit) = warm {
+                        hit.track_id = id.clone();
+                        cache.insert(id.clone(), hit.clone());
                         let mut s = shared.lock().unwrap();
                         if s.music.track_id() == id {
-                            s.facts = hit.clone();
+                            s.facts = hit;
                         }
                     } else {
                         // Show a status line while we gather, scoped to this track.
@@ -655,6 +702,9 @@ pub fn spawn_facts(shared: Shared) {
                         }
                         let facts = build_facts(&agent, &artist, &track, &album, &id);
                         cache.insert(id.clone(), facts.clone());
+                        // Persist only real results — skip empty/note-only so a
+                        // transient failure never becomes a sticky cache miss.
+                        save_facts_cache(&id, &facts);
                         let mut s = shared.lock().unwrap();
                         if s.music.track_id() == id {
                             s.facts = facts;
@@ -665,6 +715,26 @@ pub fn spawn_facts(shared: Shared) {
             thread::sleep(Duration::from_millis(300));
         }
     });
+}
+
+/// Load liner-note facts for a track from the persistent disk cache, if a real
+/// (non-empty) entry exists. Corrupt/partial JSON fails soft to `None`.
+fn load_facts_cache(id: &str) -> Option<crate::state::MusicFacts> {
+    let facts: crate::state::MusicFacts = crate::cache::get_json("facts", id)?;
+    if facts.lines.is_empty() {
+        None // empty/note-only entries are never written, but stay defensive
+    } else {
+        Some(facts)
+    }
+}
+
+/// Persist liner-note facts to the disk cache. Skips empty/note-only results so a
+/// transient generation failure isn't cached as a permanent miss.
+fn save_facts_cache(id: &str, facts: &crate::state::MusicFacts) {
+    if facts.lines.is_empty() {
+        return;
+    }
+    crate::cache::put_json("facts", id, facts);
 }
 
 /// One-shot facts probe for diagnostics (`studioboard --facts`).
