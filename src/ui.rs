@@ -269,7 +269,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             Constraint::Length(9),  // [1] MEM · DISK · NET
             Constraint::Length(11), // [2] APPLE SILICON
             Constraint::Length(9),  // [3] TOP PROCESSES (moved up, +uptime col, +header)
-            Constraint::Length(9),  // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
+            Constraint::Length(10), // [4] ROBOTS WORKING (Claude tokens + git pulse, merged)
             Constraint::Length(8),  // [5] WEATHER       (jazzed, +data)
             Constraint::Min(9),     // [6] iMESSAGE
         ])
@@ -833,19 +833,21 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         if g.last_rel.is_empty() { "—".to_string() } else { g.last_rel.clone() },
         Style::default().fg(c::FAINT),
     ));
-    // Branch activity, two metrics per row: loc · commits, then PRs · merges.
+    // Branch activity — one metric per line.
     let loc = Line::from(vec![
         Span::styled(format!("+{}", g.loc_added), Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" -{}", g.loc_removed), Style::default().fg(if g.loc_removed > 0 { c::RED } else { c::FAINT })),
         Span::styled(" loc", Style::default().fg(c::FAINT)),
-        Span::styled("   ·   ", Style::default().fg(c::FAINT)),
+    ]);
+    let commits = Line::from(vec![
         Span::styled(format!("{}", g.branch_commits), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
         Span::styled(" commits", Style::default().fg(c::DIM)),
     ]);
-    let prm = Line::from(vec![
+    let prs = Line::from(vec![
         Span::styled(format!("{}", g.pr_count), Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)),
         Span::styled(" PRs", Style::default().fg(c::DIM)),
-        Span::styled("   ·   ", Style::default().fg(c::FAINT)),
+    ]);
+    let merges = Line::from(vec![
         Span::styled(
             format!("{}", g.merges_main),
             Style::default().fg(if g.merges_main > 0 { c::GREEN } else { c::TEXT }).add_modifier(Modifier::BOLD),
@@ -853,7 +855,7 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Span::styled(" merges → main", Style::default().fg(c::DIM)),
     ]);
     f.render_widget(
-        Paragraph::new(vec![branch, commit, age, Line::from(""), loc, prm]),
+        Paragraph::new(vec![branch, commit, age, Line::from(""), loc, commits, prs, merges]),
         Rect { x: rx, y: inner.y, width: rw, height: inner.height },
     );
 }
