@@ -169,8 +169,6 @@ pub fn spawn_macmon(shared: Shared) {
             s.silicon.cpu_pct = getf("cpu_usage_pct") * 100.0;
             s.silicon.gpu_pct = pair1("gpu_usage") * 100.0;
             s.silicon.gpu_freq_mhz = pair0("gpu_usage");
-            s.silicon.all_power_w = getf("all_power");
-            s.silicon.cpu_power_w = getf("cpu_power");
             s.silicon.gpu_power_w = getf("gpu_power");
             s.silicon.sys_power_w = getf("sys_power");
             s.silicon.ane_power_w = getf("ane_power");
@@ -178,6 +176,31 @@ pub fn spawn_macmon(shared: Shared) {
             s.silicon.ecpu_freq_mhz = pair0("ecpu_usage");
             s.silicon.pcpu_pct = pair1("pcpu_usage") * 100.0;
             s.silicon.pcpu_freq_mhz = pair0("pcpu_usage");
+            // CPU/ANE power: macmon reads these off IOReport's "Energy Model"
+            // channels, but on this M4 Max (macOS 27) every per-core counter is
+            // pinned at 0 W, so `cpu_power`/`ane_power`/`all_power` collapse to
+            // just the GPU rail and the card showed a dead 0.0W forever. When the
+            // raw rail is dead, model CPU draw from the cluster util×frequency
+            // macmon *does* report correctly — a smooth, load-tracking estimate
+            // (E ≈ 6 W, P ≈ 44 W at full clocks on the M4 Max). ANE has no usable
+            // signal, so we keep the raw 0.0 (it's idle — that reading is honest).
+            let raw_cpu = getf("cpu_power");
+            s.silicon.cpu_power_w = if raw_cpu > 0.05 {
+                raw_cpu
+            } else {
+                let e = (s.silicon.ecpu_pct / 100.0) * (s.silicon.ecpu_freq_mhz as f32 / 2592.0);
+                let p = (s.silicon.pcpu_pct / 100.0) * (s.silicon.pcpu_freq_mhz as f32 / 4512.0);
+                (e * 6.0 + p * 44.0).clamp(0.0, 60.0)
+            };
+            // pkg = the SoC compute rails macmon means by `all_power`
+            // (cpu+gpu+ane); rebuild it from the recovered cpu so it isn't a
+            // dead mirror of the GPU rail.
+            let raw_all = getf("all_power");
+            s.silicon.all_power_w = if raw_cpu > 0.05 {
+                raw_all
+            } else {
+                s.silicon.cpu_power_w + s.silicon.gpu_power_w + s.silicon.ane_power_w
+            };
             if let Some(t) = v.get("temp") {
                 s.silicon.cpu_temp_c =
                     t.get("cpu_temp_avg").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
