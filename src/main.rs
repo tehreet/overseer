@@ -50,6 +50,7 @@ fn run() -> Result<()> {
     collectors::spawn_usage(shared.clone());
     collectors::spawn_messages(shared.clone());
     collectors::spawn_signal(shared.clone());
+    collectors::spawn_discord(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;
@@ -672,6 +673,43 @@ fn sample_data(st: &mut AppState, compose: bool) {
             }
         })
         .collect(),
+    };
+    st.discord = state::Discord {
+        fresh: true,
+        available: true,
+        voice: vec![
+            state::VoiceChannel {
+                name: "General".into(),
+                members: vec!["Josh".into(), "Cassie".into(), "Marcin".into()],
+            },
+            state::VoiceChannel {
+                name: "Gaming".into(),
+                members: vec!["Erik".into()],
+            },
+        ],
+        text: vec![
+            state::TextChannel {
+                name: "general".into(),
+                author: "Peter Salanki".into(),
+                preview: "anyone around to test the build?".into(),
+                rel: "4m".into(),
+                unread: true,
+            },
+            state::TextChannel {
+                name: "dev".into(),
+                author: "Alex".into(),
+                preview: "pushed the fix, CI is green".into(),
+                rel: "1h".into(),
+                unread: false,
+            },
+            state::TextChannel {
+                name: "random".into(),
+                author: "Daniel".into(),
+                preview: "lol 😂".into(),
+                rel: "yd".into(),
+                unread: false,
+            },
+        ],
     };
     // `--compose` previews the inline reply input affordance.
     if compose {

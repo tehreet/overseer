@@ -278,7 +278,8 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
             // its bottom-row burn chart is never the thing that gets clipped.
             Constraint::Max(card_height(&s.messages, s.msg_ui.active)), // [6] iMESSAGE
             Constraint::Max(card_height(&s.signal, false)),             // [7] SIGNAL
-            Constraint::Min(0),     // [8] slack absorbs leftover, keeping cards tight
+            Constraint::Max(discord_height(&s.discord)),                // [8] DISCORD
+            Constraint::Min(0),     // [9] slack absorbs leftover, keeping cards tight
         ])
         .split(body[0]);
 
@@ -290,6 +291,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     weather_panel(f, left[5], s);
     messages_panel(f, left[6], s, t);
     signal_panel(f, left[7], s);
+    discord_panel(f, left[8], s);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
@@ -1545,6 +1547,157 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState) {
             dot,
         ]));
     }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+const DISCORD_MAX_VOICE: usize = 3;
+const DISCORD_MAX_TEXT: usize = 3;
+
+/// Rows the Discord card needs: occupied voice channels (collapsed entirely when
+/// none), an optional separator, then recent text channels — plus borders.
+fn discord_height(d: &crate::state::Discord) -> u16 {
+    if !d.fresh || !d.available {
+        return 4; // gate message
+    }
+    let v = d.voice.len().min(DISCORD_MAX_VOICE);
+    let tx = d.text.len().min(DISCORD_MAX_TEXT);
+    let sep = if v > 0 && tx > 0 { 1 } else { 0 };
+    2 + (v + sep + tx).max(1) as u16
+}
+
+/// DISCORD card: occupied voice channels (each with its members; the whole voice
+/// block collapses when everyone's disconnected) above a few recent text channels
+/// rendered iMessage/Signal-style (channel · "author: last message" · rel · dot).
+fn discord_panel(f: &mut Frame, area: Rect, s: &AppState) {
+    let d = &s.discord;
+    let in_voice: usize = d.voice.iter().map(|v| v.members.len()).sum();
+    let unread_text = d.text.iter().filter(|t| t.unread).count();
+
+    // ----- title with voice / unread badge -----
+    let mut title_spans = vec![Span::styled(
+        " DISCORD ",
+        Style::default().fg(c::ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    if d.available && d.fresh {
+        if in_voice > 0 {
+            title_spans.push(Span::styled(" 🔊 ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(
+                format!("{in_voice}"),
+                Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD),
+            ));
+            title_spans.push(Span::styled(" in voice ", Style::default().fg(c::DIM)));
+        } else if unread_text > 0 {
+            title_spans.push(Span::styled(" ● ", Style::default().fg(c::PINK).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled(
+                format!("{unread_text}"),
+                Style::default().fg(c::PINK).add_modifier(Modifier::BOLD),
+            ));
+            title_spans.push(Span::styled(" unread ", Style::default().fg(c::DIM)));
+        } else {
+            title_spans.push(Span::styled(" ✓ ", Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)));
+            title_spans.push(Span::styled("idle ", Style::default().fg(c::DIM)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER))
+        .title(Line::from(title_spans))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 2 || inner.width < 10 {
+        return;
+    }
+
+    // ----- gating -----
+    if !d.fresh {
+        f.render_widget(
+            Paragraph::new(Span::styled("connecting to Discord…", Style::default().fg(c::DIM))),
+            inner,
+        );
+        return;
+    }
+    if !d.available {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("✉  Discord not configured", Style::default().fg(c::DIM))),
+                Line::from(Span::styled(
+                    "add bot token to Keychain",
+                    Style::default().fg(c::FAINT),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    }
+    if d.voice.is_empty() && d.text.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("✉  all quiet", Style::default().fg(c::FAINT)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let iw = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ----- voice section (occupied channels only; collapsed when empty) -----
+    for vc in d.voice.iter().take(DISCORD_MAX_VOICE) {
+        let head = format!("🔊 {}  ", vc.name);
+        let members = vc.members.join(", ");
+        let budget = iw.saturating_sub(dwidth(&head));
+        lines.push(Line::from(vec![
+            Span::styled(head, Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(fit_width(&members, budget), Style::default().fg(c::DIM)),
+        ]));
+    }
+
+    // ----- separator between voice and text -----
+    if !d.voice.is_empty() && !d.text.is_empty() {
+        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
+    }
+
+    // ----- text channels (iMessage/Signal row style) -----
+    let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
+    for tc in d.text.iter().take(DISCORD_MAX_TEXT) {
+        let (name_col, prev_col, dot_col) = if tc.unread {
+            (c::TEXT, c::TEXT, c::PINK)
+        } else {
+            (c::DIM, c::FAINT, c::FAINT)
+        };
+        let name = pad_width(&format!("#{}", tc.name), 18);
+        let name_style = if tc.unread {
+            Style::default().fg(name_col).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(name_col)
+        };
+        let body = if tc.author.is_empty() {
+            tc.preview.clone()
+        } else {
+            let who = tc.author.split_whitespace().next().unwrap_or(&tc.author);
+            format!("{who}: {}", tc.preview)
+        };
+        let preview = pad_width(&body, prevw);
+        let dot = if tc.unread {
+            Span::styled(" ●", Style::default().fg(dot_col).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "), // column parity with iMESSAGE/SIGNAL rows
+            Span::styled(name, name_style),
+            Span::raw(" "),
+            Span::styled(preview, Style::default().fg(prev_col)),
+            Span::styled(format!("{:>4}", truncate(&tc.rel, 4)), Style::default().fg(c::FAINT)),
+            dot,
+        ]));
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
 }
 

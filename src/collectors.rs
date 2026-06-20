@@ -1758,3 +1758,347 @@ fn hex_encode(b: &[u8]) -> String {
     }
     s
 }
+
+// ---------------------------------------------------------------------------
+// Discord: live voice presence over the gateway (sync tungstenite, one thread)
+// + recent text channels' last message over REST (another thread). Bot token and
+// guild id live in the Keychain ("studioboard-discord-bot" / "-guild"). Read-only.
+// ---------------------------------------------------------------------------
+
+const DISCORD_INTENTS: u64 = 1 | (1 << 7); // GUILDS | GUILD_VOICE_STATES
+const DISCORD_TEXT_SHOWN: usize = 3; // text channels surfaced on the card
+
+fn discord_token() -> Option<String> {
+    keychain_secret("studioboard-discord-bot")
+}
+fn discord_guild() -> Option<String> {
+    keychain_secret("studioboard-discord-guild")
+}
+fn keychain_secret(service: &str) -> Option<String> {
+    let out = Command::new("security")
+        .args(["find-generic-password", "-ws", service])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+pub fn spawn_discord(shared: Shared) {
+    // Voice presence (gateway) and text channels (REST) run independently.
+    {
+        let sh = shared.clone();
+        thread::spawn(move || discord_text_loop(sh));
+    }
+    thread::spawn(move || discord_voice_loop(shared));
+}
+
+// ----- text channels: poll each accessible channel's latest message over REST --
+
+fn discord_text_loop(shared: Shared) {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(12))
+        .build();
+    loop {
+        let cfg = discord_token().zip(discord_guild());
+        if let Some((tok, guild)) = cfg {
+            if let Some(text) = fetch_text_channels(&agent, &tok, &guild) {
+                let mut s = shared.lock().unwrap();
+                s.discord.text = text;
+                s.discord.fresh = true;
+                s.discord.available = true;
+            }
+        } else {
+            let mut s = shared.lock().unwrap();
+            s.discord.fresh = true;
+            s.discord.available = false;
+        }
+        thread::sleep(Duration::from_secs(15));
+    }
+}
+
+/// The N most-recently-active text channels the bot can read, each with its last
+/// message (author + text). Channels the bot can't see (403) are skipped.
+fn fetch_text_channels(
+    agent: &ureq::Agent,
+    tok: &str,
+    guild: &str,
+) -> Option<Vec<crate::state::TextChannel>> {
+    use crate::state::TextChannel;
+    let auth = format!("Bot {tok}");
+    let chans: serde_json::Value = agent
+        .get(&format!("https://discord.com/api/v10/guilds/{guild}/channels"))
+        .set("Authorization", &auth)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let arr = chans.as_array()?;
+
+    // Text channels (type 0), most-recently-active first by last_message_id.
+    let mut text: Vec<(&serde_json::Value, u64)> = arr
+        .iter()
+        .filter(|c| c["type"].as_u64() == Some(0))
+        .map(|c| {
+            let last = c["last_message_id"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            (c, last)
+        })
+        .filter(|(_, last)| *last > 0)
+        .collect();
+    text.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let now = Local::now().timestamp() as f64;
+    let mut rows: Vec<(f64, TextChannel)> = Vec::new();
+    // Only probe the few most-recent channels — enough to fill the card cheaply.
+    for (c, _) in text.into_iter().take(DISCORD_TEXT_SHOWN + 4) {
+        let cid = c["id"].as_str().unwrap_or("");
+        let name = c["name"].as_str().unwrap_or("?").to_string();
+        let resp = agent
+            .get(&format!("https://discord.com/api/v10/channels/{cid}/messages?limit=1"))
+            .set("Authorization", &auth)
+            .call();
+        let Ok(r) = resp else { continue }; // 403 / no access → skip
+        let Ok(msgs) = r.into_json::<serde_json::Value>() else { continue };
+        let Some(m) = msgs.as_array().and_then(|a| a.first()) else { continue };
+        let author = m["author"]["global_name"]
+            .as_str()
+            .or_else(|| m["author"]["username"].as_str())
+            .unwrap_or("?")
+            .to_string();
+        let raw = m["content"].as_str().unwrap_or("");
+        let preview = if raw.trim().is_empty() {
+            // Empty content = attachment/embed, or the Message Content intent is off.
+            if m["attachments"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                "[attachment]".to_string()
+            } else if m["embeds"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                "[embed]".to_string()
+            } else {
+                "[no message-content access]".to_string()
+            }
+        } else {
+            smart_preview(raw, PREVIEW_BUDGET)
+        };
+        let ts = m["timestamp"]
+            .as_str()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|d| d.timestamp() as f64)
+            .unwrap_or(0.0);
+        rows.push((
+            ts,
+            TextChannel { name, author, preview, rel: fmt_rel((now - ts).max(0.0)), unread: false },
+        ));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Some(rows.into_iter().take(DISCORD_TEXT_SHOWN).map(|(_, r)| r).collect())
+}
+
+// ----- voice presence: a persistent gateway connection -----------------------
+
+fn discord_voice_loop(shared: Shared) {
+    loop {
+        let _ = discord_gateway_session(&shared);
+        // Connection dropped — clear stale presence and reconnect after a beat.
+        {
+            let mut s = shared.lock().unwrap();
+            s.discord.voice.clear();
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
+    use std::collections::HashMap;
+    use tungstenite::{connect, Message};
+
+    let tok = discord_token().ok_or("no token")?;
+    let guild = discord_guild().ok_or("no guild")?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let (mut sock, _resp) =
+        connect("wss://gateway.discord.gg/?v=10&encoding=json").map_err(|e| e.to_string())?;
+
+    // Timeout reads so the heartbeat can fire even when no events are arriving.
+    if let tungstenite::stream::MaybeTlsStream::Rustls(s) = sock.get_mut() {
+        let _ = s.sock.set_read_timeout(Some(Duration::from_millis(800)));
+    }
+
+    let mut hb_interval = Duration::from_secs(41);
+    let mut last_hb = Instant::now();
+    let mut seq: Option<u64> = None;
+    // voice presence: user_id -> channel_id
+    let mut who: HashMap<String, String> = HashMap::new();
+    // voice channel id -> name
+    let mut chan: HashMap<String, String> = HashMap::new();
+    // user_id -> display name (cached; resolved from the event's member object, or
+    // a REST lookup when GUILD_CREATE voice states omit it).
+    let mut names: HashMap<String, String> = HashMap::new();
+
+    loop {
+        if last_hb.elapsed() >= hb_interval {
+            let hb = serde_json::json!({ "op": 1, "d": seq });
+            sock.send(Message::Text(hb.to_string().into())).map_err(|e| e.to_string())?;
+            last_hb = Instant::now();
+        }
+
+        let txt = match sock.read() {
+            Ok(Message::Text(t)) => t.to_string(),
+            Ok(Message::Close(_)) => return Err("closed".into()),
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let v: serde_json::Value = match serde_json::from_str(&txt) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(s) = v["s"].as_u64() {
+            seq = Some(s);
+        }
+        match v["op"].as_u64() {
+            Some(10) => {
+                // HELLO → adopt heartbeat interval, identify.
+                if let Some(ms) = v["d"]["heartbeat_interval"].as_u64() {
+                    hb_interval = Duration::from_millis(ms);
+                }
+                let identify = serde_json::json!({
+                    "op": 2,
+                    "d": {
+                        "token": tok,
+                        "intents": DISCORD_INTENTS,
+                        "properties": {"os":"macos","browser":"studioboard","device":"studioboard"}
+                    }
+                });
+                sock.send(Message::Text(identify.to_string().into())).map_err(|e| e.to_string())?;
+                last_hb = Instant::now();
+            }
+            Some(1) => {
+                // Server asked us to heartbeat immediately.
+                let hb = serde_json::json!({ "op": 1, "d": seq });
+                sock.send(Message::Text(hb.to_string().into())).map_err(|e| e.to_string())?;
+                last_hb = Instant::now();
+            }
+            Some(7) | Some(9) => return Err("reconnect requested".into()),
+            Some(0) => match v["t"].as_str().unwrap_or("") {
+                "READY" => {
+                    let mut s = shared.lock().unwrap();
+                    s.discord.fresh = true;
+                    s.discord.available = true;
+                }
+                "GUILD_CREATE" if v["d"]["id"].as_str() == Some(guild.as_str()) => {
+                    chan.clear();
+                    who.clear();
+                    if let Some(chs) = v["d"]["channels"].as_array() {
+                        for c in chs {
+                            if c["type"].as_u64() == Some(2) {
+                                chan.insert(
+                                    c["id"].as_str().unwrap_or("").to_string(),
+                                    c["name"].as_str().unwrap_or("?").to_string(),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(states) = v["d"]["voice_states"].as_array() {
+                        for st in states {
+                            apply_voice_state(&mut who, &mut names, st);
+                        }
+                    }
+                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild);
+                }
+                "VOICE_STATE_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
+                    apply_voice_state(&mut who, &mut names, &v["d"]);
+                    publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Fold one voice state into the user→channel map (channel_id null ⇒ disconnected).
+/// Caches the display name when the event carries a `member` object (VOICE_STATE_
+/// UPDATE does; the GUILD_CREATE snapshot usually doesn't — resolved later by REST).
+fn apply_voice_state(
+    who: &mut std::collections::HashMap<String, String>,
+    names: &mut std::collections::HashMap<String, String>,
+    st: &serde_json::Value,
+) {
+    let Some(uid) = st["user_id"].as_str() else { return };
+    if let Some(n) = member_display_name(&st["member"]) {
+        names.insert(uid.to_string(), n);
+    }
+    match st["channel_id"].as_str() {
+        Some(cid) if !cid.is_empty() => {
+            who.insert(uid.to_string(), cid.to_string());
+        }
+        _ => {
+            who.remove(uid);
+        }
+    }
+}
+
+/// Display name from a member object: server nick › global name › username.
+fn member_display_name(member: &serde_json::Value) -> Option<String> {
+    member["nick"]
+        .as_str()
+        .or_else(|| member["user"]["global_name"].as_str())
+        .or_else(|| member["user"]["username"].as_str())
+        .map(|s| s.to_string())
+}
+
+/// Rebuild the card's occupied-voice-channel list, resolving any unknown member
+/// names via a cached REST lookup (works without the privileged Members intent).
+fn publish_voice(
+    shared: &Shared,
+    who: &std::collections::HashMap<String, String>,
+    chan: &std::collections::HashMap<String, String>,
+    names: &mut std::collections::HashMap<String, String>,
+    agent: &ureq::Agent,
+    tok: &str,
+    guild: &str,
+) {
+    use crate::state::VoiceChannel;
+    use std::collections::BTreeMap;
+    // Group members by channel, ordered by channel name for stable rendering.
+    let mut by_chan: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (uid, cid) in who.iter() {
+        if !names.contains_key(uid) {
+            if let Some(n) = fetch_member_name(agent, tok, guild, uid) {
+                names.insert(uid.clone(), n);
+            }
+        }
+        let who_name = names.get(uid).cloned().unwrap_or_else(|| "someone".to_string());
+        let cname = chan.get(cid).cloned().unwrap_or_else(|| "voice".to_string());
+        by_chan.entry(cname).or_default().push(who_name);
+    }
+    let voice: Vec<VoiceChannel> = by_chan
+        .into_iter()
+        .map(|(name, mut members)| {
+            members.sort();
+            VoiceChannel { name, members }
+        })
+        .collect();
+    let mut s = shared.lock().unwrap();
+    s.discord.voice = voice;
+}
+
+/// REST: GET /guilds/{guild}/members/{uid} → display name. None on any failure.
+fn fetch_member_name(agent: &ureq::Agent, tok: &str, guild: &str, uid: &str) -> Option<String> {
+    let v: serde_json::Value = agent
+        .get(&format!("https://discord.com/api/v10/guilds/{guild}/members/{uid}"))
+        .set("Authorization", &format!("Bot {tok}"))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    member_display_name(&v)
+}

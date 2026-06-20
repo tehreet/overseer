@@ -247,6 +247,33 @@ pub struct MessageItem {
     pub is_shortcode: bool,  // 5-6 digit shortcode (e.g. 32665) — excluded from badge
 }
 
+/// One Discord voice channel that currently has at least one person in it.
+#[derive(Clone, Default)]
+pub struct VoiceChannel {
+    pub name: String,          // channel name (no leading glyph)
+    pub members: Vec<String>,  // display names currently connected
+}
+
+/// One Discord text channel row (newest-active first), iMessage/Signal-style.
+#[derive(Clone, Default)]
+pub struct TextChannel {
+    pub name: String,     // channel name (rendered with a leading '#')
+    pub author: String,   // last message author's display name
+    pub preview: String,  // last message text, flattened
+    pub rel: String,      // "2m" "1h" "yesterday"
+    pub unread: bool,     // channel has unread messages for the bot
+}
+
+/// Discord card data (written by the spawn_discord collector). Voice presence
+/// arrives over the gateway; text channels' last messages are polled over REST.
+#[derive(Clone, Default)]
+pub struct Discord {
+    pub fresh: bool,                 // first poll/connect completed
+    pub available: bool,             // bot token present + gateway/REST reachable
+    pub voice: Vec<VoiceChannel>,    // only channels with someone in them (else empty)
+    pub text: Vec<TextChannel>,      // recent text channels w/ last message
+}
+
 /// iMessage card data (written by the spawn_messages collector).
 #[derive(Clone, Default)]
 pub struct Messages {
@@ -363,6 +390,7 @@ pub struct AppState {
     pub messages: Messages,
     pub msg_ui: MsgUi,
     pub signal: Messages, // Signal Desktop conversations (read-only; reuses Messages shape)
+    pub discord: Discord, // Discord voice presence + recent text channels
     pub cpu_hist: History,
     pub gpu_hist: History,
     pub power_hist: History,
@@ -388,6 +416,7 @@ impl Default for AppState {
             messages: Messages::default(),
             msg_ui: MsgUi::default(),
             signal: Messages::default(),
+            discord: Discord::default(),
             cpu_hist: History::new(120),
             gpu_hist: History::new(120),
             power_hist: History::new(120),
