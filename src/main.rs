@@ -32,6 +32,10 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--diag") {
         return diag();
     }
+    if args.iter().any(|a| a == "--diag-msg") {
+        collectors::diag_messages();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--facts") {
         return facts_diag();
     }

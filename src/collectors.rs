@@ -1502,6 +1502,67 @@ pub fn spawn_messages(shared: Shared) {
     });
 }
 
+/// `--diag-msg`: exercise the real iMessage path (contacts + query + parse +
+/// contact filter) and print exactly where it breaks — so a frozen card can be
+/// told apart from "query errored on this schema", "no contacts loaded", or
+/// "rows returned but everything got filtered out".
+pub fn diag_messages() {
+    let Some(home) = dirs::home_dir() else {
+        println!("no home dir");
+        return;
+    };
+    let db = home.join("Library/Messages/chat.db");
+    let uri = format!("file:{}?immutable=1", db.display());
+    println!("studioboard --diag-msg\n");
+    println!("chat.db: {}", db.display());
+
+    // 1) Raw query: does MSG_SQL run against THIS chat.db schema at all?
+    match Command::new("sqlite3")
+        .args(["-separator", "\t", "-newline", "\n", &uri, MSG_SQL])
+        .output()
+    {
+        Ok(o) => {
+            let rows = String::from_utf8_lossy(&o.stdout).lines().count();
+            let err = String::from_utf8_lossy(&o.stderr);
+            println!("  raw query : ok={}  rows={}", o.status.success(), rows);
+            if !err.trim().is_empty() {
+                println!("  raw stderr: {}", err.trim());
+            }
+        }
+        Err(e) => println!("  raw query : could not run sqlite3: {e}"),
+    }
+
+    // 2) Contacts (AddressBook). Empty => every 1:1 chat is dropped by the filter.
+    let contacts = load_contacts();
+    println!("\ncontacts loaded: {}", contacts.len());
+    for (k, v) in contacts.iter().take(3) {
+        println!("  {k} -> {v}");
+    }
+
+    // 3) Full path: query + parse + contact filter (what the card actually shows).
+    match read_messages(&uri, &contacts) {
+        Some((items, unread)) => {
+            println!("\nread_messages: {} shown, badge unread={}", items.len(), unread);
+            for it in &items {
+                println!(
+                    "  [{}] {} — {}",
+                    if it.unread { "•" } else { " " },
+                    it.sender,
+                    it.preview
+                );
+            }
+            if items.is_empty() {
+                println!("  → rows returned but ALL were filtered out: no 1:1 chat resolved to a");
+                println!("    contact, and no named group chats. (contacts unreadable, or the");
+                println!("    contacts-only filter is too strict for your inbox.)");
+            }
+        }
+        None => {
+            println!("\nread_messages: None — query failed or chat.db unreadable (see raw stderr).")
+        }
+    }
+}
+
 /// Run the conversation query; return (items newest-active-first, unread_count).
 /// `contacts` maps normalized handles → display names (empty if no AddressBook
 /// access). None if chat.db can't be read so the panel shows a graceful hint.
