@@ -1530,18 +1530,40 @@ fn weather_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
     let mut lines: Vec<Line> = vec![big, detail, atmos];
 
-    // bottom row: location flush-left, hourly temp strip (next ~12h of forecast
-    // temps, jazz-colored) flush-right on the same line — preceded by one blank
-    // line so it sits pinned to the card's bottom edge.
-    let remaining = iw.saturating_sub(w.location.chars().count());
-    let mut bottom = vec![Span::styled(w.location.clone(), Style::default().fg(c::FAINT))];
-    if !w.temp_strip.is_empty() && remaining > 0 {
-        bottom.extend(jazz_spark(&w.temp_strip, remaining));
+    // bottom: hourly temp chart (next ~12h of forecast temps, jazz-colored). It's
+    // grown to fill the card's dead space — full inner width and as many rows tall
+    // as the card has left over (up to 3) — with the location label flush-left on
+    // the chart's top row. Falls back to the slim single-row strip when the card is
+    // too short to give the chart its own rows.
+    let chart_h = h.saturating_sub(3); // rows left below the three info rows
+    if chart_h >= 2 && !w.temp_strip.is_empty() && iw > 0 {
+        let loc_w = w.location.chars().count() + 1; // label + a space gutter
+        for (i, row) in jazz_spark_rows(&w.temp_strip, iw, chart_h).into_iter().enumerate() {
+            // Overlay the location label onto the chart's first row so the chart
+            // still owns the full width on the rows beneath it.
+            if i == 0 && loc_w < iw {
+                let mut spans = vec![
+                    Span::styled(w.location.clone(), Style::default().fg(c::FAINT)),
+                    Span::raw(" "),
+                ];
+                spans.extend(row.into_iter().skip(loc_w));
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(Line::from(row));
+            }
+        }
+    } else {
+        // Tight fallback: location flush-left, single-row strip flush-right.
+        let remaining = iw.saturating_sub(w.location.chars().count());
+        let mut bottom = vec![Span::styled(w.location.clone(), Style::default().fg(c::FAINT))];
+        if !w.temp_strip.is_empty() && remaining > 0 {
+            bottom.extend(jazz_spark(&w.temp_strip, remaining));
+        }
+        if h > 3 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(bottom));
     }
-    if h > 3 {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(bottom));
 
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2570,6 +2592,45 @@ fn jazz_spark(data: &[u64], width: usize) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+/// Multi-row jazz sparkline: like `jazz_spark` but `rows` cells tall, so the bar
+/// for each sample rises across several text rows for a bigger, easier-to-read
+/// chart. Returns one span-row per chart row, top-to-bottom, each `width` wide.
+/// Each data point is stretched ~2 columns wide so the chart spans the full card.
+fn jazz_spark_rows(data: &[u64], width: usize, rows: usize) -> Vec<Vec<Span<'static>>> {
+    let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let rows = rows.max(1);
+    if data.is_empty() || width == 0 {
+        return vec![vec![Span::raw(" ".repeat(width))]; rows];
+    }
+    // Stretch the samples so the chart fills the full width (≥1 column each).
+    let mut cols: Vec<u64> = Vec::with_capacity(width);
+    for i in 0..width {
+        let idx = i * data.len() / width;
+        cols.push(data[idx.min(data.len() - 1)]);
+    }
+    let max = cols.iter().copied().max().unwrap_or(1).max(1);
+    let steps = rows * 8; // total sub-cell resolution across the column
+    let mut out: Vec<Vec<Span>> = Vec::with_capacity(rows);
+    for r in 0..rows {
+        // Row 0 is the top of the chart; the bottom row is the base of the bars.
+        let from_bottom = rows - 1 - r;
+        let mut spans: Vec<Span> = Vec::with_capacity(width);
+        for &v in &cols {
+            let frac = (v as f32 / max as f32).clamp(0.0, 1.0);
+            let filled = (frac * steps as f32).round() as usize;
+            let cell = filled.saturating_sub(from_bottom * 8).min(8);
+            let ch = glyphs[cell];
+            if ch == ' ' {
+                spans.push(Span::raw(" "));
+            } else {
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(c::jazz(frac))));
+            }
+        }
+        out.push(spans);
+    }
+    out
 }
 
 // --- formatting helpers ----------------------------------------------------
