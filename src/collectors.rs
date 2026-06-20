@@ -55,6 +55,19 @@ pub fn spawn_system(shared: Shared) {
                 }
             }
 
+            // Disk I/O rate: sum per-process read+written deltas since the last
+            // process refresh (macOS doesn't surface reliable per-disk counters,
+            // but every process carries its own usage delta). bytes → bytes/sec.
+            let disk_bytes: u64 = sys
+                .processes()
+                .values()
+                .map(|p| {
+                    let u = p.disk_usage();
+                    u.read_bytes + u.written_bytes
+                })
+                .sum();
+            let disk_io_bps = disk_bytes as f64 / dt;
+
             let per_core: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
             let overall = sys.global_cpu_usage();
             let load = System::load_average();
@@ -112,6 +125,21 @@ pub fn spawn_system(shared: Shared) {
                 }
                 s.net_rx_hist.push((rx_bps / 1024.0) as u64);
                 s.net_tx_hist.push((tx_bps / 1024.0) as u64);
+                // Bands of the MEM·DISK·NET wave: memory used %, disk I/O (KB/s),
+                // disk free %. Pushed every tick so the wave scrolls in lockstep.
+                let mem_pct = if s.system.mem_total > 0 {
+                    (s.system.mem_used as f64 / s.system.mem_total as f64 * 100.0) as u64
+                } else {
+                    0
+                };
+                let free_pct = if d_total > 0 {
+                    (d_avail as f64 / d_total as f64 * 100.0) as u64
+                } else {
+                    0
+                };
+                s.mem_hist.push(mem_pct);
+                s.disk_io_hist.push((disk_io_bps / 1024.0) as u64);
+                s.disk_free_hist.push(free_pct);
                 // If macmon isn't feeding silicon CPU%, mirror sysinfo's.
                 if !s.silicon.fresh {
                     s.cpu_hist.push(overall as u64);

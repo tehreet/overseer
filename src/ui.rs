@@ -184,6 +184,120 @@ fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// One band of the stacked multi-area wave: a label hue + a per-column 0..1 series.
+struct Band {
+    color: ratatui::style::Color,
+    vals: Vec<f32>, // normalized 0..1, oldest→newest, one per plot column
+}
+
+/// Render a tall, buttery **stacked** area wave — every shade is a live metric.
+/// The bands pile bottom-to-top: each column's bands are summed, so the wave's
+/// height is the whole system's combined IO/memory pressure, and each coloured
+/// shade you see is the thickness of one real series. Within a band the fill
+/// glides dim→vivid toward its own crest, and band boundaries use 1/8 vertical
+/// blocks so the seams between shades are sub-cell smooth, never stair-stepped.
+fn multi_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
+    use ratatui::style::Color;
+    let w = area.width as usize;
+    let h = area.height as usize;
+    if w == 0 || h == 0 || bands.is_empty() {
+        return;
+    }
+    // Blur each band so bursty signals (disk I/O, net) read as one buttery curve.
+    let bands: Vec<Band> = bands
+        .iter()
+        .map(|b| Band { color: b.color, vals: smoothed(&b.vals, 2, 4) })
+        .collect();
+    // Per-column cumulative band tops (in 0..1 stacked units) so we can find which
+    // band a given sub-cell height lands in. The total is normalized so the tallest
+    // column just kisses the top of the plot — the wave always fills the stage.
+    let n_bands = bands.len();
+    let mut totals = vec![0.0f32; w];
+    for x in 0..w {
+        for b in &bands {
+            totals[x] += b.vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        }
+    }
+    let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.6);
+    let scale = (n_bands as f32 * 0.85) / peak; // headroom so crests don't clip flat
+
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    for row in 0..h {
+        let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_col: Option<Color> = None;
+        for x in 0..w {
+            // Walk the stacked bands bottom-up, accumulating filled height (in rows)
+            // until we reach the cell this row covers; the band straddling it wins.
+            let mut acc = 0.0f32; // filled height so far, in rows
+            let mut ch = ' ';
+            let mut col: Option<Color> = None;
+            for b in &bands {
+                let bv = b.vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                let band_rows = bv * scale * h as f32 / n_bands as f32;
+                let top = acc + band_rows;
+                if top > r_bot && band_rows > 0.0 {
+                    // This band covers (at least part of) this cell's row.
+                    let fill_to = top.min(r_bot + 1.0);
+                    let frac = (fill_to - r_bot).clamp(0.0, 1.0);
+                    ch = if frac >= 0.999 { '█' } else { c::vblock(frac) };
+                    // Brighten toward the band's own crest for that synthwave glow.
+                    let local = ((top - r_bot) / band_rows.max(1e-3)).clamp(0.0, 1.0);
+                    col = Some(c::blend(c::BG, b.color, 0.30 + 0.70 * local));
+                    break;
+                }
+                acc = top;
+            }
+            if col == run_col {
+                run.push(ch);
+            } else {
+                if !run.is_empty() {
+                    let prev = std::mem::take(&mut run);
+                    spans.push(match run_col {
+                        Some(c) => Span::styled(prev, Style::default().fg(c)),
+                        None => Span::raw(prev),
+                    });
+                }
+                run.push(ch);
+                run_col = col;
+            }
+        }
+        if !run.is_empty() {
+            spans.push(match run_col {
+                Some(c) => Span::styled(run, Style::default().fg(c)),
+                None => Span::raw(run),
+            });
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build a `w`-wide 0..1 column series from a History ring buffer (newest at the
+/// right), stretching the samples to fill the width and normalizing through
+/// `norm`. The wave bands are sourced from History (not the EQ sample buffers),
+/// so this keeps them scrolling in lockstep at the collector's 1 Hz cadence.
+fn hist_series(data: &[u64], w: usize, norm: impl Fn(f32) -> f32) -> Vec<f32> {
+    if w == 0 {
+        return Vec::new();
+    }
+    if data.is_empty() {
+        return vec![0.0; w];
+    }
+    let slice: Vec<u64> = data.iter().rev().take(w).rev().copied().collect();
+    let lead = w.saturating_sub(slice.len());
+    (0..w)
+        .map(|x| {
+            if x < lead {
+                0.0
+            } else {
+                norm(slice[x - lead] as f32)
+            }
+        })
+        .collect()
+}
+
 /// Scalar version of the delayed Catmull-Rom interpolation (for net energy).
 fn sampled_scalar(samples: &VecDeque<(Instant, f32)>, target: Instant) -> f32 {
     let m = samples.len();
@@ -856,50 +970,65 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
         0.0
     };
     let iw = inner.width as usize;
-    let bw = iw.saturating_sub(30).clamp(8, 32);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    let mut mem_line = vec![Span::styled("mem  ", Style::default().fg(c::DIM))];
-    mem_line.extend(bar_spans(memf, bw, c::jazz(memf)));
-    mem_line.push(Span::styled(
-        format!(" {:>3.0}%  {} / {}", memf * 100.0, fmt_bytes(s.system.mem_used), fmt_bytes(s.system.mem_total)),
-        Style::default().fg(c::TEXT),
-    ));
-    lines.push(Line::from(mem_line));
-    let mut disk_line = vec![Span::styled("disk ", Style::default().fg(c::DIM))];
-    disk_line.extend(bar_spans(diskf, bw, c::jazz(diskf)));
-    disk_line.push(Span::styled(
-        format!(" {:>3.0}%  {} / {}", diskf * 100.0, fmt_bytes(s.system.disk_used), fmt_bytes(s.system.disk_total)),
-        Style::default().fg(c::TEXT),
-    ));
-    lines.push(Line::from(disk_line));
-    lines.push(Line::from(vec![
-        Span::styled("net  ", Style::default().fg(c::DIM)),
-        Span::styled("▼ ", Style::default().fg(c::CYAN)),
-        Span::styled(format!("{:>10}", fmt_rate(s.system.net_rx_bps)), Style::default().fg(c::CYAN)),
-        Span::styled("    ▲ ", Style::default().fg(c::PINK)),
-        Span::styled(format!("{:>10}", fmt_rate(s.system.net_tx_bps)), Style::default().fg(c::PINK)),
-    ]));
+    // --- Top line: MEM and DISK as two small, tidy bars sharing one row. ------
+    // Split the width in half; each half gets a label, a compact bar, and a %.
+    let half = iw / 2;
+    let mbw = half.saturating_sub(11).clamp(5, 16); // leaves "mem " + " 88%"
+    let dbw = (iw - half).saturating_sub(11).clamp(5, 16);
+    let mut top = vec![Span::styled("mem ", Style::default().fg(c::DIM))];
+    top.extend(bar_spans(memf, mbw, c::jazz(memf)));
+    top.push(Span::styled(format!(" {:>3.0}%  ", memf * 100.0), Style::default().fg(c::TEXT)));
+    top.push(Span::styled("disk ", Style::default().fg(c::DIM)));
+    top.extend(bar_spans(diskf, dbw, c::jazz(diskf)));
+    top.push(Span::styled(format!(" {:>3.0}%", diskf * 100.0), Style::default().fg(c::TEXT)));
 
-    // Top rows: the mem/disk/net text. Bottom rows: a real, continuously-
-    // scrolling area graph of total throughput (delay-interpolated, log-scaled
-    // ~1 KB/s..10 MB/s). Honest data, frame-smooth motion.
+    // Bands of the wave — each shade is a live metric. Colours walk the synthwave
+    // ramp so the stack reads cyan→green→violet→pink→white bottom-to-top.
+    let bands = [
+        (c::CYAN, "net▼"),   // network down
+        (c::GREEN, "disk○"), // disk free space
+        (c::ACCENT, "mem"),  // memory used
+        (c::YELLOW, "io"),   // disk I/O
+        (c::PINK, "net▲"),   // network up
+    ];
+
+    // Gap line: a hair of vertical space + a tiny colour-keyed legend so each
+    // shade in the wave below is identifiable at a glance (no numbers — the wave
+    // is the show). Rendered dim and small so the bars and wave dominate.
+    let mut legend = Vec::with_capacity(bands.len() * 2);
+    for (i, (col, name)) in bands.iter().enumerate() {
+        if i > 0 {
+            legend.push(Span::styled(" ", Style::default().fg(c::DIM)));
+        }
+        legend.push(Span::styled("▰", Style::default().fg(*col)));
+        legend.push(Span::styled(*name, Style::default().fg(c::DIM)));
+    }
+
+    let lines = vec![Line::from(top), Line::from(legend)];
     let text_h = lines.len() as u16;
     f.render_widget(
         Paragraph::new(lines),
         Rect { x: inner.x, y: inner.y, width: inner.width, height: text_h },
     );
 
+    // --- The wave: BIG. It owns every remaining row of the card. Five stacked,
+    // shaded bands each encode a real, live series. Bursty signals are log-scaled
+    // so a quiet system still shows texture and a busy one doesn't peg flat. ---
     let plot_h = inner.height.saturating_sub(text_h);
     if plot_h >= 1 {
         let plot = Rect { x: inner.x, y: inner.y + text_h, width: inner.width, height: plot_h };
-        let vals = series(
-            &s.net_samples,
-            plot.width as usize,
-            sampled_scalar,
-            |bps| ((bps.max(1.0).log10() - 3.0) / 4.0).clamp(0.0, 1.0),
-        );
-        area_graph(f, plot, &vals, Fill::Jazz);
+        let pw = plot.width as usize;
+        // log10 ~1 KB/s..10 MB/s → 0..1, matching the old net wave's scaling.
+        let lograte = |kbps: f32| ((kbps.max(0.5).log10() + 0.0) / 4.0).clamp(0.0, 1.0);
+        let plot_bands = vec![
+            Band { color: bands[0].0, vals: hist_series(&s.net_rx_hist.data, pw, lograte) },
+            Band { color: bands[1].0, vals: hist_series(&s.disk_free_hist.data, pw, |p| (p / 100.0).clamp(0.0, 1.0)) },
+            Band { color: bands[2].0, vals: hist_series(&s.mem_hist.data, pw, |p| (p / 100.0).clamp(0.0, 1.0)) },
+            Band { color: bands[3].0, vals: hist_series(&s.disk_io_hist.data, pw, lograte) },
+            Band { color: bands[4].0, vals: hist_series(&s.net_tx_hist.data, pw, lograte) },
+        ];
+        multi_area_graph(f, plot, &plot_bands);
     }
 }
 

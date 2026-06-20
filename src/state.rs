@@ -506,6 +506,12 @@ pub struct AppState {
     pub power_hist: History,
     pub net_rx_hist: History,
     pub net_tx_hist: History,
+    /// Memory-used percent (0..100) history — a band of the MEM·DISK·NET wave.
+    pub mem_hist: History,
+    /// Disk I/O rate (KB/s, read+written across all procs) — a wave band.
+    pub disk_io_hist: History,
+    /// Disk free space (percent of root, 0..100) — a wave band.
+    pub disk_free_hist: History,
     pub started: Instant,
 }
 
@@ -538,6 +544,9 @@ impl Default for AppState {
             power_hist: History::new(120),
             net_rx_hist: History::new(120),
             net_tx_hist: History::new(120),
+            mem_hist: History::new(120),
+            disk_io_hist: History::new(120),
+            disk_free_hist: History::new(120),
             started: Instant::now(),
         }
     }

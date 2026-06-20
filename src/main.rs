@@ -565,6 +565,17 @@ fn sample_data(st: &mut AppState, compose: bool) {
         st.gpu_hist.push((*v as f64 * 0.6) as u64);
         st.power_hist.push((*v as f64 * 0.8) as u64);
     }
+    // Seed the MEM·DISK·NET wave bands (KB/s for net + disk-IO, % for mem/free)
+    // with gently-varying history so visual-verify shows the multi-band wave.
+    for k in 0..64u32 {
+        let ph = k as f32 * 0.28;
+        let wob = |amp: f32, off: f32| (amp * (ph + off).sin().abs()).max(0.0);
+        st.net_rx_hist.push((400.0 + wob(2200.0, 0.0)) as u64);  // KB/s down
+        st.net_tx_hist.push((40.0 + wob(260.0, 1.7)) as u64);    // KB/s up
+        st.disk_io_hist.push((30.0 + wob(9000.0, 0.9)) as u64);  // KB/s disk I/O
+        st.mem_hist.push((62.0 + 6.0 * (ph * 0.7).sin()) as u64); // mem used %
+        st.disk_free_hist.push((39.0 + 2.0 * (ph * 0.5).sin()) as u64); // free %
+    }
     st.silicon = SiliconStats {
         fresh: true,
         cpu_pct: 37.0,
