@@ -2767,11 +2767,62 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
     // a REST lookup when GUILD_CREATE voice states omit it).
     let mut names: HashMap<String, String> = HashMap::new();
 
+    // Opt-in voice "who's talking" detection. To receive Discord's per-user
+    // Speaking events the bot has to JOIN the voice channel (so it shows up in
+    // voice) — off unless STUDIOBOARD_DISCORD_VOICE_LISTEN is set. We then track
+    // our own session + the voice server creds and run a side voice-WS thread.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listen = std::env::var("STUDIOBOARD_DISCORD_VOICE_LISTEN")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let mut bot_id: Option<String> = None;
+    let mut voice_session: Option<String> = None; // our session_id (from our VOICE_STATE_UPDATE)
+    let mut voice_server: Option<(String, String)> = None; // (token, endpoint) from VOICE_SERVER_UPDATE
+    let mut joined_channel: Option<String> = None; // channel we've asked to join
+    let mut voice_alive: Option<Arc<AtomicBool>> = None; // kill-switch for the voice thread
+
     loop {
         if last_hb.elapsed() >= hb_interval {
             let hb = serde_json::json!({ "op": 1, "d": seq });
             sock.send(Message::Text(hb.to_string().into())).map_err(|e| e.to_string())?;
             last_hb = Instant::now();
+        }
+
+        // Maintain the voice join: hop to the busiest allowlisted channel that has
+        // people, leave when it empties. Then, once we hold our session + the voice
+        // server creds, (re)spawn the voice-WS listener.
+        if listen {
+            let target = voice_target(&who, &chan, &bot_id);
+            if target != joined_channel {
+                let join = serde_json::json!({
+                    "op": 4,
+                    "d": { "guild_id": guild, "channel_id": target, "self_mute": true, "self_deaf": true }
+                });
+                let _ = sock.send(Message::Text(join.to_string().into()));
+                joined_channel = target.clone();
+                if target.is_none() {
+                    if let Some(a) = voice_alive.take() {
+                        a.store(false, Ordering::Relaxed);
+                    }
+                    voice_session = None;
+                    voice_server = None;
+                    if let Ok(mut s) = shared.lock() {
+                        s.discord.voice_speaking = false;
+                    }
+                }
+            }
+            if joined_channel.is_some() && bot_id.is_some() && voice_session.is_some() && voice_server.is_some()
+            {
+                if let Some(a) = voice_alive.take() {
+                    a.store(false, Ordering::Relaxed);
+                }
+                let alive = Arc::new(AtomicBool::new(true));
+                voice_alive = Some(alive.clone());
+                let (tok_v, ep) = voice_server.take().unwrap();
+                let (sid, bid, sess, sh) =
+                    (guild.clone(), bot_id.clone().unwrap(), voice_session.clone().unwrap(), shared.clone());
+                thread::spawn(move || discord_voice_ws(ep, tok_v, sid, bid, sess, sh, alive));
+            }
         }
 
         let txt = match sock.read() {
@@ -2818,6 +2869,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
             Some(7) | Some(9) => return Err("reconnect requested".into()),
             Some(0) => match v["t"].as_str().unwrap_or("") {
                 "READY" => {
+                    bot_id = v["d"]["user"]["id"].as_str().map(|s| s.to_string());
                     let mut s = shared.lock().unwrap();
                     s.discord.fresh = true;
                     s.discord.available = true;
@@ -2837,12 +2889,33 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     }
                     if let Some(states) = v["d"]["voice_states"].as_array() {
                         for st in states {
+                            // Never list the bot itself as a voice member.
+                            if st["user_id"].as_str() == bot_id.as_deref() {
+                                continue;
+                            }
                             apply_voice_state(&mut who, &mut names, st);
                         }
                     }
                     publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild, false);
                 }
+                "VOICE_SERVER_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
+                    // Endpoint + token for the voice WS handshake (arrives after we
+                    // send the op4 join). The loop top spawns the listener.
+                    let ep = v["d"]["endpoint"].as_str().unwrap_or("").to_string();
+                    let vt = v["d"]["token"].as_str().unwrap_or("").to_string();
+                    if !ep.is_empty() {
+                        voice_server = Some((vt, ep));
+                    }
+                }
                 "VOICE_STATE_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
+                    if v["d"]["user_id"].as_str() == bot_id.as_deref() {
+                        // Our own state → capture the session_id for the voice WS;
+                        // don't add the bot to the presence list.
+                        if let Some(sess) = v["d"]["session_id"].as_str() {
+                            voice_session = Some(sess.to_string());
+                        }
+                        continue;
+                    }
                     apply_voice_state(&mut who, &mut names, &v["d"]);
                     publish_voice(shared, &who, &chan, &mut names, &agent, &tok, &guild, true);
                 }
@@ -2851,6 +2924,176 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
             _ => {}
         }
     }
+}
+
+/// Pick the voice channel for the bot to sit in so it can hear who's talking: the
+/// allowlisted channel with the most (non-bot) people. None when none qualify.
+fn voice_target(
+    who: &std::collections::HashMap<String, String>,
+    chan: &std::collections::HashMap<String, String>,
+    bot_id: &Option<String>,
+) -> Option<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (uid, cid) in who {
+        if Some(uid) == bot_id.as_ref() {
+            continue;
+        }
+        let cname = chan.get(cid).map(|s| s.as_str()).unwrap_or("voice");
+        if !name_allowed(DISCORD_VOICE_CHANNELS, cname) {
+            continue;
+        }
+        *counts.entry(cid.clone()).or_default() += 1;
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(cid, _)| cid)
+}
+
+/// Connect to a Discord *voice* websocket and track who's talking. We never send
+/// or receive audio — we just complete the handshake far enough that Discord
+/// streams us op5 Speaking events for the others in the channel, and flip
+/// `discord.voice_speaking` while at least one of them is transmitting. Runs until
+/// the socket drops or `alive` goes false.
+fn discord_voice_ws(
+    endpoint: String,
+    token: String,
+    server_id: String,
+    user_id: String,
+    session_id: String,
+    shared: Shared,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+    use tungstenite::{connect, Message};
+
+    let host = endpoint.split(':').next().unwrap_or(&endpoint).to_string();
+    let Ok((mut sock, _)) = connect(format!("wss://{host}/?v=4")) else {
+        alive.store(false, Ordering::Relaxed);
+        return;
+    };
+    if let tungstenite::stream::MaybeTlsStream::Rustls(s) = sock.get_mut() {
+        let _ = s.sock.set_read_timeout(Some(Duration::from_millis(500)));
+    }
+
+    let set_speaking = |on: bool| {
+        if let Ok(mut s) = shared.lock() {
+            s.discord.voice_speaking = on;
+        }
+    };
+
+    // IDENTIFY right away (also fine to do on HELLO; servers accept either order).
+    let identify = serde_json::json!({
+        "op": 0,
+        "d": { "server_id": server_id, "user_id": user_id, "session_id": session_id, "token": token }
+    });
+    let _ = sock.send(Message::Text(identify.to_string().into()));
+
+    let mut hb_interval = Duration::from_millis(13_750);
+    let mut last_hb = Instant::now();
+    let mut nonce: u64 = 1;
+    let mut talking: HashSet<u64> = HashSet::new(); // SSRCs currently transmitting
+
+    loop {
+        if !alive.load(Ordering::Relaxed) {
+            let _ = sock.close(None);
+            break;
+        }
+        if last_hb.elapsed() >= hb_interval {
+            nonce = nonce.wrapping_add(1);
+            let hb = serde_json::json!({ "op": 3, "d": nonce });
+            if sock.send(Message::Text(hb.to_string().into())).is_err() {
+                break;
+            }
+            last_hb = Instant::now();
+        }
+        let txt = match sock.read() {
+            Ok(Message::Text(t)) => t.to_string(),
+            Ok(Message::Close(_)) => break,
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
+                continue
+            }
+            Err(_) => break,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+            continue;
+        };
+        match v["op"].as_u64() {
+            Some(8) => {
+                if let Some(ms) = v["d"]["heartbeat_interval"].as_u64() {
+                    hb_interval = Duration::from_millis(ms.max(3000));
+                }
+            }
+            Some(2) => {
+                // READY → finish the UDP handshake so Discord keeps streaming us
+                // speaking events (we discard the media path beyond this).
+                let ssrc = v["d"]["ssrc"].as_u64().unwrap_or(0) as u32;
+                let ip = v["d"]["ip"].as_str().unwrap_or("").to_string();
+                let port = v["d"]["port"].as_u64().unwrap_or(0) as u16;
+                let modes: Vec<String> = v["d"]["modes"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if let Some((my_ip, my_port)) = udp_ip_discovery(&ip, port, ssrc) {
+                    let mode = modes
+                        .iter()
+                        .find(|m| m.contains("xchacha20"))
+                        .or_else(|| modes.first())
+                        .cloned()
+                        .unwrap_or_else(|| "aead_xchacha20_poly1305_rtpsize".into());
+                    let sp = serde_json::json!({
+                        "op": 1,
+                        "d": { "protocol": "udp", "data": { "address": my_ip, "port": my_port, "mode": mode } }
+                    });
+                    let _ = sock.send(Message::Text(sp.to_string().into()));
+                }
+            }
+            Some(5) => {
+                // SPEAKING: `speaking` is a bitmask (bit 0 = voice), per SSRC.
+                let ssrc = v["d"]["ssrc"].as_u64().unwrap_or(0);
+                let on = v["d"]["speaking"].as_u64().unwrap_or(0) & 1 != 0;
+                let was = !talking.is_empty();
+                if ssrc != 0 {
+                    if on {
+                        talking.insert(ssrc);
+                    } else {
+                        talking.remove(&ssrc);
+                    }
+                }
+                let now_on = !talking.is_empty();
+                if now_on != was {
+                    set_speaking(now_on);
+                }
+            }
+            _ => {}
+        }
+    }
+    set_speaking(false);
+    alive.store(false, Ordering::Relaxed);
+}
+
+/// Discord voice UDP IP discovery: send the 74-byte discovery packet and parse our
+/// external address + port from the reply. None on any socket error/timeout.
+fn udp_ip_discovery(ip: &str, port: u16, ssrc: u32) -> Option<(String, u16)> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    sock.connect((ip, port)).ok()?;
+    let mut pkt = [0u8; 74];
+    pkt[0..2].copy_from_slice(&1u16.to_be_bytes()); // type 0x1 = request
+    pkt[2..4].copy_from_slice(&70u16.to_be_bytes()); // payload length
+    pkt[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    sock.send(&pkt).ok()?;
+    let mut buf = [0u8; 74];
+    let n = sock.recv(&mut buf).ok()?;
+    if n < 74 {
+        return None;
+    }
+    // address: NUL-terminated string from offset 8; port: last 2 bytes, big-endian.
+    let end = buf[8..72].iter().position(|&b| b == 0).map(|p| 8 + p).unwrap_or(72);
+    let addr = std::str::from_utf8(&buf[8..end]).ok()?.to_string();
+    Some((addr, u16::from_be_bytes([buf[72], buf[73]])))
 }
 
 /// Fold one voice state into the user→channel map (channel_id null ⇒ disconnected).
