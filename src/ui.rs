@@ -740,7 +740,11 @@ fn is_box_glyph(s: &str) -> bool {
 /// unread messages / a voice join / a doctor run. Title text and inner content are
 /// left untouched (only box-drawing glyphs are recolored). Call AFTER rendering the
 /// card's block, gated on the card's alert condition.
-fn shimmer_border(f: &mut Frame, area: Rect, t: f64) {
+/// Sweep a jazz gradient around a card's border. `speed` sets how fast the band
+/// travels (turns/sec ×2); `glow` (0..1) blends the sweep toward white for a
+/// brighter, hotter shimmer — used when a Discord voice channel is actively
+/// talking. The defaults (0.55, 0.0) are the calm attention shimmer.
+fn shimmer_border(f: &mut Frame, area: Rect, t: f64, speed: f32, glow: f32) {
     if area.width < 2 || area.height < 2 {
         return;
     }
@@ -771,9 +775,14 @@ fn shimmer_border(f: &mut Frame, area: Rect, t: f64) {
             } else {
                 2.0 * (w - 1.0) + (h - 1.0) + ((h - 1.0) - cy)
             };
-            // Two color cycles around the box, sweeping ~0.55 turns/sec.
-            let phase = ((idx / perim) * 2.0 - t as f32 * 0.55).rem_euclid(1.0);
-            cell.fg = c::jazz(phase);
+            // Two color cycles around the box, sweeping at `speed` turns/sec.
+            let phase = ((idx / perim) * 2.0 - t as f32 * speed).rem_euclid(1.0);
+            let base = c::jazz(phase);
+            cell.fg = if glow > 0.0 {
+                c::blend(base, ratatui::style::Color::Rgb(245, 245, 255), glow.clamp(0.0, 1.0))
+            } else {
+                base
+            };
             cell.modifier.insert(Modifier::BOLD);
         }
     }
@@ -1970,7 +1979,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // while the brief red send-fail flash is playing).
     let flashing = ui.send_failed_at.map_or(false, |fa| fa.elapsed().as_secs_f32() < 0.36);
     if msgs.available && msgs.unread_count > 0 && !flashing {
-        shimmer_border(f, area, t);
+        shimmer_border(f, area, t, 0.55, 0.0);
     }
 
     if inner.height < 2 || inner.width < 10 {
@@ -2187,7 +2196,7 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     f.render_widget(block, area);
     // Unread → shimmer the border until you've checked Signal.
     if sig.available && sig.unread_count > 0 {
-        shimmer_border(f, area, t);
+        shimmer_border(f, area, t, 0.55, 0.0);
     }
 
     if inner.height < 2 || inner.width < 10 {
@@ -2347,14 +2356,24 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    // Shimmer the border on unread text messages (until cleared) or for 20s after
-    // someone joins voice. STUDIOBOARD_FAKE_VOICE also lights it up for previewing.
+    // Border shimmer, in priority order:
+    //  • someone is TALKING in voice  → bright, fast, white-hot sweep
+    //  • unread text / 20s after a voice JOIN → calm attention sweep
+    // STUDIOBOARD_FAKE_SPEAKING / _VOICE light these up for previewing.
     let voice_join = d.voice_join_at.map_or(false, |i| i.elapsed().as_secs_f64() < 20.0);
     let fake_join = std::env::var("STUDIOBOARD_FAKE_VOICE")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    if d.available && (unread_text > 0 || voice_join || fake_join) {
-        shimmer_border(f, area, t);
+    let fake_speaking = std::env::var("STUDIOBOARD_FAKE_SPEAKING")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let speaking = d.voice_speaking || fake_speaking;
+    if d.available && speaking {
+        // Pulse the glow a touch so "talking" reads as alive, not just lit.
+        let glow = 0.45 + 0.20 * (t * 5.0).sin().abs() as f32;
+        shimmer_border(f, area, t, 1.6, glow);
+    } else if d.available && (unread_text > 0 || voice_join || fake_join) {
+        shimmer_border(f, area, t, 0.55, 0.0);
     }
 
     if inner.height < 2 || inner.width < 10 {
@@ -2535,7 +2554,7 @@ fn doctor_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     f.render_widget(block, area);
     // Shimmer the border while a triage run is in flight.
     if d.available && d.running {
-        shimmer_border(f, area, t);
+        shimmer_border(f, area, t, 0.55, 0.0);
     }
     if inner.height < 2 || inner.width < 10 {
         return;

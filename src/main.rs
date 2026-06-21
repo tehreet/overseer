@@ -818,6 +818,9 @@ fn sample_data(st: &mut AppState, compose: bool) {
             },
         ],
         voice_join_at: None,
+        voice_speaking: std::env::var("STUDIOBOARD_FAKE_SPEAKING")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
     };
     // MAC-DOCTOR card preview. Idle by default; STUDIOBOARD_FAKE_DOCTOR=running
     // previews the in-flight (diagnosing) state.

@@ -398,6 +398,7 @@ pub struct Discord {
     pub voice: Vec<VoiceChannel>,    // only channels with someone in them (else empty)
     pub text: Vec<TextChannel>,      // recent text channels w/ last message
     pub voice_join_at: Option<Instant>, // when someone last JOINED voice → 20s border shimmer
+    pub voice_speaking: bool,           // someone is TALKING right now → bright border shimmer
 }
 
 /// mac-doctor / syswatch triage agent status (written by spawn_doctor). The
