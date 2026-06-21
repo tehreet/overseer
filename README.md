@@ -22,13 +22,23 @@ A buttery-smooth, always-on TUI command center for the Mac Studio (Apple M4 Max)
 - **Apple Silicon** — GPU %, GPU clock, package/CPU/GPU/system power draw (W),
   CPU & GPU temperatures. Source: [`macmon`](https://github.com/vladkens/macmon)
   (no sudo).
-- **Claude Code** — today's tokens (in/out/cache), estimated cost, sessions,
-  message count, top model, an hourly burn sparkline, and month-to-date
-  estimated cost. Parsed from `~/.claude/projects/**/*.jsonl`.
+- **Claude Code (ROBOTS WORKING)** — a realtime "who's working" feed of the
+  Claude Code sessions active right now: one pulsing row per session showing what
+  it's doing this second (editing a file, running a command, reading, thinking,
+  spawning an agent…), its project, model, and how long since its last move —
+  read live from each transcript's tail (~1 Hz). Beneath it, rolling-window token
+  totals (today / week / month / sessions). Parsed from
+  `~/.claude/projects/**/*.jsonl`; probe headlessly with `--diag-live`.
 - **Now Playing + Lyrics** — current Apple Music track with a smooth,
   frame-interpolated progress bar and **time-synced karaoke lyrics** from
   [LRCLIB](https://lrclib.net). The active line lights up character-by-character
   in time with playback.
+- **Now Watching** — when you're watching in the macOS **TV app**, the same band
+  flips to the movie/show: its cover (like album art), a smooth progress bar, the
+  show · season/episode or title · year · genre · director, the live audio EQ, and
+  the FACTS card fills with trivia about the film/series and its cast. Music takes
+  priority when it's actually playing; otherwise TV wins. Probe it headlessly with
+  `--diag-tv`.
 
 ## Why it's smooth
 

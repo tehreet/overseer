@@ -10,6 +10,8 @@ mod audio;
 mod cache;
 mod collectors;
 mod lyrics;
+#[cfg(target_os = "macos")]
+mod nowplaying;
 mod state;
 mod theme;
 mod ui;
@@ -40,6 +42,19 @@ fn main() -> Result<()> {
     }
     if args.iter().any(|a| a == "--diag-signal") {
         collectors::diag_signal();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--diag-live") {
+        collectors::diag_live_sessions();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--diag-tv") {
+        collectors::diag_tv();
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--diag-np") {
+        nowplaying::diag();
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -103,6 +118,7 @@ fn run() -> Result<()> {
     collectors::spawn_git(shared.clone());
     collectors::spawn_weather(shared.clone());
     collectors::spawn_usage(shared.clone());
+    collectors::spawn_live_sessions(shared.clone());
     collectors::spawn_messages(shared.clone());
     collectors::spawn_signal(shared.clone());
     collectors::spawn_discord(shared.clone());
@@ -659,6 +675,31 @@ fn sample_data(st: &mut AppState, compose: bool) {
         sessions_30d: 73,
         hourly: vec![0, 0, 0, 0, 0, 0, 0, 12, 40, 88, 120, 64, 30, 55, 90, 140, 110, 70, 0, 0, 0, 0, 0, 0],
     };
+    // A representative realtime "who's working" roster for the ROBOTS feed, one
+    // row per live Claude Code session, newest-active first (matches the
+    // collector's sort) so visual-verify shows the icon/pulse/age treatment.
+    {
+        use state::{ActionKind, LiveSession, LiveSessions};
+        let mk = |project: &str, model: &str, kind, action: &str, age: f64| LiveSession {
+            session_id: project.into(),
+            project: project.into(),
+            branch: "main".into(),
+            model: model.into(),
+            action: action.into(),
+            kind,
+            age_secs: age,
+        };
+        st.live = LiveSessions {
+            fresh: true,
+            sessions: vec![
+                mk("battlestation", "Opus", ActionKind::Edit, "editing ui.rs", 1.4),
+                mk("battlestation", "Opus", ActionKind::Run, "cargo build --release", 4.2),
+                mk("dotfiles", "Sonnet", ActionKind::Read, "grep spawn_live", 9.0),
+                mk("syswatch", "Haiku", ActionKind::Think, "thinking", 17.0),
+                mk("homelab", "Sonnet", ActionKind::Idle, "awaiting you", 48.0),
+            ],
+        };
+    }
     st.music = MusicStats {
         running: true,
         playing: true,
@@ -669,7 +710,34 @@ fn sample_data(st: &mut AppState, compose: bool) {
         base_pos: 11.0,
         sampled_at: Instant::now(),
         polled: true,
+        ..Default::default()
     };
+    // STUDIOBOARD_FAKE_WATCH previews the "now watching" band off-screen:
+    // `=movie` a film, anything else a TV episode. Mirrors STUDIOBOARD_FAKE_VOICE.
+    if let Ok(kind) = std::env::var("STUDIOBOARD_FAKE_WATCH") {
+        let movie = kind == "movie";
+        st.music = MusicStats {
+            running: true,
+            playing: true,
+            source: state::MediaSource::Tv,
+            track: if movie { "Dune: Part Two".into() } else { "Cold Harbor".into() },
+            duration: if movie { 9966.0 } else { 2890.0 },
+            base_pos: if movie { 3727.0 } else { 1042.0 },
+            sampled_at: Instant::now(),
+            polled: true,
+            watch: state::WatchMeta {
+                show: if movie { String::new() } else { "Severance".into() },
+                season: if movie { 0 } else { 2 },
+                episode: if movie { 0 } else { 10 },
+                year: if movie { "2024".into() } else { "2025".into() },
+                genre: if movie { "Sci-Fi".into() } else { "Thriller".into() },
+                director: if movie { "Denis Villeneuve".into() } else { "Ben Stiller".into() },
+                kind: if movie { "movie".into() } else { "TV show".into() },
+                poster_url: String::new(),
+            },
+            ..Default::default()
+        };
+    }
     // Album art: decode the last real dump (so visual-verify exercises the true
     // sampling path on a real cover); fall back to a radial gradient otherwise.
     st.album_art = collectors::sample_album_art(st.music.track_id());
@@ -683,12 +751,21 @@ fn sample_data(st: &mut AppState, compose: bool) {
         track_id: st.music.track_id(),
         source: "claude".into(),
         note: String::new(),
-        lines: vec![
-            "Drake's first solo #1 on the Billboard Hot 100.".into(),
-            "The beat samples Whitney Houston's \"I'm Every Woman\" ad-libs.".into(),
-            "Recorded in a single late-night session in Toronto.".into(),
-            "The phrase became a meme long before the song dropped.".into(),
-        ],
+        lines: if st.music.is_tv() {
+            vec![
+                "Ben Stiller directs most of the series and shapes its eerie tone.".into(),
+                "Adam Scott and Britt Lower lead as severed Lumon employees.".into(),
+                "The Lumon offices were shot in Bell Labs' Holmdel, NJ complex.".into(),
+                "The score is by Theodore Shapiro; the title sequence won an Emmy.".into(),
+            ]
+        } else {
+            vec![
+                "Drake's first solo #1 on the Billboard Hot 100.".into(),
+                "The beat samples Whitney Houston's \"I'm Every Woman\" ad-libs.".into(),
+                "Recorded in a single late-night session in Toronto.".into(),
+                "The phrase became a meme long before the song dropped.".into(),
+            ]
+        },
     };
     st.queue = state::Queue {
         fresh: true,
@@ -938,4 +1015,26 @@ fn sample_data(st: &mut AppState, compose: bool) {
         .map(|(t, s)| LyricLine { t, text: s.to_string() })
         .collect(),
     };
+
+    // Watching has no lyrics / up-next — match what the live collectors do so the
+    // off-screen preview is faithful (LYRICS parks a note, QUEUE shows empty).
+    if st.music.is_tv() {
+        st.lyrics = Lyrics {
+            lines: Vec::new(),
+            synced: false,
+            track_id: st.music.track_id(),
+            note: "▶ now watching".into(),
+        };
+        st.queue = state::Queue { fresh: true, ..Default::default() };
+        st.watch_info = state::WatchInfo {
+            track_id: st.music.track_id(),
+            synopsis: "A severed Lumon employee on the testing floor races to complete the \
+                       mysterious Cold Harbor file as the boundary between his work and home \
+                       selves collapses."
+                .into(),
+            director: "Ben Stiller".into(),
+            cast: vec!["Adam Scott".into(), "Britt Lower".into(), "Tramell Tillman".into(), "Patricia Arquette".into()],
+            note: String::new(),
+        };
+    }
 }

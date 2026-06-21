@@ -114,6 +114,33 @@ impl Lyrics {
     }
 }
 
+/// Which app is feeding the NOW PLAYING band. The same card/art/facts pipeline
+/// serves both; only the labels, art source, and facts prompt differ.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaSource {
+    #[default]
+    Music,
+    Tv,
+}
+
+/// Extra metadata that only applies when watching (source == Tv): enough to label
+/// the card nicely and to ground the trivia prompt in the right film/series.
+#[derive(Clone, Default)]
+pub struct WatchMeta {
+    /// Series name for an episode; empty for a movie.
+    pub show: String,
+    pub season: u32,
+    pub episode: u32,
+    pub year: String,
+    pub genre: String,
+    pub director: String,
+    /// Raw TV media kind ("movie", "TV show", "home video", …) for tuning labels.
+    pub kind: String,
+    /// Poster image URL (from iTunes) for streamed films the TV app won't supply
+    /// artwork for; the artwork collector downloads + decodes it like album art.
+    pub poster_url: String,
+}
+
 #[derive(Clone)]
 pub struct MusicStats {
     pub running: bool,
@@ -128,6 +155,10 @@ pub struct MusicStats {
     /// Set true after the first AppleScript poll completes, so the UI doesn't
     /// flash the pulse before the real music state is known.
     pub polled: bool,
+    /// Music vs. TV — selects the card's wording, art app, and facts prompt.
+    pub source: MediaSource,
+    /// Populated only when `source == Tv`.
+    pub watch: WatchMeta,
 }
 
 impl Default for MusicStats {
@@ -142,6 +173,8 @@ impl Default for MusicStats {
             base_pos: 0.0,
             sampled_at: Instant::now(),
             polled: false,
+            source: MediaSource::Music,
+            watch: WatchMeta::default(),
         }
     }
 }
@@ -155,8 +188,20 @@ impl MusicStats {
             self.base_pos
         }
     }
+    /// Stable identity for art/facts caching. Includes the source + series/episode
+    /// so a movie can't collide with a same-named song, and each episode is its own
+    /// cache entry.
     pub fn track_id(&self) -> String {
-        format!("{}|{}|{}", self.artist, self.track, self.album)
+        match self.source {
+            MediaSource::Music => format!("{}|{}|{}", self.artist, self.track, self.album),
+            MediaSource::Tv => format!(
+                "tv|{}|{}|S{}E{}",
+                self.watch.show, self.track, self.watch.season, self.watch.episode
+            ),
+        }
+    }
+    pub fn is_tv(&self) -> bool {
+        matches!(self.source, MediaSource::Tv)
     }
 }
 
@@ -534,6 +579,71 @@ pub struct UsageStats {
     pub hourly: Vec<u64>,
 }
 
+/// What a live Claude Code session is doing this very moment — derived from the
+/// tail of its JSONL transcript. Drives the icon + color in the ROBOTS feed.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActionKind {
+    /// Turn finished (`stop_reason: end_turn`) — the robot is waiting on a human.
+    #[default]
+    Idle,
+    /// Extended-thinking block is the latest thing on the wire.
+    Think,
+    /// A shell command (`Bash`) is running.
+    Run,
+    /// Editing/writing a file (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`).
+    Edit,
+    /// Reading or searching the codebase (`Read`/`Grep`/`Glob`).
+    Read,
+    /// Reaching out to the web (`WebFetch`/`WebSearch`).
+    Web,
+    /// Spawning a sub-agent (`Task`/`Agent`).
+    Agent,
+    /// Any other tool call (incl. MCP) in flight.
+    Tool,
+    /// Streaming a text answer right now (no `end_turn` yet).
+    Respond,
+}
+
+/// One Claude Code session that has touched its transcript within the live
+/// window. Read cheaply from the file's tail by the fast `spawn_live_sessions`
+/// thread so the ROBOTS card can show a realtime "who's working" feed.
+#[derive(Clone, Default)]
+pub struct LiveSession {
+    pub session_id: String,
+    /// Basename of the session's cwd, e.g. `battlestation`.
+    pub project: String,
+    /// Git branch the session is on, if the transcript recorded one.
+    pub branch: String,
+    /// Short model name in use (`Opus`/`Sonnet`/`Haiku`).
+    pub model: String,
+    /// Human-readable label of what it's doing right now.
+    pub action: String,
+    pub kind: ActionKind,
+    /// Seconds since the session's last transcript event (mtime / last ts).
+    pub age_secs: f64,
+}
+
+/// The realtime roster of working Claude Code sessions, newest-active first.
+#[derive(Clone, Default)]
+pub struct LiveSessions {
+    pub fresh: bool,
+    pub sessions: Vec<LiveSession>,
+}
+
+/// Synopsis + key credits for what's being watched — fills the (repurposed)
+/// LYRICS card while a movie/show plays. Synopsis is Wikipedia's lead; credits
+/// come from Claude (Wikipedia-parse fallback).
+#[derive(Clone, Default)]
+pub struct WatchInfo {
+    /// Identity of the title this describes, so the UI only shows a matching one.
+    pub track_id: String,
+    pub synopsis: String,
+    pub director: String,
+    pub cast: Vec<String>,
+    /// Status line while gathering (e.g. "gathering synopsis…").
+    pub note: String,
+}
+
 /// The whole world, behind one mutex. Cheap to clone for a render snapshot.
 #[derive(Clone)]
 pub struct AppState {
@@ -576,6 +686,10 @@ pub struct AppState {
     pub git: GitStats,
     pub weather: Weather,
     pub usage: UsageStats,
+    /// Realtime feed of currently-working Claude Code sessions (ROBOTS card).
+    pub live: LiveSessions,
+    /// Synopsis + credits for the current movie/show (repurposed LYRICS card).
+    pub watch_info: WatchInfo,
     pub messages: Messages,
     pub msg_ui: MsgUi,
     pub signal: Messages, // Signal Desktop conversations (read-only; reuses Messages shape)
@@ -618,6 +732,8 @@ impl Default for AppState {
             git: GitStats::default(),
             weather: Weather::default(),
             usage: UsageStats::default(),
+            live: LiveSessions::default(),
+            watch_info: WatchInfo::default(),
             messages: Messages::default(),
             msg_ui: MsgUi::default(),
             signal: Messages::default(),

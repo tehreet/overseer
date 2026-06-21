@@ -9,8 +9,6 @@ use ratatui::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Timelike};
-
 use crate::state::AppState;
 use crate::theme as c;
 
@@ -1012,10 +1010,12 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     }
 
     let h = inner.height as usize;
-    // Left column kept narrow so the divider sits left and the commit message
-    // (right column) gets the room.
-    let lw = ((inner.width as usize * 34 / 100).max(16))
-        .min((inner.width as usize).saturating_sub(24)) as u16;
+    // The live "who's working" feed is now the card's left half, so give it a
+    // touch more room than the old burn chart needed — enough for one clean line
+    // per robot (icon · project · action · age) — while the git pulse keeps the
+    // right.
+    let lw = ((inner.width as usize * 42 / 100).max(18))
+        .min((inner.width as usize).saturating_sub(22)) as u16;
     let div_x = inner.x + lw + 1; // 1-col gutter, then divider
     let rx = div_x + 2; // 1-col gutter after the divider
     let rw = (inner.x + inner.width).saturating_sub(rx);
@@ -1032,81 +1032,45 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         );
     }
 
-    // ----- left: per-hour burn chart on top, token windows beneath -----
+    // ----- left: realtime "who's working" feed on top, token windows beneath --
+    // The live session feed is the card's anchor now (replacing the old per-hour
+    // burn chart); the rolling-window token totals are condensed to two compact
+    // rows pinned at the bottom so the feed gets the room to show every robot.
+    let wlen = 2u16; // today/week on one row, month/sessions on the next
+    let feed_h = inner.height.saturating_sub(wlen);
+    if feed_h >= 1 {
+        live_feed(
+            f,
+            Rect { x: inner.x, y: inner.y, width: lw, height: feed_h },
+            &s.live,
+            t,
+        );
+    }
+
     if !u.fresh {
         f.render_widget(
             Paragraph::new(Span::styled("scanning ~/.claude…", Style::default().fg(c::DIM))),
-            Rect { x: inner.x, y: inner.y, width: lw, height: 1 },
+            Rect { x: inner.x, y: inner.y + feed_h, width: lw, height: 1 },
         );
     } else {
         let tot_today = u.today_input + u.today_output + u.today_cache_read + u.today_cache_write;
-        let row = |label: &str, val: String, col| {
-            Line::from(vec![
-                Span::styled(format!("{label:<8} "), Style::default().fg(c::DIM)),
+        // One label:value cell. Two cells per line keeps the totals to two rows.
+        let cell = |label: &str, val: String, col| {
+            vec![
+                Span::styled(format!("{label} "), Style::default().fg(c::DIM)),
                 Span::styled(val, Style::default().fg(col).add_modifier(Modifier::BOLD)),
-            ])
+            ]
         };
-        let windows = [
-            ("today", fmt_tokens(tot_today), c::cyan()),
-            ("week", fmt_tokens(u.tokens_7d), c::accent()),
-            ("month", fmt_tokens(u.tokens_30d), c::pink()),
-            ("sessions", format!("{}", u.sessions_30d), c::TEXT),
-        ];
-        // Window today's per-hour burn so it ENDS at the current hour — the live
-        // hour is the rightmost bar. Showing the raw tail of the 24h array would
-        // render the empty late-day/future hours (all blank).
-        let cur_hour = Local::now().hour() as usize;
-        let today_so_far: &[u64] = if u.hourly.is_empty() {
-            &u.hourly[..]
-        } else {
-            &u.hourly[..=cur_hour.min(u.hourly.len() - 1)]
-        };
-        let peak = today_so_far.iter().copied().max().unwrap_or(0);
-        let peak_hr = today_so_far
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, v)| **v)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        // The burn chart is the card's anchor: a multi-row per-hour bar chart of
-        // today's token spend, filling the rows above the four window numbers so
-        // there's no dead gap and the whole left half reads as one unit.
-        let wlen = windows.len() as u16;
-        let chart_h = inner.height.saturating_sub(wlen + 1); // +1 header row
-        let chart_w = lw as usize;
-        if chart_h >= 1 && chart_w > 0 && peak > 0 {
-            // Header: what the chart is + its peak, so it communicates at a glance.
-            let header = Line::from(vec![
-                Span::styled("burn/hr ", Style::default().fg(c::DIM)),
-                Span::styled(
-                    format!("peak {} @{:02}:00", fmt_tokens(peak), peak_hr),
-                    Style::default().fg(c::FAINT),
-                ),
-            ]);
-            f.render_widget(
-                Paragraph::new(header),
-                Rect { x: inner.x, y: inner.y, width: lw, height: 1 },
-            );
-            for (i, srow) in jazz_spark_rows(today_so_far, chart_w, chart_h as usize)
-                .into_iter()
-                .enumerate()
-            {
-                f.render_widget(
-                    Paragraph::new(Line::from(srow)),
-                    Rect { x: inner.x, y: inner.y + 1 + i as u16, width: lw, height: 1 },
-                );
-            }
-        }
-
-        // Token windows pinned to the bottom of the left column, under the chart.
-        let text: Vec<Line> = windows
-            .iter()
-            .map(|(l, v, c)| row(l, v.clone(), *c))
-            .collect();
+        let gap = Span::raw("  ");
+        let mut l1 = cell("today", fmt_tokens(tot_today), c::cyan());
+        l1.push(gap.clone());
+        l1.extend(cell("wk", fmt_tokens(u.tokens_7d), c::accent()));
+        let mut l2 = cell("month", fmt_tokens(u.tokens_30d), c::pink());
+        l2.push(gap);
+        l2.extend(cell("sess", format!("{}", u.sessions_30d), c::TEXT));
         let wy = inner.y + inner.height.saturating_sub(wlen);
         f.render_widget(
-            Paragraph::new(text),
+            Paragraph::new(vec![Line::from(l1), Line::from(l2)]),
             Rect { x: inner.x, y: wy, width: lw, height: wlen.min(inner.height) },
         );
     }
@@ -1172,6 +1136,145 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         Paragraph::new(vec![branch, commit, age, Line::from(""), loc, commits, prs, merges]),
         Rect { x: rx, y: inner.y, width: rw, height: inner.height },
     );
+}
+
+/// The glyph + base color for a live session's current action, so the kind reads
+/// at a glance: a shell prompt for a command, a pencil for an edit, etc.
+fn kind_glyph(k: crate::state::ActionKind) -> (&'static str, Color) {
+    use crate::state::ActionKind as K;
+    match k {
+        K::Idle => ("○", c::FAINT),
+        K::Think => ("✶", c::accent()),
+        K::Run => ("❯", c::cyan()),
+        K::Edit => ("✎", c::GREEN),
+        K::Read => ("▤", c::accent()),
+        K::Web => ("◍", c::cyan()),
+        K::Agent => ("✦", c::pink()),
+        K::Tool => ("⚙", c::cyan()),
+        K::Respond => ("✺", c::pink()),
+    }
+}
+
+/// Compact age: seconds under a minute, then minutes. Live sessions are by
+/// definition young, so this never needs hours.
+fn fmt_age(secs: f64) -> String {
+    if secs < 1.0 {
+        "now".to_string()
+    } else if secs < 60.0 {
+        format!("{}s", secs as u64)
+    } else {
+        format!("{}m", (secs / 60.0) as u64)
+    }
+}
+
+/// Realtime feed for the ROBOTS card: one glide-y line per live Claude Code
+/// session — icon (what it's doing), project, action label, and age — newest-
+/// active on top (the collector sorts that way), so a session that just moved
+/// rises to the top and pushes the others down. Capped at the 5 most recent. The
+/// icon shimmers toward bright on fresh activity and fades as a session goes
+/// quiet, so the whole feed breathes with the work.
+fn live_feed(f: &mut Frame, area: Rect, l: &crate::state::LiveSessions, t: f64) {
+    if area.height == 0 || area.width < 6 {
+        return;
+    }
+    let w = area.width as usize;
+    let tt = t as f32;
+
+    if !l.fresh {
+        f.render_widget(
+            Paragraph::new(Span::styled("scanning robots…", Style::default().fg(c::DIM))),
+            Rect { height: 1, ..area },
+        );
+        return;
+    }
+    if l.sessions.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("no active sessions", Style::default().fg(c::DIM))),
+            Rect { height: 1, ..area },
+        );
+        return;
+    }
+
+    // The 5 most-recent sessions, filling from the top (newest first).
+    let cap = (area.height as usize).min(5);
+    for (i, sess) in l.sessions.iter().take(cap).enumerate() {
+        f.render_widget(
+            Paragraph::new(session_line(sess, w, tt, i)),
+            Rect { x: area.x, y: area.y + i as u16, width: area.width, height: 1 },
+        );
+    }
+}
+
+/// One robot's line: `{icon} {project}  {action}            {age}`. The icon
+/// pulses in its kind color (fading as the session ages); the age is right-
+/// aligned and the action fills whatever's left.
+fn session_line(s: &crate::state::LiveSession, w: usize, t: f32, idx: usize) -> Line<'static> {
+    use crate::state::ActionKind as K;
+    let idle = matches!(s.kind, K::Idle);
+    let (glyph, kcol) = kind_glyph(s.kind);
+
+    // Recency 1.0 (fresh) → 0.0 (going quiet over ~12s): drives both the fade and
+    // how lively the pulse is, so a hot robot sparkles and a stalled one settles.
+    let recency = (1.0 - s.age_secs as f32 / 12.0).clamp(0.0, 1.0);
+    let icon_col = if idle {
+        c::FAINT
+    } else {
+        // Dim toward FAINT as it ages, then shimmer toward TEXT on the beat. Phase
+        // offset per row so the feed twinkles rather than blinking in lockstep.
+        let base = c::blend(kcol, c::FAINT, 0.5 * (1.0 - recency));
+        let pulse = 0.5 + 0.5 * (t * 3.0 + idx as f32 * 0.8).sin();
+        c::blend(base, c::TEXT, 0.4 * pulse * (0.3 + 0.7 * recency))
+    };
+
+    // Age string sits flush right; reserve its width plus a leading gap.
+    let age = fmt_age(s.age_secs);
+    let age_w = age.chars().count();
+    let icon_w = 2; // glyph + trailing space
+
+    let mut spans = vec![Span::styled(
+        format!("{glyph} "),
+        Style::default().fg(icon_col).add_modifier(if recency > 0.5 && !idle {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        }),
+    )];
+
+    // Middle = project + action (+ optional model), sharing the room left after
+    // the icon and the right-aligned age. The action is the interesting part, so
+    // the project takes a capped slice and the action gets the rest.
+    let middle = w.saturating_sub(icon_w + age_w + 1);
+    let proj_budget = (middle * 9 / 20).clamp(6, 16).min(middle.saturating_sub(4));
+    let proj = fit_width(&s.project, proj_budget.max(1));
+    let mut rem = middle.saturating_sub(dwidth(&proj) + 1); // 1-col gap after project
+    let action = fit_width(&s.action, rem.max(1));
+    rem = rem.saturating_sub(dwidth(&action));
+
+    // Show the model dim before the age when there's comfortable room (wide
+    // terminals); it quietly drops on narrow ones.
+    let model = (!s.model.is_empty() && rem >= dwidth(&s.model) + 2).then(|| {
+        rem -= dwidth(&s.model) + 2;
+        s.model.clone()
+    });
+
+    spans.push(Span::styled(
+        proj,
+        Style::default()
+            .fg(if idle { c::DIM } else { c::accent() })
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(" {action}"),
+        Style::default().fg(if idle { c::FAINT } else { c::TEXT }),
+    ));
+    if let Some(m) = model {
+        spans.push(Span::styled(format!(" ·{m}"), Style::default().fg(c::FAINT)));
+    }
+    if rem > 0 {
+        spans.push(Span::raw(" ".repeat(rem)));
+    }
+    spans.push(Span::styled(format!(" {age}"), Style::default().fg(c::FAINT)));
+    Line::from(spans)
 }
 
 /// The top band of the right column: NOW PLAYING on the left, a LINER NOTES card
@@ -1289,7 +1392,7 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         let note = if !m.running || m.track.is_empty() {
             "♫"
         } else if fa.track_id != m.track_id() || fa.note.is_empty() {
-            "gathering liner notes…"
+            if m.is_tv() { "gathering trivia…" } else { "gathering liner notes…" }
         } else {
             &fa.note
         };
@@ -1400,7 +1503,8 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let m = &s.music;
     let hot = m.playing;
-    let block = panel("NOW PLAYING", hot);
+    let tv = m.is_tv();
+    let block = panel(if tv { "NOW WATCHING" } else { "NOW PLAYING" }, hot);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1434,19 +1538,51 @@ fn now_playing(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // Text column width — needed before we lay out the (possibly scrolling) title.
     let textw = (inner.width.saturating_sub(gap)) as usize;
 
-    // Line 1 = "Artist - Song" (no transport glyph); line 2 = album. A line wider
-    // than the column smoothly marquee-scrolls instead of truncating; both shimmer.
-    let title = marquee(
-        &[
-            (m.artist.as_str(), c::accent(), true),
-            (" - ", c::FAINT, false),
-            (m.track.as_str(), c::TEXT, true),
-        ],
-        textw,
-        t,
-        0.0,
-    );
-    let album = marquee(&[(m.album.as_str(), c::DIM, false)], textw, t, 1.0);
+    // Two text lines, source-aware. Music: "Artist - Song" / album. TV episode:
+    // "Show  S2·E5" / episode title. Movie: title / "year · genre · director".
+    // A line wider than the column smoothly marquee-scrolls instead of truncating.
+    let se_tag = if tv && m.watch.season > 0 {
+        format!("  S{}·E{}", m.watch.season, m.watch.episode)
+    } else {
+        String::new()
+    };
+    let movie_sub = if tv {
+        [m.watch.year.as_str(), m.watch.genre.as_str(), m.watch.director.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("  ·  ")
+    } else {
+        String::new()
+    };
+    let (title, album) = if tv {
+        if !m.watch.show.is_empty() {
+            (
+                marquee(
+                    &[(m.watch.show.as_str(), c::accent(), true), (se_tag.as_str(), c::FAINT, false)],
+                    textw, t, 0.0,
+                ),
+                marquee(&[(m.track.as_str(), c::TEXT, true)], textw, t, 1.0),
+            )
+        } else {
+            (
+                marquee(&[(m.track.as_str(), c::accent(), true)], textw, t, 0.0),
+                marquee(&[(movie_sub.as_str(), c::DIM, false)], textw, t, 1.0),
+            )
+        }
+    } else {
+        (
+            marquee(
+                &[
+                    (m.artist.as_str(), c::accent(), true),
+                    (" - ", c::FAINT, false),
+                    (m.track.as_str(), c::TEXT, true),
+                ],
+                textw, t, 0.0,
+            ),
+            marquee(&[(m.album.as_str(), c::DIM, false)], textw, t, 1.0),
+        )
+    };
 
     // Progress bar stretches to the right edge of the card: only the two time
     // labels are reserved, the bar takes everything between them. A sheen glides
@@ -2719,7 +2855,88 @@ fn pad_width(s: &str, width: usize) -> String {
     t
 }
 
+/// The watching counterpart of the LYRICS card: titled with the film/show name,
+/// it shows a synopsis with the director and top-billed cast beneath. No EQ.
+fn watch_synopsis_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    let m = &s.music;
+    let wi = &s.watch_info;
+    let name = if !m.watch.show.is_empty() { &m.watch.show } else { &m.track };
+
+    let title = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            truncate(name, (area.width as usize).saturating_sub(4).max(4)),
+            Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default()),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .title(title)
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(c::BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 6 || inner.height < 2 {
+        return;
+    }
+
+    // Still gathering, or nothing yet for this title → a quiet centered note.
+    let ready = wi.track_id == m.track_id()
+        && (!wi.synopsis.is_empty() || !wi.director.is_empty() || !wi.cast.is_empty());
+    if !ready {
+        let note = if !wi.note.is_empty() { wi.note.as_str() } else { "gathering synopsis…" };
+        f.render_widget(
+            Paragraph::new(Span::styled(note.to_string(), Style::default().fg(c::DIM)))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let width = inner.width as usize;
+    // Reserve room for the credits footer so the synopsis never crowds it out.
+    let mut footer: Vec<Line> = Vec::new();
+    if !wi.director.is_empty() {
+        footer.push(Line::from(vec![
+            Span::styled("Director  ", Style::default().fg(c::DIM)),
+            Span::styled(wi.director.clone(), Style::default().fg(c::accent()).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    if !wi.cast.is_empty() {
+        footer.push(Line::from(vec![
+            Span::styled("Starring  ", Style::default().fg(c::DIM)),
+            Span::styled(wi.cast.join(", "), Style::default().fg(c::TEXT)),
+        ]));
+    }
+    let footer_h = if footer.is_empty() { 0 } else { footer.len() + 1 }; // +1 blank spacer
+    let synopsis_budget = (inner.height as usize).saturating_sub(footer_h).max(1);
+
+    // A slow, uniform sheen so the block reads as calm, tinted text (matches FACTS).
+    let glow = 0.5 + 0.5 * (t * 0.6).sin() as f32;
+    let col = c::blend(c::blend(c::TEXT, c::accent(), 0.16), c::blend(c::TEXT, c::cyan(), 0.35), 0.14 * glow);
+
+    let mut lines: Vec<Line> = wrap_text(&wi.synopsis, width)
+        .into_iter()
+        .take(synopsis_budget)
+        .map(|seg| Line::from(Span::styled(seg, Style::default().fg(col))))
+        .collect();
+    if !footer.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(footer);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+    // Watching a movie/show → this card becomes the synopsis + credits, titled
+    // with the film's name (no lyrics, no EQ).
+    if s.music.is_tv() {
+        watch_synopsis_panel(f, area, s, t);
+        return;
+    }
     let synced = s.lyrics.synced;
     // Title with an on-palette miss-count badge (same custom-span build the QUEUE
     // card uses) so the backlog of un-resolved tracks is visible and actionable —

@@ -392,64 +392,405 @@ pub fn probe_music() -> (bool, bool, String, String, String, f64, f64) {
     (false, false, String::new(), String::new(), String::new(), 0.0, 0.0)
 }
 
+// ---------------------------------------------------------------------------
+// TV.app shares Music's AppleScript lineage, so "now watching" reads the same
+// way "now playing" does: a current track (the episode/movie) with name, show,
+// season/episode, duration, etc., plus player position/state. When a movie is
+// streamed (no library track) we fall back to `current stream title`.
+// ---------------------------------------------------------------------------
+const TV_SCRIPT: &str = r#"
+if application "TV" is running then
+  tell application "TV"
+    try
+      set s to player state as string
+      set t to current track
+      set nm to (name of t)
+      set du to (duration of t) as string
+      set pp to (player position) as string
+      set sh to ""
+      try
+        set sh to (show of t)
+      end try
+      set sn to "0"
+      try
+        set sn to (season number of t) as string
+      end try
+      set ep to "0"
+      try
+        set ep to (episode number of t) as string
+      end try
+      set yr to ""
+      try
+        set yr to (year of (release date of t)) as string
+      end try
+      set gn to ""
+      try
+        set gn to (genre of t)
+      end try
+      set dr to ""
+      try
+        set dr to (director of t)
+      end try
+      set mk to ""
+      try
+        set mk to (media kind of t) as string
+      end try
+      return s & "\t" & nm & "\t" & sh & "\t" & sn & "\t" & ep & "\t" & du & "\t" & pp & "\t" & yr & "\t" & gn & "\t" & dr & "\t" & mk
+    on error
+      try
+        set st2 to current stream title
+        if st2 is not "" then
+          return (player state as string) & "\t" & st2 & "\t\t0\t0\t0\t" & ((player position) as string) & "\t\t\t\tstream"
+        end if
+      end try
+      return "STOPPED"
+    end try
+  end tell
+else
+  return "NOTRUNNING"
+end if
+"#;
+
+/// A parsed snapshot from one media app, before it's smoothed into `MusicStats`.
+#[derive(Clone)]
+struct MediaUpdate {
+    source: crate::state::MediaSource,
+    playing: bool,
+    track: String,
+    artist: String,
+    album: String,
+    duration: f64,
+    position: f64,
+    watch: crate::state::WatchMeta,
+}
+
+impl MediaUpdate {
+    /// Mirror of `MusicStats::track_id` so we can detect "same item" before the
+    /// state is mutated (drives the snap-vs-slew decision).
+    fn identity(&self) -> String {
+        use crate::state::MediaSource;
+        match self.source {
+            MediaSource::Music => format!("{}|{}|{}", self.artist, self.track, self.album),
+            MediaSource::Tv => {
+                format!("tv|{}|{}|S{}E{}", self.watch.show, self.track, self.watch.season, self.watch.episode)
+            }
+        }
+    }
+}
+
+/// Poll Apple Music. None when it isn't running or has no current track.
+fn probe_music_np() -> Option<MediaUpdate> {
+    let out = Command::new("osascript").arg("-e").arg(MUSIC_SCRIPT).output().ok()?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let line = raw.trim();
+    if line == "NOTRUNNING" || line == "STOPPED" || line.is_empty() {
+        return None;
+    }
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() < 6 {
+        return None;
+    }
+    Some(MediaUpdate {
+        source: crate::state::MediaSource::Music,
+        playing: f[0].eq_ignore_ascii_case("playing"),
+        track: f[1].to_string(),
+        artist: f[2].to_string(),
+        album: f[3].to_string(),
+        duration: f[4].parse().unwrap_or(0.0),
+        position: f[5].parse().unwrap_or(0.0),
+        watch: crate::state::WatchMeta::default(),
+    })
+}
+
+/// Poll the TV app. None when it isn't running or has nothing loaded.
+fn probe_tv_np() -> Option<MediaUpdate> {
+    let out = Command::new("osascript").arg("-e").arg(TV_SCRIPT).output().ok()?;
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let line = raw.trim();
+    if line == "NOTRUNNING" || line == "STOPPED" || line.is_empty() {
+        return None;
+    }
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() < 7 || f[1].trim().is_empty() {
+        return None;
+    }
+    let g = |i: usize| f.get(i).map(|x| x.trim().to_string()).unwrap_or_default();
+    let watch = crate::state::WatchMeta {
+        show: g(2),
+        season: g(3).parse().unwrap_or(0),
+        episode: g(4).parse().unwrap_or(0),
+        year: g(7),
+        genre: g(8),
+        director: g(9),
+        kind: g(10),
+        poster_url: String::new(),
+    };
+    Some(MediaUpdate {
+        source: crate::state::MediaSource::Tv,
+        playing: f[0].eq_ignore_ascii_case("playing"),
+        track: g(1),
+        artist: String::new(),
+        album: String::new(),
+        duration: g(5).parse().unwrap_or(0.0),
+        position: g(6).parse().unwrap_or(0.0),
+        watch,
+    })
+}
+
+/// Smooth a fresh media snapshot into `MusicStats`: snap the position on an
+/// item/state change or a seek, otherwise slew gently so the progress bar and
+/// karaoke wipe never hitch.
+fn apply_media(m: &mut crate::state::MusicStats, u: MediaUpdate) {
+    let same = m.running && m.track_id() == u.identity();
+    let was_playing = m.playing;
+    let predicted = if was_playing {
+        m.base_pos + m.sampled_at.elapsed().as_secs_f64()
+    } else {
+        m.base_pos
+    };
+    let snap = !same || !was_playing || !u.playing || (u.position - predicted).abs() > 1.5;
+    let new_base = if snap { u.position } else { predicted + (u.position - predicted) * 0.25 };
+
+    m.running = true;
+    m.playing = u.playing;
+    m.source = u.source;
+    m.track = u.track;
+    m.artist = u.artist;
+    m.album = u.album;
+    m.duration = u.duration;
+    m.watch = u.watch;
+    m.base_pos = new_base;
+    m.sampled_at = Instant::now();
+}
+
 pub fn spawn_music(shared: Shared) {
-    thread::spawn(move || loop {
-        let out = Command::new("osascript").arg("-e").arg(MUSIC_SCRIPT).output();
-        if let Ok(o) = out {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            let line = raw.trim();
-            let mut s = shared.lock().unwrap();
-            if line == "NOTRUNNING" {
-                s.music.running = false;
-                s.music.playing = false;
-            } else if line == "STOPPED" || line.is_empty() {
-                s.music.running = true;
-                s.music.playing = false;
-            } else {
-                let f: Vec<&str> = line.split('\t').collect();
-                if f.len() >= 6 {
-                    let new_playing = f[0].eq_ignore_ascii_case("playing");
-                    let track = f[1].to_string();
-                    let artist = f[2].to_string();
-                    let album = f[3].to_string();
-                    let duration: f64 = f[4].parse().unwrap_or(0.0);
-                    let polled: f64 = f[5].parse().unwrap_or(0.0);
+    thread::spawn(move || {
+        // System now-playing (via the `swift`/MediaRemote helper) is the only way
+        // to see TV-app *streaming*, but it spawns a process, so probe it on a
+        // slower cadence than Music's AppleScript and synthesize the live position
+        // from the local clock between probes.
+        let mut np: Option<crate::nowplaying::NowPlaying> = None;
+        let mut np_at = Instant::now();
+        let mut enrich = crate::state::WatchMeta::default();
+        let mut enriched_title = String::new();
+        let mut first = true;
 
-                    // Where our interpolated clock *thinks* we are right now.
-                    let same_track =
-                        s.music.track == track && s.music.artist == artist && s.music.album == album;
-                    let was_playing = s.music.playing;
-                    let predicted = if was_playing {
-                        s.music.base_pos + s.music.sampled_at.elapsed().as_secs_f64()
-                    } else {
-                        s.music.base_pos
-                    };
-                    // Snap on track change / play-state change / seek; otherwise
-                    // slew gently toward the truth so the wipe never hitches.
-                    let snap = !same_track
-                        || !was_playing
-                        || !new_playing
-                        || (polled - predicted).abs() > 1.5;
-                    let new_base = if snap {
-                        polled
-                    } else {
-                        predicted + (polled - predicted) * 0.25
-                    };
-
-                    s.music.running = true;
-                    s.music.playing = new_playing;
-                    s.music.track = track;
-                    s.music.artist = artist;
-                    s.music.album = album;
-                    s.music.duration = duration;
-                    s.music.base_pos = new_base;
-                    s.music.sampled_at = Instant::now();
+        loop {
+            if first || np_at.elapsed() >= Duration::from_millis(1500) {
+                np = crate::nowplaying::get();
+                np_at = Instant::now();
+                first = false;
+                // When the watched title changes, enrich it: TV.app's richer
+                // metadata for downloaded items, else iTunes for year/genre/poster.
+                if let Some(n) = np.as_ref().filter(|n| n.is_video) {
+                    if n.title != enriched_title {
+                        enriched_title = n.title.clone();
+                        enrich = enrich_watch(&n.title);
+                    }
+                } else {
+                    enriched_title.clear();
+                    enrich = crate::state::WatchMeta::default();
                 }
             }
-            s.music.polled = true; // real music state is now known
+
+            // Turn the cached system now-playing into a "watching" update, with the
+            // position advanced from the local clock since the last probe.
+            let video = np.as_ref().filter(|n| n.is_video).map(|n| {
+                let pos = if n.playing { n.elapsed + np_at.elapsed().as_secs_f64() } else { n.elapsed };
+                MediaUpdate {
+                    source: crate::state::MediaSource::Tv,
+                    playing: n.playing,
+                    track: n.title.clone(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration: n.duration,
+                    position: pos.min(n.duration.max(0.0)),
+                    watch: crate::state::WatchMeta {
+                        kind: if enrich.kind.is_empty() { "movie".into() } else { enrich.kind.clone() },
+                        ..enrich.clone()
+                    },
+                }
+            });
+            let video_playing = video.as_ref().map(|v| v.playing).unwrap_or(false);
+
+            // TV takes priority: anything actively WATCHING beats Apple Music. Only
+            // when nothing is being watched do we fall back to the music player.
+            let chosen = if video_playing {
+                video
+            } else {
+                let music = probe_music_np();
+                if music.as_ref().map(|m| m.playing).unwrap_or(false) {
+                    music // listening to music
+                } else {
+                    // Neither actively playing: a paused show still beats a paused
+                    // song, then fall back to whatever's loaded.
+                    video.or(music)
+                }
+            };
+
+            let mut s = shared.lock().unwrap();
+            match chosen {
+                Some(u) => apply_media(&mut s.music, u),
+                None => {
+                    s.music.running = false;
+                    s.music.playing = false;
+                    s.music.track.clear();
+                    s.music.watch = crate::state::WatchMeta::default();
+                    s.music.source = crate::state::MediaSource::Music;
+                }
+            }
+            s.music.polled = true;
+            drop(s);
+            thread::sleep(Duration::from_millis(500));
         }
-        thread::sleep(Duration::from_millis(500));
     });
+}
+
+/// Best-effort metadata for a watched title. Tries TV.app (rich for downloaded
+/// library items: show/season/episode/director), then Wikipedia (poster + year,
+/// reliable even for studio films iTunes drops) plus iTunes (genre/director).
+fn enrich_watch(title: &str) -> crate::state::WatchMeta {
+    // TV.app first — only useful when it actually has the item in its library.
+    if let Some(tv) = probe_tv_np() {
+        if !tv.watch.show.is_empty() || !tv.watch.director.is_empty() || !tv.watch.year.is_empty() {
+            return tv.watch;
+        }
+    }
+    let mut m = crate::state::WatchMeta { kind: "movie".into(), ..Default::default() };
+    if let Some((extract, img)) = wiki_summary(title, true) {
+        m.poster_url = img;
+        m.year = parse_year(&extract);
+    }
+    // iTunes adds genre/director when it has the film (absent for some studios).
+    if let Some(it) = itunes_lookup(title) {
+        if m.year.is_empty() {
+            m.year = it.year;
+        }
+        if m.poster_url.is_empty() {
+            m.poster_url = it.poster_url;
+        }
+        m.genre = it.genre;
+        m.director = it.director;
+    }
+    m
+}
+
+/// First plausible release year (19xx/20xx) mentioned in a film's lead extract.
+fn parse_year(text: &str) -> String {
+    let bytes = text.as_bytes();
+    for w in bytes.windows(4) {
+        if (w[0] == b'1' && w[1] == b'9' || w[0] == b'2' && w[1] == b'0')
+            && w[2].is_ascii_digit()
+            && w[3].is_ascii_digit()
+        {
+            return String::from_utf8_lossy(w).to_string();
+        }
+    }
+    String::new()
+}
+
+/// Keyless iTunes Search lookup → year/genre/director/poster folded into a
+/// WatchMeta. Empty for titles iTunes doesn't carry.
+fn itunes_lookup(title: &str) -> Option<crate::state::WatchMeta> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let url = format!(
+        "https://itunes.apple.com/search?media=movie&entity=movie&limit=1&term={}",
+        urlencode(title)
+    );
+    let v: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
+    let r = v.get("results")?.get(0)?;
+    let year = r
+        .get("releaseDate")
+        .and_then(|d| d.as_str())
+        .map(|d| d.chars().take(4).collect::<String>())
+        .unwrap_or_default();
+    let genre = r.get("primaryGenreName").and_then(|g| g.as_str()).unwrap_or("").to_string();
+    let director = r.get("artistName").and_then(|a| a.as_str()).unwrap_or("").to_string();
+    let poster = r
+        .get("artworkUrl100")
+        .and_then(|u| u.as_str())
+        .map(|u| u.replace("100x100bb", "600x600bb"))
+        .unwrap_or_default();
+    Some(crate::state::WatchMeta {
+        year,
+        genre,
+        director,
+        kind: "movie".into(),
+        poster_url: poster,
+        ..Default::default()
+    })
+}
+
+/// Fetch a Wikipedia REST summary for `title` → (lead extract, lead image URL).
+/// When `film` is set, tries film-disambiguated titles first so a movie wins over
+/// a same-named topic. Used for the poster and the synopsis panel.
+fn wiki_summary(title: &str, film: bool) -> Option<(String, String)> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let mut titles = Vec::new();
+    if film {
+        titles.push(format!("{title} (film)"));
+    }
+    titles.push(title.to_string());
+    for t in titles {
+        let url = format!(
+            "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+            urlencode(&t).replace("%20", "%20")
+        );
+        let Ok(resp) = agent.get(&url).set("User-Agent", FACTS_UA).call() else { continue };
+        let Ok(v) = resp.into_json::<serde_json::Value>() else { continue };
+        if v.get("type").and_then(|x| x.as_str()) == Some("disambiguation") {
+            continue;
+        }
+        let extract = v.get("extract").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let img = v
+            .get("originalimage")
+            .or_else(|| v.get("thumbnail"))
+            .and_then(|t| t.get("source"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !extract.is_empty() || !img.is_empty() {
+            return Some((extract, img));
+        }
+    }
+    None
+}
+
+/// Minimal percent-encoding for a query term (spaces + reserved chars).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Headless probe of the TV now-watching path (`studioboard --diag-tv`).
+pub fn diag_tv() {
+    println!("Probing TV.app …\n");
+    match probe_tv_np() {
+        None => println!("  (TV not running, or nothing loaded — start a movie/show and retry)"),
+        Some(u) => {
+            println!("  playing  : {}", u.playing);
+            println!("  title    : {}", u.track);
+            println!("  show     : {}", if u.watch.show.is_empty() { "(movie)" } else { &u.watch.show });
+            println!("  S/E      : S{} E{}", u.watch.season, u.watch.episode);
+            println!("  year     : {}", u.watch.year);
+            println!("  genre    : {}", u.watch.genre);
+            println!("  director : {}", u.watch.director);
+            println!("  kind     : {}", u.watch.kind);
+            println!("  duration : {:.0}s   position : {:.0}s", u.duration, u.position);
+        }
+    }
 }
 
 /// Watches for track changes and fetches lyrics off the network thread so the
@@ -472,9 +813,13 @@ pub fn spawn_lyrics(shared: Shared) {
             shared.lock().unwrap().lyrics_misses = n;
         }
         loop {
+            // Watching a movie/show has no lyrics — park a friendly note and skip
+            // the LRCLIB lookups entirely (no point hammering the API with titles).
             let info = {
                 let s = shared.lock().unwrap();
-                if s.music.running && !s.music.track.is_empty() {
+                if s.music.is_tv() {
+                    None
+                } else if s.music.running && !s.music.track.is_empty() {
                     Some((
                         s.music.track_id(),
                         s.music.artist.clone(),
@@ -486,6 +831,18 @@ pub fn spawn_lyrics(shared: Shared) {
                     None
                 }
             };
+            {
+                let mut s = shared.lock().unwrap();
+                if s.music.is_tv() && s.music.track_id() != s.lyrics.track_id {
+                    s.lyrics = crate::state::Lyrics {
+                        lines: Vec::new(),
+                        synced: false,
+                        track_id: s.music.track_id(),
+                        note: "▶ now watching".into(),
+                    };
+                    current = s.music.track_id();
+                }
+            }
             if let Some((id, artist, track, album, dur)) = info {
                 if id != current {
                     current = id.clone();
@@ -584,10 +941,10 @@ pub fn spawn_lyrics_reconcile(shared: Shared) {
 // ---------------------------------------------------------------------------
 const ART_THUMB: u32 = 160;
 
-fn artwork_script(path: &str) -> String {
+fn artwork_script(app: &str, path: &str) -> String {
     format!(
         r#"
-tell application "Music"
+tell application "{app}"
   if not (exists current track) then return "NOTRACK"
   try
     set d to data of artwork 1 of current track
@@ -618,25 +975,39 @@ pub fn spawn_artwork(shared: Shared) {
         let path_str = path.to_string_lossy().to_string();
         let mut current = String::new();
         loop {
-            let id = {
+            let id_src = {
                 let s = shared.lock().unwrap();
                 if s.music.running && !s.music.track.is_empty() {
-                    Some(s.music.track_id())
+                    Some((s.music.track_id(), s.music.source, s.music.watch.poster_url.clone()))
                 } else {
                     None
                 }
             };
-            if let Some(id) = id {
+            if let Some((id, source, poster_url)) = id_src {
                 if id != current {
                     current = id.clone();
-                    // Warm from the disk cache first so a song heard once shows its
-                    // cover instantly, with no AppleScript/decode on replay.
+                    let app = match source {
+                        crate::state::MediaSource::Tv => "TV",
+                        crate::state::MediaSource::Music => "Music",
+                    };
+                    // Warm from the disk cache first so a cover seen once shows
+                    // instantly, with no AppleScript/decode on replay.
                     let art = if let Some(cached) = load_art_cache(&id) {
                         cached
+                    } else if source == crate::state::MediaSource::Tv && !poster_url.is_empty() {
+                        // Streamed film: the TV app exposes no artwork, so decode the
+                        // iTunes poster we resolved by title.
+                        match fetch_poster(&poster_url, &path, &id) {
+                            Some(decoded) => {
+                                save_art_cache(&id, &decoded);
+                                decoded
+                            }
+                            None => crate::state::AlbumArt { track_id: id.clone(), ..Default::default() },
+                        }
                     } else {
                         let out = Command::new("osascript")
                             .arg("-e")
-                            .arg(artwork_script(&path_str))
+                            .arg(artwork_script(app, &path_str))
                             .output();
                         let ok = out
                             .as_ref()
@@ -675,7 +1046,7 @@ pub fn probe_artwork() -> Option<(usize, usize, usize, [u8; 3])> {
     let path_str = path.to_string_lossy().to_string();
     let out = Command::new("osascript")
         .arg("-e")
-        .arg(artwork_script(&path_str))
+        .arg(artwork_script("Music", &path_str))
         .output()
         .ok()?;
     if String::from_utf8_lossy(&out.stdout).trim() != "OK" {
@@ -737,6 +1108,26 @@ fn load_art_cache(id: &str) -> Option<crate::state::AlbumArt> {
     }
     let px = body.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
     Some(crate::state::AlbumArt { track_id: id.to_string(), w, h, px })
+}
+
+/// Download a poster image (iTunes) to `path` and decode it like album art.
+/// Used for streamed films whose cover the TV app won't hand over.
+fn fetch_poster(url: &str, path: &std::path::Path, id: &str) -> Option<crate::state::AlbumArt> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(10))
+        .build();
+    let resp = agent.get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    resp.into_reader().take(8 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
+    std::fs::write(path, &bytes).ok()?;
+    let art = decode_art(path, id);
+    if art.px.is_empty() {
+        None
+    } else {
+        Some(art)
+    }
 }
 
 fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
@@ -801,8 +1192,15 @@ end if
 pub fn spawn_queue(shared: Shared) {
     thread::spawn(move || loop {
         let want = {
-            let s = shared.lock().unwrap();
-            if s.music.running && !s.music.track.is_empty() {
+            let mut s = shared.lock().unwrap();
+            // No "up next" while watching TV — and clear any stale music queue so a
+            // paused Music playlist can't leak onto the watching view.
+            if s.music.is_tv() {
+                if !s.queue.items.is_empty() || !s.queue.fresh {
+                    s.queue = crate::state::Queue { fresh: true, ..Default::default() };
+                }
+                None
+            } else if s.music.running && !s.music.track.is_empty() {
                 Some(s.music.track_id())
             } else {
                 None
@@ -869,24 +1267,53 @@ pub fn spawn_facts(shared: Shared) {
             .build();
         let mut cache: std::collections::HashMap<String, crate::state::MusicFacts> =
             Default::default();
+        let mut wcache: std::collections::HashMap<String, crate::state::WatchInfo> =
+            Default::default();
         let mut current = String::new();
         loop {
             let info = {
                 let s = shared.lock().unwrap();
                 if s.music.running && !s.music.track.is_empty() {
-                    Some((
-                        s.music.track_id(),
-                        s.music.artist.clone(),
-                        s.music.track.clone(),
-                        s.music.album.clone(),
-                    ))
+                    Some(FactSubject::from_music(&s.music))
                 } else {
                     None
                 }
             };
-            if let Some((id, artist, track, album)) = info {
+            if let Some(subject) = info {
+                let id = subject.id.clone();
                 if id != current {
                     current = id.clone();
+
+                    // Watching: gather the synopsis + credits for the repurposed
+                    // LYRICS card; clear it when we're back on music.
+                    if subject.is_tv {
+                        if let Some(hit) = wcache.get(&id).cloned() {
+                            let mut s = shared.lock().unwrap();
+                            if s.music.track_id() == id {
+                                s.watch_info = hit;
+                            }
+                        } else {
+                            {
+                                let mut s = shared.lock().unwrap();
+                                if s.music.track_id() == id {
+                                    s.watch_info = crate::state::WatchInfo {
+                                        track_id: id.clone(),
+                                        note: "gathering synopsis…".into(),
+                                        ..Default::default()
+                                    };
+                                }
+                            }
+                            let wi = build_watch_info(&agent, &subject);
+                            wcache.insert(id.clone(), wi.clone());
+                            let mut s = shared.lock().unwrap();
+                            if s.music.track_id() == id {
+                                s.watch_info = wi;
+                            }
+                        }
+                    } else {
+                        let mut s = shared.lock().unwrap();
+                        s.watch_info = crate::state::WatchInfo::default();
+                    }
                     // Warm from the in-memory cache first, then disk (survives
                     // restarts), before spending a network/LLM call.
                     let warm = cache.get(&id).cloned().or_else(|| load_facts_cache(&id));
@@ -904,12 +1331,16 @@ pub fn spawn_facts(shared: Shared) {
                             if s.music.track_id() == id {
                                 s.facts = crate::state::MusicFacts {
                                     track_id: id.clone(),
-                                    note: "gathering liner notes…".into(),
+                                    note: if subject.is_tv {
+                                        "gathering trivia…".into()
+                                    } else {
+                                        "gathering liner notes…".into()
+                                    },
                                     ..Default::default()
                                 };
                             }
                         }
-                        let facts = build_facts(&agent, &artist, &track, &album, &id);
+                        let facts = build_facts(&agent, &subject);
                         cache.insert(id.clone(), facts.clone());
                         // Persist only real results — skip empty/note-only so a
                         // transient failure never becomes a sticky cache miss.
@@ -946,14 +1377,82 @@ fn save_facts_cache(id: &str, facts: &crate::state::MusicFacts) {
     crate::cache::put_json("facts", id, facts);
 }
 
+/// What the LINER NOTES / TRIVIA card is gathering facts about — a song or a
+/// film/episode. Carries just enough to write a grounded prompt + a wiki query.
+pub struct FactSubject {
+    pub id: String,
+    pub is_tv: bool,
+    pub artist: String,
+    pub track: String,
+    pub album: String,
+    pub show: String,
+    pub year: String,
+    pub genre: String,
+    pub director: String,
+    pub season: u32,
+    pub episode: u32,
+}
+
+impl FactSubject {
+    fn from_music(m: &crate::state::MusicStats) -> Self {
+        FactSubject {
+            id: m.track_id(),
+            is_tv: m.is_tv(),
+            artist: m.artist.clone(),
+            track: m.track.clone(),
+            album: m.album.clone(),
+            show: m.watch.show.clone(),
+            year: m.watch.year.clone(),
+            genre: m.watch.genre.clone(),
+            director: m.watch.director.clone(),
+            season: m.watch.season,
+            episode: m.watch.episode,
+        }
+    }
+    /// Human phrase naming the work, for prompts/logs ("the film X", "X from the
+    /// series Y", "the song A by B").
+    fn phrase(&self) -> String {
+        if self.is_tv {
+            if self.show.is_empty() {
+                let yr = if self.year.is_empty() { String::new() } else { format!(" ({})", self.year) };
+                format!("the film \"{}\"{}", self.track, yr)
+            } else {
+                format!("the episode \"{}\" of the series \"{}\"", self.track, self.show)
+            }
+        } else {
+            format!("the song \"{}\" by {}", self.track, self.artist)
+        }
+    }
+    /// Best single Wikipedia title to look up for the keyless fallback.
+    fn wiki_title(&self) -> String {
+        if self.is_tv {
+            if self.show.is_empty() { self.track.clone() } else { self.show.clone() }
+        } else {
+            self.track.clone()
+        }
+    }
+}
+
 /// One-shot facts probe for diagnostics (`studioboard --facts`).
 pub fn probe_facts(artist: &str, track: &str, album: &str) -> crate::state::MusicFacts {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(4))
         .timeout_read(Duration::from_secs(20))
         .build();
-    let id = format!("{artist}|{track}|{album}");
-    build_facts(&agent, artist, track, album, &id)
+    let subject = FactSubject {
+        id: format!("{artist}|{track}|{album}"),
+        is_tv: false,
+        artist: artist.into(),
+        track: track.into(),
+        album: album.into(),
+        show: String::new(),
+        year: String::new(),
+        genre: String::new(),
+        director: String::new(),
+        season: 0,
+        episode: 0,
+    };
+    build_facts(&agent, &subject)
 }
 
 /// Resolve the Anthropic API key without an interactive prompt. Tries the
@@ -985,16 +1484,15 @@ fn anthropic_key() -> Option<String> {
     }
 }
 
-pub fn build_facts(
-    agent: &ureq::Agent,
-    artist: &str,
-    track: &str,
-    album: &str,
-    id: &str,
-) -> crate::state::MusicFacts {
-    let mut out = crate::state::MusicFacts { track_id: id.to_string(), ..Default::default() };
+pub fn build_facts(agent: &ureq::Agent, subject: &FactSubject) -> crate::state::MusicFacts {
+    let mut out = crate::state::MusicFacts { track_id: subject.id.clone(), ..Default::default() };
     if let Some(key) = anthropic_key() {
-        if let Some(lines) = facts_via_claude(agent, &key, artist, track, album) {
+        let lines = if subject.is_tv {
+            facts_via_claude_watch(agent, &key, subject)
+        } else {
+            facts_via_claude(agent, &key, &subject.artist, &subject.track, &subject.album)
+        };
+        if let Some(lines) = lines {
             if !lines.is_empty() {
                 out.lines = lines;
                 out.source = "claude".into();
@@ -1002,15 +1500,219 @@ pub fn build_facts(
             }
         }
     }
-    if let Some(lines) = facts_via_wikipedia(agent, artist, track, album) {
+    let wiki = if subject.is_tv {
+        facts_via_wikipedia_watch(agent, subject)
+    } else {
+        facts_via_wikipedia(agent, &subject.artist, &subject.track, &subject.album)
+    };
+    if let Some(lines) = wiki {
         if !lines.is_empty() {
             out.lines = lines;
             out.source = "wikipedia".into();
             return out;
         }
     }
-    out.note = "no liner notes found".into();
+    out.note = if subject.is_tv { "no trivia found".into() } else { "no liner notes found".into() };
     out
+}
+
+/// Ask the model for punchy facts about a film/episode — cast, production,
+/// reception, behind-the-scenes. Mirrors `facts_via_claude` for music.
+fn facts_via_claude_watch(
+    agent: &ureq::Agent,
+    key: &str,
+    subject: &FactSubject,
+) -> Option<Vec<String>> {
+    let system = "You are a film & TV buff writing punchy trivia for a now-watching \
+dashboard. Output ONLY the facts — one per line, no numbering, no bullets, no \
+preamble, no caveats, no sign-off. NEVER refuse and NEVER add commentary about \
+your confidence. If unsure of a hyper-specific detail, give a fact you ARE \
+confident about (a lead actor, the director, the production, its reception or \
+cultural impact). Every line is a concrete, surprising fact under 18 words.";
+    let mut ctx = String::new();
+    if !subject.director.is_empty() {
+        ctx.push_str(&format!(" Directed by {}.", subject.director));
+    }
+    if !subject.genre.is_empty() {
+        ctx.push_str(&format!(" Genre: {}.", subject.genre));
+    }
+    let prompt = format!(
+        "Four facts about {}.{} Favor the main cast (who stars in it), the \
+         director, production lore, awards or box-office/streaming feats, and \
+         behind-the-scenes trivia a superfan would geek out over.",
+        subject.phrase(),
+        ctx
+    );
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 400,
+        "system": system,
+        "messages": [{ "role": "user", "content": prompt }]
+    });
+    let resp: serde_json::Value = agent
+        .post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+        .ok()?
+        .into_json()
+        .ok()?;
+    let text = resp.get("content")?.get(0)?.get("text")?.as_str()?;
+    if looks_like_refusal(text) {
+        return None;
+    }
+    let lines: Vec<String> = text
+        .lines()
+        .filter_map(clean_fact)
+        .filter(|l| !looks_like_refusal(l))
+        .take(6)
+        .collect();
+    if lines.len() < 2 {
+        None
+    } else {
+        Some(lines)
+    }
+}
+
+/// Keyless fallback for watching: stitch sentences from the film/series'
+/// Wikipedia extract.
+fn facts_via_wikipedia_watch(agent: &ureq::Agent, subject: &FactSubject) -> Option<Vec<String>> {
+    let title = subject.wiki_title();
+    let ex = wiki_extract(agent, &title)
+        .or_else(|| wiki_extract(agent, &format!("{title} (film)")))
+        .or_else(|| wiki_extract(agent, &format!("{title} (TV series)")))?;
+    let facts: Vec<String> = sentences(&ex).into_iter().take(5).collect();
+    if facts.is_empty() {
+        None
+    } else {
+        Some(facts)
+    }
+}
+
+/// Gather the synopsis + key credits for the watching card: a Wikipedia lead
+/// synopsis, with director/cast from Claude (Wikipedia-parse as a fallback).
+fn build_watch_info(agent: &ureq::Agent, subject: &FactSubject) -> crate::state::WatchInfo {
+    let mut wi = crate::state::WatchInfo { track_id: subject.id.clone(), ..Default::default() };
+    if let Some((extract, _)) = wiki_summary(&subject.wiki_title(), true) {
+        wi.synopsis = sentences(&extract).into_iter().take(3).collect::<Vec<_>>().join(" ");
+        // Cheap parse straight from the lead — overwritten by Claude when available.
+        wi.director = capture_after(&extract, &["directed by ", "director "]);
+        wi.cast = capture_list(&extract, &["stars ", "starring ", "featuring "]);
+    }
+    if let Some(key) = anthropic_key() {
+        if let Some((dir, cast)) = watch_credits_via_claude(agent, &key, subject) {
+            if !dir.is_empty() {
+                wi.director = dir;
+            }
+            if !cast.is_empty() {
+                wi.cast = cast;
+            }
+        }
+    }
+    if wi.synopsis.is_empty() {
+        wi.note = "no synopsis found".into();
+    }
+    wi
+}
+
+/// Ask Claude for the director + top-billed cast as two clean lines.
+fn watch_credits_via_claude(
+    agent: &ureq::Agent,
+    key: &str,
+    subject: &FactSubject,
+) -> Option<(String, Vec<String>)> {
+    let prompt = format!(
+        "For {}, output EXACTLY two lines and nothing else:\n\
+         Director: <director full name>\n\
+         Cast: <the 4 top-billed actors, comma-separated>",
+        subject.phrase()
+    );
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 200,
+        "messages": [{ "role": "user", "content": prompt }]
+    });
+    let resp: serde_json::Value = agent
+        .post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+        .ok()?
+        .into_json()
+        .ok()?;
+    let text = resp.get("content")?.get(0)?.get("text")?.as_str()?;
+    let mut director = String::new();
+    let mut cast = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("Director:").or_else(|| l.strip_prefix("director:")) {
+            director = rest.trim().to_string();
+        } else if let Some(rest) = l.strip_prefix("Cast:").or_else(|| l.strip_prefix("cast:")) {
+            cast = rest
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .take(4)
+                .collect();
+        }
+    }
+    if director.is_empty() && cast.is_empty() {
+        None
+    } else {
+        Some((director, cast))
+    }
+}
+
+/// Capture the words right after the first matching marker, up to a sentence
+/// break or a connective ("and"/"from"/","). Best-effort name extraction.
+fn capture_after(text: &str, markers: &[&str]) -> String {
+    let lower = text.to_lowercase();
+    for m in markers {
+        if let Some(i) = lower.find(m) {
+            let rest = &text[i + m.len()..];
+            let end = rest
+                .find(|c| c == '.' || c == ',' || c == ';')
+                .unwrap_or(rest.len());
+            let span = rest[..end].trim();
+            // Stop at a connective so "George Lucas and produced by…" → "George Lucas".
+            let span = span
+                .split(" and ")
+                .next()
+                .unwrap_or(span)
+                .split(" from ")
+                .next()
+                .unwrap_or(span)
+                .trim();
+            if !span.is_empty() && span.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                return span.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Capture a comma/"and"-separated list of names following a marker ("stars …").
+fn capture_list(text: &str, markers: &[&str]) -> Vec<String> {
+    let lower = text.to_lowercase();
+    for m in markers {
+        if let Some(i) = lower.find(m) {
+            let rest = &text[i + m.len()..];
+            let end = rest.find('.').unwrap_or(rest.len());
+            let span = rest[..end].replace(" and ", ", ");
+            let names: Vec<String> = span
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+                .take(4)
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Ask Haiku for a handful of short, surprising, *specific* facts. Best-effort:
@@ -1585,8 +2287,382 @@ fn short_model(m: &str) -> String {
         "Sonnet".into()
     } else if l.contains("haiku") {
         "Haiku".into()
+    } else if l.contains("fable") {
+        "Fable".into()
     } else {
         m.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live Claude Code sessions: a realtime "who's working" feed for the ROBOTS
+// card. Unlike spawn_usage (which fully parses every transcript every 8s for
+// aggregate token stats), this thread is deliberately cheap and fast — it only
+// looks at transcripts touched in the last LIVE_WINDOW_SECS and reads just the
+// tail of each, so it can poll ~1 Hz and reflect what each robot is doing now.
+// ---------------------------------------------------------------------------
+
+/// A session whose JSONL was appended-to within this many seconds is "live".
+/// Long-running tools (a slow build, a deep agent) can sit quiet a while, so the
+/// window is generous; the UI fades a row out as it ages toward the edge.
+const LIVE_WINDOW_SECS: f64 = 120.0;
+
+/// Bytes off the end of a transcript we parse to learn its current state. A few
+/// turns of context (tool calls + results) fit comfortably; big tool_results are
+/// the main bulk, and we only need the last meaningful message anyway.
+const TAIL_BYTES: u64 = 96 * 1024;
+
+/// Headless probe of the live-session feed: runs the real scan against
+/// `~/.claude/projects` and prints the roster, so the collector can be verified
+/// without the TUI. `studioboard --diag-live`.
+pub fn diag_live_sessions() {
+    use crate::state::ActionKind as K;
+    let live = scan_live_sessions();
+    println!(
+        "live sessions (active within {LIVE_WINDOW_SECS:.0}s): {}\n",
+        live.sessions.len()
+    );
+    for s in &live.sessions {
+        let kind = match s.kind {
+            K::Idle => "idle",
+            K::Think => "think",
+            K::Run => "run",
+            K::Edit => "edit",
+            K::Read => "read",
+            K::Web => "web",
+            K::Agent => "agent",
+            K::Tool => "tool",
+            K::Respond => "respond",
+        };
+        println!(
+            "  {:>5.1}s  [{:<7}] {:<16} {:<7} {:<40} ({})",
+            s.age_secs,
+            kind,
+            s.project,
+            s.model,
+            s.action,
+            if s.branch.is_empty() { "-" } else { &s.branch },
+        );
+    }
+    if live.sessions.is_empty() {
+        println!("  (no Claude Code transcripts touched recently — start a session to see one)");
+    }
+}
+
+pub fn spawn_live_sessions(shared: Shared) {
+    thread::spawn(move || loop {
+        let live = scan_live_sessions();
+        {
+            let mut s = shared.lock().unwrap();
+            s.live = live;
+        }
+        thread::sleep(Duration::from_millis(900));
+    });
+}
+
+fn scan_live_sessions() -> crate::state::LiveSessions {
+    use crate::state::LiveSessions;
+    let Some(base) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) else {
+        return LiveSessions { fresh: true, sessions: Vec::new() };
+    };
+    let now = std::time::SystemTime::now();
+    let mut sessions = Vec::new();
+
+    for path in walk_jsonl(&base) {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(modt) = meta.modified() else { continue };
+        let age = now.duration_since(modt).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        if age > LIVE_WINDOW_SECS {
+            continue;
+        }
+        if let Some(sess) = read_session_tail(&path, meta.len()) {
+            sessions.push(sess);
+        }
+    }
+    // Newest-active first — the hottest robots sit at the top of the feed.
+    sessions.sort_by(|a, b| a.age_secs.partial_cmp(&b.age_secs).unwrap_or(std::cmp::Ordering::Equal));
+    LiveSessions { fresh: true, sessions }
+}
+
+/// Decode the project leaf name from a transcript path. Claude Code stores
+/// transcripts under `~/.claude/projects/<encoded-cwd>/<id>.jsonl`, where
+/// `<encoded-cwd>` is the launch directory with every `/` replaced by `-`. That
+/// mapping is ambiguous for folders that contain real dashes (`my-cool-app`), so
+/// we rebuild the actual path by greedily matching the longest run of segments
+/// that resolves to a real directory, then take its basename.
+fn project_from_dir(path: &std::path::Path) -> String {
+    let Some(dirname) = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return String::new();
+    };
+    let parts: Vec<&str> = dirname.trim_start_matches('-').split('-').collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut cur = std::path::PathBuf::from("/");
+    let mut i = 0;
+    while i < parts.len() {
+        // Longest run [i..j) that forms an existing directory wins, so a dashed
+        // folder name (joined back with '-') is preferred over a shorter match.
+        let mut matched = false;
+        let mut j = parts.len();
+        while j > i {
+            let seg = parts[i..j].join("-");
+            let cand = cur.join(&seg);
+            if cand.is_dir() {
+                cur = cand;
+                i = j;
+                matched = true;
+                break;
+            }
+            j -= 1;
+        }
+        if !matched {
+            // Path no longer on disk (project moved/deleted): take the remaining
+            // tail naively so we still show *something* sensible.
+            return parts[i..].join("-");
+        }
+    }
+    cur.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Read just the tail of a transcript and distill the session's current state.
+/// Returns None for transcripts with no usable message in the tail (e.g. a file
+/// that's all meta lines).
+fn read_session_tail(path: &std::path::Path, len: u64) -> Option<crate::state::LiveSession> {
+    use crate::state::{ActionKind, LiveSession};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let start = len.saturating_sub(TAIL_BYTES);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = String::new();
+    // Lossy: a mid-multibyte seek can split a UTF-8 char; we only need to read,
+    // and the first (partial) line is discarded below anyway.
+    let mut raw = Vec::new();
+    f.read_to_end(&mut raw).ok()?;
+    buf.push_str(&String::from_utf8_lossy(&raw));
+
+    let mut lines: Vec<&str> = buf.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // drop the partial first line from the mid-file seek
+    }
+
+    // Scan from the newest line backward, collecting the first of each thing we
+    // need. `kind`/`action` are decided by the most recent *real* message.
+    let mut model = String::new();
+    let mut branch = String::new();
+    let mut sid = String::new();
+    let mut last_ts: Option<DateTime<chrono::FixedOffset>> = None;
+    let mut state: Option<(ActionKind, String)> = None;
+    // The most recent tool_use we saw — used to label a session that's currently
+    // chewing on a tool_result (the tool just finished; show what it was).
+    let mut recent_tool: Option<(ActionKind, String)> = None;
+
+    for line in lines.iter().rev() {
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if sid.is_empty() {
+            if let Some(x) = v.get("sessionId").and_then(|x| x.as_str()) {
+                sid = x.to_string();
+            }
+        }
+        if branch.is_empty() {
+            if let Some(x) = v.get("gitBranch").and_then(|x| x.as_str()) {
+                branch = x.to_string();
+            }
+        }
+        if last_ts.is_none() {
+            if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
+                last_ts = DateTime::parse_from_rfc3339(ts).ok();
+            }
+        }
+
+        let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let msg = v.get("message");
+        if model.is_empty() {
+            if let Some(m) = msg.and_then(|m| m.get("model")).and_then(|x| x.as_str()) {
+                if m != "<synthetic>" {
+                    model = short_model(m);
+                }
+            }
+        }
+
+        // Note the most recent tool_use for the tool_result fallback label.
+        if recent_tool.is_none() && typ == "assistant" {
+            if let Some(content) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for b in content.iter().rev() {
+                    if b.get("type").and_then(|x| x.as_str()) == Some("tool_use") {
+                        let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+                        let empty = serde_json::Value::Null;
+                        let input = b.get("input").unwrap_or(&empty);
+                        recent_tool = Some(describe_tool(name, input));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The first real message (from the end) fixes the session's live state.
+        if state.is_none() {
+            if typ == "assistant" {
+                state = assistant_state(msg);
+            } else if typ == "user" {
+                // A tool_result arriving last means the assistant is mid-turn,
+                // about to act on it — show the tool that just completed.
+                let is_tool_result = msg
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .any(|b| b.get("type").and_then(|x| x.as_str()) == Some("tool_result"))
+                    })
+                    .unwrap_or(false);
+                if is_tool_result {
+                    state = recent_tool
+                        .clone()
+                        .or(Some((ActionKind::Tool, "working".into())));
+                }
+            }
+        }
+
+        // Stop once we've learned everything we can from this tail.
+        if state.is_some() && !model.is_empty() && !sid.is_empty() && !branch.is_empty() {
+            break;
+        }
+    }
+
+    let (kind, action) = state.or(recent_tool).unwrap_or((
+        crate::state::ActionKind::Idle,
+        "idle".into(),
+    ));
+
+    // Prefer the precise last-event timestamp; fall back to file mtime age.
+    let age_secs = match last_ts {
+        Some(ts) => (Local::now().with_timezone(ts.offset()) - ts)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0,
+        None => std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    };
+
+    // Project identity comes from the transcript's encoded directory name, not
+    // the per-line `cwd` (which drifts as the session `cd`s into subdirs and would
+    // make the feed row's label flicker). The dir name is the launch cwd with
+    // every '/' turned into '-'; we rebuild the real path to take a correct leaf.
+    let project = project_from_dir(path);
+
+    Some(LiveSession {
+        session_id: sid,
+        project,
+        branch,
+        model,
+        action,
+        kind,
+        age_secs,
+    })
+}
+
+/// Decide a live state from the latest assistant message's final content block.
+fn assistant_state(
+    msg: Option<&serde_json::Value>,
+) -> Option<(crate::state::ActionKind, String)> {
+    use crate::state::ActionKind;
+    let msg = msg?;
+    let content = msg.get("content").and_then(|c| c.as_array())?;
+    let last = content.last()?;
+    match last.get("type").and_then(|x| x.as_str()) {
+        Some("tool_use") => {
+            let name = last.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+            let empty = serde_json::Value::Null;
+            let input = last.get("input").unwrap_or(&empty);
+            Some(describe_tool(name, input))
+        }
+        Some("thinking") | Some("redacted_thinking") => {
+            Some((ActionKind::Think, "thinking".into()))
+        }
+        Some("text") => {
+            // end_turn → the answer is delivered and it's the human's move.
+            let stop = msg.get("stop_reason").and_then(|x| x.as_str());
+            if matches!(stop, Some("end_turn") | Some("stop_sequence")) {
+                Some((ActionKind::Idle, "awaiting you".into()))
+            } else {
+                Some((ActionKind::Respond, "responding".into()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Map a tool call to a (kind, human label) for the live feed. Bash carries a
+/// model-written `description` we lean on; file tools show the basename.
+fn describe_tool(name: &str, input: &serde_json::Value) -> (crate::state::ActionKind, String) {
+    use crate::state::ActionKind;
+    let s = |k: &str| input.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    let base = |k: &str| {
+        let p = s(k);
+        p.rsplit('/').next().unwrap_or(p).to_string()
+    };
+    let clip = |t: &str, n: usize| {
+        let t = t.trim();
+        let mut out: String = t.chars().take(n).collect();
+        if t.chars().count() > n {
+            out.push('…');
+        }
+        out
+    };
+    match name {
+        "Bash" => {
+            let d = s("description");
+            let label = if !d.is_empty() {
+                clip(d, 38)
+            } else {
+                clip(s("command"), 38)
+            };
+            (ActionKind::Run, label)
+        }
+        "Edit" | "MultiEdit" => (ActionKind::Edit, format!("editing {}", base("file_path"))),
+        "Write" => (ActionKind::Edit, format!("writing {}", base("file_path"))),
+        "NotebookEdit" => (ActionKind::Edit, format!("editing {}", base("notebook_path"))),
+        "Read" => (ActionKind::Read, format!("reading {}", base("file_path"))),
+        "Grep" => (ActionKind::Read, format!("grep {}", clip(s("pattern"), 28))),
+        "Glob" => (ActionKind::Read, format!("glob {}", clip(s("pattern"), 28))),
+        "Task" | "Agent" => {
+            let d = s("description");
+            let d = if d.is_empty() { s("subagent_type") } else { d };
+            (ActionKind::Agent, format!("agent: {}", clip(d, 30)))
+        }
+        "WebFetch" => (ActionKind::Web, "fetching web".into()),
+        "WebSearch" => (ActionKind::Web, format!("web: {}", clip(s("query"), 30))),
+        "TodoWrite" => (ActionKind::Think, "planning".into()),
+        "AskUserQuestion" => (ActionKind::Idle, "asking you".into()),
+        "ExitPlanMode" => (ActionKind::Think, "finishing plan".into()),
+        n if n.starts_with("mcp__") => {
+            // mcp__server__tool → "server·tool"
+            let parts: Vec<&str> = n.trim_start_matches("mcp__").split("__").collect();
+            let label = match parts.as_slice() {
+                [srv, tool, ..] => format!("{}·{}", srv, tool),
+                [tool] => tool.to_string(),
+                _ => n.to_string(),
+            };
+            (ActionKind::Tool, clip(&label, 32))
+        }
+        n => (ActionKind::Tool, clip(n, 32)),
     }
 }
 
