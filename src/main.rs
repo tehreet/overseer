@@ -47,6 +47,31 @@ fn main() -> Result<()> {
         audio::diag();
         return Ok(());
     }
+    if args.iter().any(|a| a == "--diag-voice") {
+        // Headless: run only the Discord collector with voice listening on and
+        // stream the handshake log, so the voice path can be diagnosed without
+        // the TUI (which needs a real terminal). Joins voice — use briefly.
+        std::env::set_var("STUDIOBOARD_DISCORD_VOICE_LISTEN", "1");
+        let shared = Arc::new(Mutex::new(AppState::default()));
+        collectors::spawn_discord(shared);
+        let log = dirs::home_dir()
+            .map(|h| h.join(".cache/studioboard/voice.log"))
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        println!("--diag-voice: listening 20s (need someone in a voice channel)…\n");
+        let mut shown = 0u64;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(txt) = std::fs::read_to_string(&log) {
+                let lines: Vec<&str> = txt.lines().collect();
+                for l in lines.iter().skip(shown as usize) {
+                    println!("{l}");
+                }
+                shown = lines.len() as u64;
+            }
+        }
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--facts") {
         return facts_diag();
     }

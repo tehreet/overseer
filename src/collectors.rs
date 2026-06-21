@@ -2776,7 +2776,11 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let mut bot_id: Option<String> = None;
-    let mut voice_session: Option<String> = None; // our session_id (from our VOICE_STATE_UPDATE)
+    // Our MAIN gateway session_id (from READY). This is the authoritative session
+    // for our connection and is what the voice IDENTIFY must use — grabbing it from
+    // a VOICE_STATE_UPDATE can pick up a stale/foreign session (e.g. when another
+    // studioboard instance is connected as the same bot) → voice close 4006.
+    let mut gw_session: Option<String> = None;
     let mut voice_server: Option<(String, String)> = None; // (token, endpoint) from VOICE_SERVER_UPDATE
     let mut joined_channel: Option<String> = None; // channel we've asked to join
     let mut voice_alive: Option<Arc<AtomicBool>> = None; // kill-switch for the voice thread
@@ -2792,7 +2796,12 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
         // people, leave when it empties. Then, once we hold our session + the voice
         // server creds, (re)spawn the voice-WS listener.
         if listen {
-            let target = voice_target(&who, &chan, &bot_id);
+            // STUDIOBOARD_DISCORD_VOICE_FORCE=<channel_id> forces a join even when
+            // the channel is empty — purely for diagnosing the voice handshake.
+            let forced = std::env::var("STUDIOBOARD_DISCORD_VOICE_FORCE")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let target = forced.or_else(|| voice_target(&who, &chan, &bot_id));
             if target != joined_channel {
                 // self_deaf:false so Discord keeps streaming us the others' Speaking
                 // events; self_mute:true so the bot never transmits.
@@ -2807,14 +2816,13 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     if let Some(a) = voice_alive.take() {
                         a.store(false, Ordering::Relaxed);
                     }
-                    voice_session = None;
                     voice_server = None;
                     if let Ok(mut s) = shared.lock() {
                         s.discord.voice_speaking = false;
                     }
                 }
             }
-            if joined_channel.is_some() && bot_id.is_some() && voice_session.is_some() && voice_server.is_some()
+            if joined_channel.is_some() && bot_id.is_some() && gw_session.is_some() && voice_server.is_some()
             {
                 if let Some(a) = voice_alive.take() {
                     a.store(false, Ordering::Relaxed);
@@ -2823,7 +2831,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                 voice_alive = Some(alive.clone());
                 let (tok_v, ep) = voice_server.take().unwrap();
                 let (sid, bid, sess, sh) =
-                    (guild.clone(), bot_id.clone().unwrap(), voice_session.clone().unwrap(), shared.clone());
+                    (guild.clone(), bot_id.clone().unwrap(), gw_session.clone().unwrap(), shared.clone());
                 voice_log(&format!("gateway: spawning voice ws endpoint={ep}"));
                 thread::spawn(move || discord_voice_ws(ep, tok_v, sid, bid, sess, sh, alive));
             }
@@ -2874,6 +2882,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
             Some(0) => match v["t"].as_str().unwrap_or("") {
                 "READY" => {
                     bot_id = v["d"]["user"]["id"].as_str().map(|s| s.to_string());
+                    gw_session = v["d"]["session_id"].as_str().map(|s| s.to_string());
                     let mut s = shared.lock().unwrap();
                     s.discord.fresh = true;
                     s.discord.available = true;
@@ -2914,11 +2923,11 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                 }
                 "VOICE_STATE_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
                     if v["d"]["user_id"].as_str() == bot_id.as_deref() {
-                        // Our own state → capture the session_id for the voice WS;
-                        // don't add the bot to the presence list.
-                        if let Some(sess) = v["d"]["session_id"].as_str() {
-                            voice_log("gateway: captured our voice session_id");
-                            voice_session = Some(sess.to_string());
+                        // Our own state — don't list the bot as a voice member. Warn
+                        // if the session here isn't ours (another instance owns the
+                        // bot's voice → our IDENTIFY would 4006).
+                        if v["d"]["session_id"].as_str() != gw_session.as_deref() {
+                            voice_log("gateway: WARNING bot voice owned by a different session (another studioboard instance?)");
                         }
                         continue;
                     }
@@ -3008,7 +3017,13 @@ fn discord_voice_ws(
         }
         let txt = match sock.read() {
             Ok(Message::Text(t)) => t.to_string(),
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(cf)) => {
+                match cf {
+                    Some(c) => voice_log(&format!("voice: CLOSE code={} reason={:?}", c.code, c.reason)),
+                    None => voice_log("voice: CLOSE (no frame)"),
+                }
+                break;
+            }
             Ok(_) => continue,
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
@@ -3031,7 +3046,10 @@ fn discord_voice_ws(
                     "d": { "server_id": server_id, "user_id": user_id, "session_id": session_id, "token": token }
                 });
                 let _ = sock.send(Message::Text(identify.to_string().into()));
-                voice_log(&format!("voice: HELLO (hb={}ms) → sent IDENTIFY", hb_interval.as_millis()));
+                voice_log(&format!(
+                    "voice: HELLO (hb={}ms) → sent IDENTIFY (server_id={} user_id={} session_len={} token_len={})",
+                    hb_interval.as_millis(), server_id, user_id, session_id.len(), token.len()
+                ));
             }
             Some(2) => {
                 // READY → finish the UDP handshake so Discord keeps streaming us
