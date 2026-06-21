@@ -399,6 +399,7 @@ pub struct Discord {
     pub text: Vec<TextChannel>,      // recent text channels w/ last message
     pub voice_join_at: Option<Instant>, // when someone last JOINED voice → 20s border shimmer
     pub voice_speaking: bool,           // someone is TALKING right now → bright border shimmer
+    pub voice_e2ee_blocked: bool,       // Discord rejected the voice listener with DAVE/E2EE (4017)
 }
 
 /// mac-doctor / syswatch triage agent status (written by spawn_doctor). The

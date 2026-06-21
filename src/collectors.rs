@@ -2781,6 +2781,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
     // a VOICE_STATE_UPDATE can pick up a stale/foreign session (e.g. when another
     // studioboard instance is connected as the same bot) → voice close 4006.
     let mut gw_session: Option<String> = None;
+    let mut voice_session: Option<String> = None; // session_id from the bot's VOICE_STATE_UPDATE
     let mut voice_server: Option<(String, String)> = None; // (token, endpoint) from VOICE_SERVER_UPDATE
     let mut joined_channel: Option<String> = None; // channel we've asked to join
     let mut voice_alive: Option<Arc<AtomicBool>> = None; // kill-switch for the voice thread
@@ -2796,13 +2797,32 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
         // people, leave when it empties. Then, once we hold our session + the voice
         // server creds, (re)spawn the voice-WS listener.
         if listen {
-            // STUDIOBOARD_DISCORD_VOICE_FORCE=<channel_id> forces a join even when
-            // the channel is empty — purely for diagnosing the voice handshake.
-            let forced = std::env::var("STUDIOBOARD_DISCORD_VOICE_FORCE")
-                .ok()
-                .filter(|s| !s.trim().is_empty());
-            let target = forced.or_else(|| voice_target(&who, &chan, &bot_id));
+            // Once Discord has rejected us with 4017 (DAVE/E2EE required), stop
+            // trying — leave voice and never rejoin this session. Otherwise pick the
+            // channel to listen in. STUDIOBOARD_DISCORD_VOICE_FORCE forces a join for
+            // diagnosing the handshake.
+            let blocked = shared.lock().map(|s| s.discord.voice_e2ee_blocked).unwrap_or(false);
+            let target = if blocked {
+                None
+            } else {
+                std::env::var("STUDIOBOARD_DISCORD_VOICE_FORCE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| voice_target(&who, &chan, &bot_id))
+            };
             if target != joined_channel {
+                if target.is_some() {
+                    // Clear any stale/zombie voice state first (e.g. left over from a
+                    // prior instance that didn't disconnect cleanly) — otherwise the
+                    // fresh voice IDENTIFY is rejected with 4006. Leave, let Discord
+                    // process it, then claim the channel.
+                    let leave = serde_json::json!({
+                        "op": 4,
+                        "d": { "guild_id": guild, "channel_id": serde_json::Value::Null, "self_mute": true, "self_deaf": false }
+                    });
+                    let _ = sock.send(Message::Text(leave.to_string().into()));
+                    thread::sleep(Duration::from_millis(250));
+                }
                 // self_deaf:false so Discord keeps streaming us the others' Speaking
                 // events; self_mute:true so the bot never transmits.
                 let join = serde_json::json!({
@@ -2810,19 +2830,23 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     "d": { "guild_id": guild, "channel_id": target, "self_mute": true, "self_deaf": false }
                 });
                 let _ = sock.send(Message::Text(join.to_string().into()));
-                voice_log(&format!("gateway: op4 join channel={target:?}"));
+                voice_log(&format!("gateway: op4 join channel={target:?} (pre-leave done)"));
                 joined_channel = target.clone();
                 if target.is_none() {
                     if let Some(a) = voice_alive.take() {
                         a.store(false, Ordering::Relaxed);
                     }
                     voice_server = None;
+                    voice_session = None;
                     if let Ok(mut s) = shared.lock() {
                         s.discord.voice_speaking = false;
                     }
                 }
             }
-            if joined_channel.is_some() && bot_id.is_some() && gw_session.is_some() && voice_server.is_some()
+            // Spawn once we have the channel-join's own session (from the bot's
+            // VOICE_STATE_UPDATE) AND the voice server creds — the pair Discord
+            // issued together. Using a mismatched session is what triggers 4006.
+            if joined_channel.is_some() && bot_id.is_some() && voice_session.is_some() && voice_server.is_some()
             {
                 if let Some(a) = voice_alive.take() {
                     a.store(false, Ordering::Relaxed);
@@ -2830,9 +2854,9 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                 let alive = Arc::new(AtomicBool::new(true));
                 voice_alive = Some(alive.clone());
                 let (tok_v, ep) = voice_server.take().unwrap();
-                let (sid, bid, sess, sh) =
-                    (guild.clone(), bot_id.clone().unwrap(), gw_session.clone().unwrap(), shared.clone());
-                voice_log(&format!("gateway: spawning voice ws endpoint={ep}"));
+                let sess = voice_session.take().unwrap();
+                let (sid, bid, sh) = (guild.clone(), bot_id.clone().unwrap(), shared.clone());
+                voice_log(&format!("gateway: spawning voice ws endpoint={ep} session={sess}"));
                 thread::spawn(move || discord_voice_ws(ep, tok_v, sid, bid, sess, sh, alive));
             }
         }
@@ -2883,6 +2907,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                 "READY" => {
                     bot_id = v["d"]["user"]["id"].as_str().map(|s| s.to_string());
                     gw_session = v["d"]["session_id"].as_str().map(|s| s.to_string());
+                    voice_log(&format!("gateway: READY gw_session={gw_session:?}"));
                     let mut s = shared.lock().unwrap();
                     s.discord.fresh = true;
                     s.discord.available = true;
@@ -2917,17 +2942,19 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     let ep = v["d"]["endpoint"].as_str().unwrap_or("").to_string();
                     let vt = v["d"]["token"].as_str().unwrap_or("").to_string();
                     if !ep.is_empty() {
-                        voice_log(&format!("gateway: VOICE_SERVER_UPDATE endpoint={ep}"));
+                        voice_log(&format!("gateway: VOICE_SERVER_UPDATE endpoint={ep} token={vt}"));
                         voice_server = Some((vt, ep));
                     }
                 }
                 "VOICE_STATE_UPDATE" if v["d"]["guild_id"].as_str() == Some(guild.as_str()) => {
                     if v["d"]["user_id"].as_str() == bot_id.as_deref() {
-                        // Our own state — don't list the bot as a voice member. Warn
-                        // if the session here isn't ours (another instance owns the
-                        // bot's voice → our IDENTIFY would 4006).
-                        if v["d"]["session_id"].as_str() != gw_session.as_deref() {
-                            voice_log("gateway: WARNING bot voice owned by a different session (another studioboard instance?)");
+                        // Our own state → the session_id here is the one the voice
+                        // server expects in IDENTIFY. Capture it (don't list the bot).
+                        let vs = v["d"]["session_id"].as_str();
+                        voice_log(&format!("gateway: bot VOICE_STATE_UPDATE channel={:?} session={:?} (gw_session={:?})",
+                            v["d"]["channel_id"].as_str(), vs, gw_session));
+                        if let Some(sess) = vs {
+                            voice_session = Some(sess.to_string());
                         }
                         continue;
                     }
@@ -2980,13 +3007,14 @@ fn discord_voice_ws(
     use std::sync::atomic::Ordering;
     use tungstenite::{connect, Message};
 
-    let host = endpoint.split(':').next().unwrap_or(&endpoint).to_string();
-    let Ok((mut sock, _)) = connect(format!("wss://{host}/?v=4")) else {
-        voice_log(&format!("voice: CONNECT FAILED to {host}"));
+    // Connect to the EXACT host:port Discord handed us (stripping the port reaches
+    // the wrong server → 4006). v8 is required for the DAVE/E2EE opt-out field below.
+    let Ok((mut sock, _)) = connect(format!("wss://{endpoint}/?v=8")) else {
+        voice_log(&format!("voice: CONNECT FAILED to {endpoint}"));
         alive.store(false, Ordering::Relaxed);
         return;
     };
-    voice_log(&format!("voice: connected to {host}"));
+    voice_log(&format!("voice: connected to {endpoint}"));
     if let tungstenite::stream::MaybeTlsStream::Rustls(s) = sock.get_mut() {
         let _ = s.sock.set_read_timeout(Some(Duration::from_millis(500)));
     }
@@ -3000,6 +3028,7 @@ fn discord_voice_ws(
     let mut hb_interval = Duration::from_millis(13_750);
     let mut last_hb = Instant::now();
     let mut nonce: u64 = 1;
+    let mut last_seq: Option<u64> = None; // v8 server message sequence, acked in heartbeats
     let mut talking: HashSet<u64> = HashSet::new(); // SSRCs currently transmitting
 
     loop {
@@ -3009,7 +3038,8 @@ fn discord_voice_ws(
         }
         if last_hb.elapsed() >= hb_interval {
             nonce = nonce.wrapping_add(1);
-            let hb = serde_json::json!({ "op": 3, "d": nonce });
+            // v8 heartbeat carries the nonce + last-seen sequence to ack.
+            let hb = serde_json::json!({ "op": 3, "d": { "t": nonce, "seq_ack": last_seq } });
             if sock.send(Message::Text(hb.to_string().into())).is_err() {
                 break;
             }
@@ -3018,9 +3048,17 @@ fn discord_voice_ws(
         let txt = match sock.read() {
             Ok(Message::Text(t)) => t.to_string(),
             Ok(Message::Close(cf)) => {
-                match cf {
+                match &cf {
                     Some(c) => voice_log(&format!("voice: CLOSE code={} reason={:?}", c.code, c.reason)),
                     None => voice_log("voice: CLOSE (no frame)"),
+                }
+                // 4017 = Discord requires DAVE/E2EE (mandatory for non-stage voice
+                // since Mar 2026). We can't satisfy it without implementing the DAVE
+                // (MLS) protocol, so flag it; the gateway then leaves and stops.
+                if matches!(&cf, Some(c) if u16::from(c.code) == 4017) {
+                    if let Ok(mut s) = shared.lock() {
+                        s.discord.voice_e2ee_blocked = true;
+                    }
                 }
                 break;
             }
@@ -3035,6 +3073,9 @@ fn discord_voice_ws(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
+        if let Some(sq) = v["seq"].as_u64() {
+            last_seq = Some(sq);
+        }
         match v["op"].as_u64() {
             Some(8) => {
                 // HELLO → adopt the heartbeat interval, then IDENTIFY.
@@ -3043,7 +3084,15 @@ fn discord_voice_ws(
                 }
                 let identify = serde_json::json!({
                     "op": 0,
-                    "d": { "server_id": server_id, "user_id": user_id, "session_id": session_id, "token": token }
+                    "d": {
+                        "server_id": server_id,
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "token": token,
+                        // Opt out of DAVE/E2EE (op4017 otherwise) — we never touch the
+                        // media, only the Speaking control events.
+                        "max_dave_protocol_version": 0
+                    }
                 });
                 let _ = sock.send(Message::Text(identify.to_string().into()));
                 voice_log(&format!(
