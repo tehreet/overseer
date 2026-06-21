@@ -566,6 +566,13 @@ fn sample_data(st: &mut AppState, compose: bool) {
         let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
         st.silicon_samples
             .push_back((ts, vec![gpu, 18.4, 58.0, 52.0, 9.2, 3.1, pwr, 41.0, 23.0, 0.2]));
+        // RESOURCES wave channels: mem %, net down/up KB/s, disk I/O KB/s — gently
+        // varying so visual-verify shows the smooth four-shade stacked wave.
+        let memp = (60.0 + 6.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
+        let down = (300.0 + 2200.0 * (ph * 0.8).sin().abs()).max(1.0);
+        let up = (60.0 + 380.0 * (ph * 0.6 + 1.0).sin().abs()).max(1.0);
+        let io = (40.0 + 9000.0 * (ph * 0.9 + 0.5).sin().abs()).max(1.0);
+        st.res_samples.push_back((ts, vec![memp, down, up, io]));
     }
     for (i, v) in [12, 20, 35, 50, 41, 30, 48, 62, 55, 37].iter().enumerate() {
         let _ = i;

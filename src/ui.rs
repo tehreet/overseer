@@ -184,32 +184,32 @@ fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// One band of the stacked multi-area wave: a label hue + a per-column 0..1 series.
-struct Band {
-    color: ratatui::style::Color,
-    vals: Vec<f32>, // normalized 0..1, oldest→newest, one per plot column
-}
-
-/// Render the resources wave: several live series **layered** as translucent
-/// colour hills in the SAME plot, each filling from the baseline up to its own
-/// height. They paint back-to-front (tallest behind), so at any cell the *shortest*
-/// series still covering it wins the colour — you see distinct coloured zones
-/// stacked by height (the burstier a series, the more its colour breathes), with
-/// the tallest setting a sub-cell-smooth silhouette. A dim→vivid vertical gradient
-/// gives the whole wave that synthwave glow. Each series is normalised on its own,
-/// so a near-constant one (memory) reads as a calm band while net / disk I/O dance.
-fn overlay_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
+/// Render the RESOURCES wave: the live channels **stacked** into one smooth,
+/// cohesive area that scrolls per-frame (the inputs are delay-interpolated
+/// upstream, so the curve glides instead of stepping at 1 Hz). Each channel is a
+/// shade up the jazz ramp — violet → pink → white, the "four shades of pink" —
+/// piled bottom→top, so the silhouette is the combined activity. A dim→vivid
+/// vertical glow plus a 1/8-block top edge keep it buttery; the stack is
+/// normalised so the busiest column just kisses the top and the wave owns the card.
+fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(ratatui::style::Color, Vec<f32>)]) {
     use ratatui::style::Color;
     let w = area.width as usize;
     let h = area.height as usize;
     if w == 0 || h == 0 || bands.is_empty() {
         return;
     }
-    // Blur each series so bursty signals read as one buttery curve, not cliffs.
-    let bands: Vec<(Color, Vec<f32>)> = bands
-        .iter()
-        .map(|b| (b.color, smoothed(&b.vals, 2, 4)))
-        .collect();
+    // Blur each channel so bursty signals read as one buttery curve, not cliffs.
+    let bands: Vec<(Color, Vec<f32>)> =
+        bands.iter().map(|(col, v)| (*col, smoothed(v, 2, 4))).collect();
+    // Per-column stack totals → scale so the tallest column ~fills the plot.
+    let mut totals = vec![0.0f32; w];
+    for x in 0..w {
+        for (_, v) in &bands {
+            totals[x] += v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        }
+    }
+    let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.8);
+    let scale = (h as f32 * 0.94) / peak;
 
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for row in 0..h {
@@ -219,35 +219,26 @@ fn overlay_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
         let mut run = String::new();
         let mut run_col: Option<Color> = None;
         for x in 0..w {
-            // The shortest series still covering this cell is the front layer; the
-            // tallest sets the silhouette's sub-cell top glyph.
-            let mut front_fh = f32::INFINITY;
-            let mut front_col = c::BG;
-            let mut top_fh = 0.0f32;
-            let mut covered = false;
-            for (col, vals) in &bands {
-                let v = vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let fh = v * h as f32; // fill height in rows
-                if fh > r_bot {
-                    covered = true;
-                    if fh < front_fh {
-                        front_fh = fh;
-                        front_col = *col;
-                    }
-                }
-                if fh > top_fh {
-                    top_fh = fh;
-                }
-            }
-            let (ch, col) = if !covered {
-                (' ', None)
+            let total = totals[x] * scale; // stack top, in rows
+            let (ch, col) = if total <= r_bot {
+                (' ', None) // above the wave
             } else {
-                let cc = c::blend(c::BG, front_col, 0.30 + 0.70 * crest);
-                if top_fh >= r_bot + 1.0 {
-                    ('█', Some(cc))
-                } else {
-                    (c::vblock(top_fh - r_bot), Some(cc)) // smooth silhouette top
+                // Which shade owns this cell? Probe the cell's middle (clamped just
+                // inside the stack top) and find the band whose slice contains it.
+                let probe = (r_bot + 0.5).min(total - 1e-3).max(0.0);
+                let mut acc = 0.0f32;
+                let mut shade = bands.last().map(|b| b.0).unwrap_or(c::BG);
+                for (col, v) in &bands {
+                    let br = v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0) * scale;
+                    if probe < acc + br {
+                        shade = *col;
+                        break;
+                    }
+                    acc += br;
                 }
+                // Sub-cell smoothing only on the very top edge of the stack.
+                let ch = if total < r_bot + 1.0 { c::vblock(total - r_bot) } else { '█' };
+                (ch, Some(c::blend(c::BG, shade, 0.42 + 0.58 * crest)))
             };
             if col == run_col {
                 run.push(ch);
@@ -272,30 +263,6 @@ fn overlay_area_graph(f: &mut Frame, area: Rect, bands: &[Band]) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
-}
-
-/// Build a `w`-wide 0..1 column series from a History ring buffer (newest at the
-/// right), stretching the samples to fill the width and normalizing through
-/// `norm`. The wave bands are sourced from History (not the EQ sample buffers),
-/// so this keeps them scrolling in lockstep at the collector's 1 Hz cadence.
-fn hist_series(data: &[u64], w: usize, norm: impl Fn(f32) -> f32) -> Vec<f32> {
-    if w == 0 {
-        return Vec::new();
-    }
-    if data.is_empty() {
-        return vec![0.0; w];
-    }
-    let slice: Vec<u64> = data.iter().rev().take(w).rev().copied().collect();
-    let lead = w.saturating_sub(slice.len());
-    (0..w)
-        .map(|x| {
-            if x < lead {
-                0.0
-            } else {
-                norm(slice[x - lead] as f32)
-            }
-        })
-        .collect()
 }
 
 /// Scalar version of the delayed Catmull-Rom interpolation (for net energy).
@@ -963,43 +930,39 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    let memf = if s.system.mem_total > 0 {
-        s.system.mem_used as f32 / s.system.mem_total as f32
-    } else {
-        0.0
-    };
-    let diskf = if s.system.disk_total > 0 {
-        s.system.disk_used as f32 / s.system.disk_total as f32
-    } else {
-        0.0
-    };
-    let iw = inner.width as usize;
+    // The wave's four channels: jazz-ramp shade (violet→pink→white), label, the
+    // 0..1 normaliser, and which res_samples slot it reads. The key and the wave
+    // both derive from this list, so the colours in the legend always match.
+    let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
+    let pct: fn(f32) -> f32 = |p| (p / 100.0).clamp(0.0, 1.0);
+    let channels: [(f32, &str, fn(f32) -> f32, usize); 4] = [
+        (0.46, "mem", pct, 0),     // memory used
+        (0.66, "net ↓", lograte, 1), // network down
+        (0.82, "net ↑", lograte, 2), // network up
+        (0.96, "disk", lograte, 3),  // disk I/O
+    ];
 
-    // --- Top line: MEM and DISK as two small, tidy bars sharing one row. ------
-    // Split the width in half; each half gets a label, a compact bar, and a %.
-    let half = iw / 2;
-    let mbw = half.saturating_sub(11).clamp(5, 16); // leaves "mem " + " 88%"
-    let dbw = (iw - half).saturating_sub(11).clamp(5, 16);
-    let mut top = vec![Span::styled("mem ", Style::default().fg(c::DIM))];
-    top.extend(bar_spans(memf, mbw, c::jazz(memf)));
-    top.push(Span::styled(format!(" {:>3.0}%  ", memf * 100.0), Style::default().fg(c::TEXT)));
-    top.push(Span::styled("disk ", Style::default().fg(c::DIM)));
-    top.extend(bar_spans(diskf, dbw, c::jazz(diskf)));
-    top.push(Span::styled(format!(" {:>3.0}%", diskf * 100.0), Style::default().fg(c::TEXT)));
-
-    // Top row is just the two tidy bars — no legend; the wave is the whole show.
-    let lines = vec![Line::from(top)];
-    let text_h = lines.len() as u16;
+    // --- Key: one row, a colour swatch per wave shade + what it means. Clean and
+    // quiet (swatch bold in the shade, label dim) so the wave stays the show.
+    let mut key: Vec<Span> = Vec::new();
+    for (i, (t, name, _, _)) in channels.iter().enumerate() {
+        if i > 0 {
+            key.push(Span::raw("   "));
+        }
+        key.push(Span::styled("█ ", Style::default().fg(c::jazz(*t)).add_modifier(Modifier::BOLD)));
+        key.push(Span::styled(*name, Style::default().fg(c::DIM)));
+    }
+    let text_h = 1u16;
     f.render_widget(
-        Paragraph::new(lines),
+        Paragraph::new(Line::from(key)),
         Rect { x: inner.x, y: inner.y, width: inner.width, height: text_h },
     );
 
-    // --- The wave: BIG. It owns every remaining row of the card. Four live
-    // metrics overlay as translucent colour waves — memory (violet), net down
-    // (cyan), net up (pink), disk I/O (green) — that brighten where they cross.
-    // A blank gap row keeps the wave off the bars above. Bursty rates are
-    // log-scaled so a quiet system still shows texture and a busy one won't peg.
+    // --- The wave: BIG. It owns every remaining row of the card. The four live
+    // channels stack into one smooth, cohesive area in four shades of pink. Inputs
+    // are frame-interpolated (delayed Catmull-Rom from res_samples) so the curve
+    // glides continuously instead of stepping at the 1 Hz collector tick — the
+    // buttery motion the original net wave had. A blank gap row sits under the key.
     let plot_h = inner.height.saturating_sub(text_h + 1);
     if plot_h >= 1 {
         let plot = Rect {
@@ -1009,16 +972,14 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
             height: plot_h,
         };
         let pw = plot.width as usize;
-        // log10 ~1 KB/s..10 MB/s → 0..1.
-        let lograte = |kbps: f32| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
-        let pct = |p: f32| (p / 100.0).clamp(0.0, 1.0);
-        let plot_bands = vec![
-            Band { color: c::accent(), vals: hist_series(&s.mem_hist.data, pw, pct) }, // memory used
-            Band { color: c::cyan(), vals: hist_series(&s.net_rx_hist.data, pw, lograte) }, // net down
-            Band { color: c::pink(), vals: hist_series(&s.net_tx_hist.data, pw, lograte) }, // net up
-            Band { color: c::GREEN, vals: hist_series(&s.disk_io_hist.data, pw, lograte) }, // disk I/O
-        ];
-        overlay_area_graph(f, plot, &plot_bands);
+        let plot_bands: Vec<(ratatui::style::Color, Vec<f32>)> = channels
+            .iter()
+            .map(|(t, _, norm, ch)| {
+                let ch = *ch;
+                (c::jazz(*t), series(&s.res_samples, pw, move |b, tt| sampled_channel(b, ch, tt), *norm))
+            })
+            .collect();
+        stacked_wave(f, plot, &plot_bands);
     }
 }
 
@@ -1440,8 +1401,7 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // that shimmers just a little. Text sits in a soft violet-white; the breath
     // nudges it toward a gentle glint and back.
     let glow = 0.5 + 0.5 * (t * 0.6).sin() as f32; // 0..1, slow + uniform
-    let head_base = c::blend(c::TEXT, c::accent(), 0.16); // soft violet-white
-    let cont_base = c::blend(c::DIM, c::accent(), 0.12);
+    let base = c::blend(c::TEXT, c::accent(), 0.16); // soft violet-white — every line
     let sheen = c::blend(c::TEXT, c::cyan(), 0.35); // gentle glint target
     let blocks: Vec<Vec<Line>> = fa
         .lines
@@ -1453,7 +1413,6 @@ fn facts_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
                 .into_iter()
                 .enumerate()
                 .map(|(j, seg)| {
-                    let base = if j == 0 { head_base } else { cont_base };
                     let col = c::blend(base, sheen, 0.14 * glow); // a little, uniform
                     let mut spans = if j == 0 {
                         vec![Span::styled("• ", Style::default().fg(color).add_modifier(Modifier::BOLD))]
@@ -2216,12 +2175,14 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             Span::raw("  ")
         };
         let mut row_spans: Vec<Span> = vec![marker, Span::styled(sender, sender_style), Span::raw(" ")];
-        if m.is_rich {
-            // A picture/video preview ("[rich message]") gets a gentle travelling
-            // sheen so it reads as special — the same glint energy as an unread
-            // sender name, pink while unread and settling to faint once read.
-            let base = if m.unread { c::blend(c::pink(), c::FAINT, adv) } else { c::FAINT };
+        if m.is_rich && m.unread {
+            // A *new* picture/video preview ("[rich message]") gets a gentle
+            // travelling sheen so it reads as special, settling to faint as the
+            // row is marked read (adv 0→1). Once read it's plain, like before.
+            let base = c::blend(c::pink(), c::FAINT, adv);
             row_spans.extend(shimmer_spans(&preview, t, i as f32, base, 0.5, 0.10, false));
+        } else if m.is_rich {
+            row_spans.push(Span::styled(preview, Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)));
         } else {
             row_spans.push(Span::styled(preview, Style::default().fg(prev_col)));
         }

@@ -133,6 +133,25 @@ pub fn spawn_system(shared: Shared) {
                 while s.net_samples.len() > 16 {
                     s.net_samples.pop_front();
                 }
+                // RESOURCES wave channels: mem %, net down/up KB/s, disk I/O KB/s.
+                // Delay-interpolated on playback so the wave glides per-frame.
+                let mem_pct = if s.system.mem_total > 0 {
+                    s.system.mem_used as f32 / s.system.mem_total as f32 * 100.0
+                } else {
+                    0.0
+                };
+                s.res_samples.push_back((
+                    now,
+                    vec![
+                        mem_pct,
+                        (rx_bps / 1024.0) as f32,
+                        (tx_bps / 1024.0) as f32,
+                        (disk_io_bps / 1024.0) as f32,
+                    ],
+                ));
+                while s.res_samples.len() > 16 {
+                    s.res_samples.pop_front();
+                }
                 // Top-process snapshot for the proc card's delayed, interpolated
                 // playback (eased cpu%/mem + sliding row reorder, keyed by name).
                 let proc_snap = s.system.top_procs.clone();

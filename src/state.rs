@@ -554,6 +554,10 @@ pub struct AppState {
     /// the bars glide between FFT frames instead of stepping. Empty until the
     /// audio thread produces a frame; `audio_live` flips true once it does.
     pub audio_samples: VecDeque<(Instant, Vec<f32>)>,
+    /// Timestamped resource metrics for the RESOURCES wave — [mem %, net down
+    /// KB/s, net up KB/s, disk I/O KB/s] — played back delay-interpolated (like
+    /// net_samples) so the wave glides per-frame instead of stepping at 1 Hz.
+    pub res_samples: VecDeque<(Instant, Vec<f32>)>,
     /// True once the audio tap is capturing (the visualizer then reflects real
     /// sound); false keeps the honest synthetic resting flourish.
     pub audio_live: bool,
@@ -597,6 +601,7 @@ impl Default for AppState {
             silicon: SiliconStats::default(),
             cpu_samples: VecDeque::new(),
             net_samples: VecDeque::new(),
+            res_samples: VecDeque::new(),
             silicon_samples: VecDeque::new(),
             proc_samples: VecDeque::new(),
             audio_samples: VecDeque::new(),
