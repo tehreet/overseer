@@ -2794,11 +2794,14 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
         if listen {
             let target = voice_target(&who, &chan, &bot_id);
             if target != joined_channel {
+                // self_deaf:false so Discord keeps streaming us the others' Speaking
+                // events; self_mute:true so the bot never transmits.
                 let join = serde_json::json!({
                     "op": 4,
-                    "d": { "guild_id": guild, "channel_id": target, "self_mute": true, "self_deaf": true }
+                    "d": { "guild_id": guild, "channel_id": target, "self_mute": true, "self_deaf": false }
                 });
                 let _ = sock.send(Message::Text(join.to_string().into()));
+                voice_log(&format!("gateway: op4 join channel={target:?}"));
                 joined_channel = target.clone();
                 if target.is_none() {
                     if let Some(a) = voice_alive.take() {
@@ -2821,6 +2824,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                 let (tok_v, ep) = voice_server.take().unwrap();
                 let (sid, bid, sess, sh) =
                     (guild.clone(), bot_id.clone().unwrap(), voice_session.clone().unwrap(), shared.clone());
+                voice_log(&format!("gateway: spawning voice ws endpoint={ep}"));
                 thread::spawn(move || discord_voice_ws(ep, tok_v, sid, bid, sess, sh, alive));
             }
         }
@@ -2904,6 +2908,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     let ep = v["d"]["endpoint"].as_str().unwrap_or("").to_string();
                     let vt = v["d"]["token"].as_str().unwrap_or("").to_string();
                     if !ep.is_empty() {
+                        voice_log(&format!("gateway: VOICE_SERVER_UPDATE endpoint={ep}"));
                         voice_server = Some((vt, ep));
                     }
                 }
@@ -2912,6 +2917,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                         // Our own state → capture the session_id for the voice WS;
                         // don't add the bot to the presence list.
                         if let Some(sess) = v["d"]["session_id"].as_str() {
+                            voice_log("gateway: captured our voice session_id");
                             voice_session = Some(sess.to_string());
                         }
                         continue;
@@ -2967,9 +2973,11 @@ fn discord_voice_ws(
 
     let host = endpoint.split(':').next().unwrap_or(&endpoint).to_string();
     let Ok((mut sock, _)) = connect(format!("wss://{host}/?v=4")) else {
+        voice_log(&format!("voice: CONNECT FAILED to {host}"));
         alive.store(false, Ordering::Relaxed);
         return;
     };
+    voice_log(&format!("voice: connected to {host}"));
     if let tungstenite::stream::MaybeTlsStream::Rustls(s) = sock.get_mut() {
         let _ = s.sock.set_read_timeout(Some(Duration::from_millis(500)));
     }
@@ -2979,13 +2987,6 @@ fn discord_voice_ws(
             s.discord.voice_speaking = on;
         }
     };
-
-    // IDENTIFY right away (also fine to do on HELLO; servers accept either order).
-    let identify = serde_json::json!({
-        "op": 0,
-        "d": { "server_id": server_id, "user_id": user_id, "session_id": session_id, "token": token }
-    });
-    let _ = sock.send(Message::Text(identify.to_string().into()));
 
     let mut hb_interval = Duration::from_millis(13_750);
     let mut last_hb = Instant::now();
@@ -3021,9 +3022,16 @@ fn discord_voice_ws(
         };
         match v["op"].as_u64() {
             Some(8) => {
+                // HELLO → adopt the heartbeat interval, then IDENTIFY.
                 if let Some(ms) = v["d"]["heartbeat_interval"].as_u64() {
                     hb_interval = Duration::from_millis(ms.max(3000));
                 }
+                let identify = serde_json::json!({
+                    "op": 0,
+                    "d": { "server_id": server_id, "user_id": user_id, "session_id": session_id, "token": token }
+                });
+                let _ = sock.send(Message::Text(identify.to_string().into()));
+                voice_log(&format!("voice: HELLO (hb={}ms) → sent IDENTIFY", hb_interval.as_millis()));
             }
             Some(2) => {
                 // READY → finish the UDP handshake so Discord keeps streaming us
@@ -3035,20 +3043,26 @@ fn discord_voice_ws(
                     .as_array()
                     .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                if let Some((my_ip, my_port)) = udp_ip_discovery(&ip, port, ssrc) {
-                    let mode = modes
-                        .iter()
-                        .find(|m| m.contains("xchacha20"))
-                        .or_else(|| modes.first())
-                        .cloned()
-                        .unwrap_or_else(|| "aead_xchacha20_poly1305_rtpsize".into());
-                    let sp = serde_json::json!({
-                        "op": 1,
-                        "d": { "protocol": "udp", "data": { "address": my_ip, "port": my_port, "mode": mode } }
-                    });
-                    let _ = sock.send(Message::Text(sp.to_string().into()));
+                voice_log(&format!("voice: READY ssrc={ssrc} {ip}:{port} modes={modes:?}"));
+                match udp_ip_discovery(&ip, port, ssrc) {
+                    Some((my_ip, my_port)) => {
+                        let mode = modes
+                            .iter()
+                            .find(|m| m.contains("xchacha20"))
+                            .or_else(|| modes.first())
+                            .cloned()
+                            .unwrap_or_else(|| "aead_xchacha20_poly1305_rtpsize".into());
+                        let sp = serde_json::json!({
+                            "op": 1,
+                            "d": { "protocol": "udp", "data": { "address": my_ip, "port": my_port, "mode": mode } }
+                        });
+                        let _ = sock.send(Message::Text(sp.to_string().into()));
+                        voice_log(&format!("voice: UDP discovery {my_ip}:{my_port} → SELECT_PROTOCOL mode={mode}"));
+                    }
+                    None => voice_log("voice: UDP IP DISCOVERY FAILED (no SELECT_PROTOCOL sent)"),
                 }
             }
+            Some(4) => voice_log("voice: SESSION_DESCRIPTION (handshake complete)"),
             Some(5) => {
                 // SPEAKING: `speaking` is a bitmask (bit 0 = voice), per SSRC.
                 let ssrc = v["d"]["ssrc"].as_u64().unwrap_or(0);
@@ -3062,15 +3076,33 @@ fn discord_voice_ws(
                     }
                 }
                 let now_on = !talking.is_empty();
+                voice_log(&format!("voice: SPEAKING ssrc={ssrc} on={on} → anyone_talking={now_on}"));
                 if now_on != was {
                     set_speaking(now_on);
                 }
             }
-            _ => {}
+            Some(op) => voice_log(&format!("voice: (op {op})")),
+            None => {}
         }
     }
+    voice_log("voice: connection closed");
     set_speaking(false);
     alive.store(false, Ordering::Relaxed);
+}
+
+/// Append a line to ~/.cache/studioboard/voice.log so the opt-in Discord voice
+/// listener can be diagnosed without disturbing the TUI (which owns the screen).
+fn voice_log(msg: &str) {
+    use std::io::Write;
+    let Some(home) = dirs::home_dir() else { return };
+    let path = home.join(".cache/studioboard/voice.log");
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let ts = Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(f, "{ts} {msg}");
+    }
 }
 
 /// Discord voice UDP IP discovery: send the 74-byte discovery packet and parse our
