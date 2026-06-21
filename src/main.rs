@@ -47,6 +47,11 @@ fn main() -> Result<()> {
         audio::diag();
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--diag-discord-audio") {
+        audio::diag_voice();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--diag-voice") {
         // Headless: run only the Discord collector with voice listening on and
         // stream the handshake log, so the voice path can be diagnosed without
@@ -104,6 +109,10 @@ fn run() -> Result<()> {
     collectors::spawn_doctor(shared.clone());
     collectors::spawn_keybinds(shared.clone());
     collectors::spawn_audio(shared.clone());
+    // Discord "who's talking" by tapping Discord.app's audio locally (the bot
+    // voice gateway is walled by DAVE/E2EE). Lights the DISCORD border on call audio.
+    #[cfg(target_os = "macos")]
+    audio::spawn_voice(shared.clone());
 
     // Terminal setup with a panic hook that always restores the screen.
     terminal::enable_raw_mode()?;

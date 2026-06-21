@@ -22,11 +22,15 @@ use std::time::Instant;
 use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioSubTapDriftCompensationKey,
+    kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyIsRunning, kAudioProcessPropertyIsRunningInput,
+    kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID, kAudioSubTapDriftCompensationKey,
     kAudioSubTapUIDKey, kAudioTapPropertyUID, AudioDeviceCreateIOProcID, AudioDeviceIOProcID,
     AudioDeviceStart, AudioDeviceStop, AudioDeviceDestroyIOProcID, AudioHardwareCreateAggregateDevice,
     AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
-    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, CATapDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::{
@@ -416,4 +420,374 @@ fn cf_dict(pairs: &[(CFRetained<CFString>, *const CFType)]) -> CFRetained<CFDict
         )
         .expect("CFDictionaryCreate")
     }
+}
+
+// ===========================================================================
+// Discord "who's talking" via a per-process audio tap.
+//
+// Discord's voice gateway now mandates DAVE/E2EE, so a bot can't read Speaking
+// events anymore (close 4017). Instead we tap Discord.app's OWN audio output
+// locally — the same Core Audio process-tap tech as the EQ, but scoped to just
+// Discord's processes — and flip `discord.voice_speaking` whenever that audio is
+// active, i.e. someone in your call is talking. No bot, no API, no E2EE. (This
+// sees audio coming OUT of Discord; your own mic going INTO Discord isn't
+// tappable per-process, so it reflects the people you're listening to.)
+// ===========================================================================
+
+/// RMS above this (≈ -52 dB) counts as "audio is flowing" → talking.
+const VOICE_THRESH: f32 = 0.0025;
+/// Hold the shimmer this long after the audio falls quiet, so the gaps between
+/// words/sentences don't strobe the border off and on.
+const VOICE_HANG_MS: u64 = 300;
+
+/// Realtime state for the Discord tap: a smoothed level + the current speaking
+/// latch + when it was last loud (for the hang-off).
+struct VoiceCtx {
+    shared: Shared,
+    level: Mutex<f32>,
+    speaking: Mutex<bool>,
+    loud_at: Mutex<Option<Instant>>,
+    frames: std::sync::atomic::AtomicU64, // IO callbacks seen (diagnostic)
+}
+
+/// Live Discord-voice tap handle. Dropping it stops the IO proc and tears the
+/// tap + aggregate device back down (same lifecycle as `AudioCapture`).
+pub struct VoiceCapture {
+    agg_id: AudioObjectID,
+    tap_id: AudioObjectID,
+    proc_id: AudioDeviceIOProcID,
+    _ctx: Arc<VoiceCtx>,
+}
+
+impl VoiceCapture {
+    /// Current smoothed RMS level the tap is seeing (for diagnostics).
+    pub fn level(&self) -> f32 {
+        *self._ctx.level.lock().unwrap()
+    }
+    /// Total IO callbacks seen so far (diagnostic: 0 ⇒ the tap is delivering nothing).
+    pub fn frames(&self) -> u64 {
+        self._ctx.frames.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for VoiceCapture {
+    fn drop(&mut self) {
+        unsafe {
+            if self.proc_id.is_some() {
+                AudioDeviceStop(self.agg_id, self.proc_id);
+                AudioDeviceDestroyIOProcID(self.agg_id, self.proc_id);
+            }
+            if self.agg_id != 0 {
+                AudioHardwareDestroyAggregateDevice(self.agg_id);
+            }
+            if self.tap_id != 0 {
+                AudioHardwareDestroyProcessTap(self.tap_id);
+            }
+        }
+    }
+}
+
+/// Realtime IO proc for the Discord tap: compute the buffer RMS, smooth it, and
+/// latch `voice_speaking` on/off with a short hang so the border lights the
+/// instant a voice comes through and settles a beat after it stops.
+unsafe extern "C-unwind" fn voice_io_proc(
+    _device: AudioObjectID,
+    _now: NonNull<AudioTimeStamp>,
+    in_input_data: NonNull<AudioBufferList>,
+    _input_time: NonNull<AudioTimeStamp>,
+    _out: NonNull<AudioBufferList>,
+    _out_time: NonNull<AudioTimeStamp>,
+    client: *mut c_void,
+) -> i32 {
+    if client.is_null() {
+        return 0;
+    }
+    let ctx = &*(client as *const VoiceCtx);
+    ctx.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let list = in_input_data.as_ref();
+    let nbuf = list.mNumberBuffers as usize;
+    if nbuf == 0 {
+        return 0;
+    }
+    let buffers = std::slice::from_raw_parts(list.mBuffers.as_ptr(), nbuf);
+    let buf = &buffers[0];
+    if buf.mData.is_null() {
+        return 0;
+    }
+    let n = (buf.mDataByteSize as usize) / std::mem::size_of::<f32>();
+    if n == 0 {
+        return 0;
+    }
+    let samples = std::slice::from_raw_parts(buf.mData as *const f32, n);
+    let mut sumsq = 0.0f32;
+    for &s in samples {
+        sumsq += s * s;
+    }
+    let rms = (sumsq / n as f32).sqrt();
+
+    let lvl = {
+        let mut level = ctx.level.lock().unwrap();
+        *level = *level * 0.6 + rms * 0.4; // smooth a touch so brief clicks don't trip it
+        *level
+    };
+
+    let mut speaking = ctx.speaking.lock().unwrap();
+    let mut loud_at = ctx.loud_at.lock().unwrap();
+    let now = Instant::now();
+    if lvl > VOICE_THRESH {
+        *loud_at = Some(now);
+        if !*speaking {
+            *speaking = true;
+            if let Ok(mut s) = ctx.shared.lock() {
+                s.discord.voice_speaking = true;
+            }
+        }
+    } else if *speaking {
+        let quiet_for = loud_at
+            .map(|t| now.duration_since(t).as_millis() as u64)
+            .unwrap_or(u64::MAX);
+        if quiet_for >= VOICE_HANG_MS {
+            *speaking = false;
+            if let Ok(mut s) = ctx.shared.lock() {
+                s.discord.voice_speaking = false;
+            }
+        }
+    }
+    0
+}
+
+/// Every audio process object the HAL currently knows about.
+unsafe fn process_object_list() -> Vec<AudioObjectID> {
+    let addr = prop_addr(kAudioHardwarePropertyProcessObjectList);
+    let sys = kAudioObjectSystemObject as AudioObjectID;
+    let mut size: u32 = 0;
+    if AudioObjectGetPropertyDataSize(sys, NonNull::from(&addr), 0, std::ptr::null(), NonNull::from(&mut size)) != 0
+        || size == 0
+    {
+        return Vec::new();
+    }
+    let count = size as usize / std::mem::size_of::<AudioObjectID>();
+    let mut objs = vec![0 as AudioObjectID; count];
+    let Some(ptr) = NonNull::new(objs.as_mut_ptr() as *mut c_void) else {
+        return Vec::new();
+    };
+    let mut size2 = size;
+    if AudioObjectGetPropertyData(sys, NonNull::from(&addr), 0, std::ptr::null(), NonNull::from(&mut size2), ptr) != 0 {
+        return Vec::new();
+    }
+    objs
+}
+
+/// Read a fixed-size u32 property (e.g. a process object's PID).
+unsafe fn read_u32(obj: AudioObjectID, selector: u32) -> Option<u32> {
+    let addr = prop_addr(selector);
+    let mut out: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let st = AudioObjectGetPropertyData(
+        obj,
+        NonNull::from(&addr),
+        0,
+        std::ptr::null(),
+        NonNull::from(&mut size),
+        NonNull::new(&mut out as *mut _ as *mut c_void)?,
+    );
+    if st != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// PIDs of every running Discord process (main + all helpers), via `pgrep`.
+fn discord_pids() -> std::collections::HashSet<u32> {
+    std::process::Command::new("pgrep")
+        .args(["-i", "discord"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The audio process objects belonging to Discord — matched by PID against the
+/// whole Discord process tree (not bundle id, which misses Chromium's separate
+/// audio-service helper that actually renders the call). Empty when none.
+unsafe fn discord_process_objects() -> Vec<AudioObjectID> {
+    let pids = discord_pids();
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    process_object_list()
+        .into_iter()
+        .filter(|&o| read_u32(o, kAudioProcessPropertyPID).map(|p| pids.contains(&p)).unwrap_or(false))
+        .collect()
+}
+
+/// Stand up a private mono tap of just Discord's processes + an aggregate device
+/// + the level-detecting IO proc. None if Discord has no audio object right now
+/// or any HAL call fails.
+fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<VoiceCapture> {
+    use objc2::rc::Retained;
+    unsafe {
+        let nums: Vec<Retained<NSNumber>> = objs.iter().map(|&o| NSNumber::new_u32(o)).collect();
+        let arr: Retained<NSArray<NSNumber>> = NSArray::from_retained_slice(&nums);
+        let desc = if global {
+            let empty: Retained<NSArray<NSNumber>> = NSArray::new();
+            CATapDescription::initStereoGlobalTapButExcludeProcesses(CATapDescription::alloc(), &empty)
+        } else {
+            CATapDescription::initMonoMixdownOfProcesses(CATapDescription::alloc(), &arr)
+        };
+        desc.setName(&objc2_foundation::NSString::from_str("studioboard-discord-voice"));
+        desc.setPrivate(true);
+        desc.setMuteBehavior(objc2_core_audio::CATapMuteBehavior(0)); // CATapUnmuted
+
+        let mut tap_id: AudioObjectID = 0;
+        if AudioHardwareCreateProcessTap(Some(&desc), &mut tap_id as *mut AudioObjectID) != 0 || tap_id == 0 {
+            return None;
+        }
+
+        let ctx = Arc::new(VoiceCtx {
+            shared,
+            level: Mutex::new(0.0),
+            speaking: Mutex::new(false),
+            loud_at: Mutex::new(None),
+            frames: std::sync::atomic::AtomicU64::new(0),
+        });
+        let ctx_ptr = Arc::as_ptr(&ctx) as *mut c_void;
+        let mut guard = VoiceCapture { agg_id: 0, tap_id, proc_id: None, _ctx: ctx };
+
+        let tap_uid = read_cfstring(tap_id, kAudioTapPropertyUID)?;
+        let sub_tap: CFRetained<CFDictionary> = cf_dict(&[
+            (cfstr(kAudioSubTapUIDKey), tap_uid.as_ref() as &CFType as *const CFType),
+            (cfstr(kAudioSubTapDriftCompensationKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
+        ]);
+        let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType]);
+        // Distinct aggregate UIDs per variant so two taps can coexist (the diag
+        // runs a discord tap + a global tap at once; same UID would collide).
+        let kind = if global { "global" } else { "discord" };
+        let agg_uid = CFString::from_str(&format!("com.studioboard.voicelevel.{kind}"));
+        let agg_name = CFString::from_str(&format!("studioboard voice {kind}"));
+        let agg_desc: CFRetained<CFDictionary> = cf_dict(&[
+            (cfstr(kAudioAggregateDeviceUIDKey), agg_uid.as_ref() as &CFType as *const CFType),
+            (cfstr(kAudioAggregateDeviceNameKey), agg_name.as_ref() as &CFType as *const CFType),
+            (cfstr(kAudioAggregateDeviceIsPrivateKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
+            (cfstr(kAudioAggregateDeviceIsStackedKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
+            (cfstr(kAudioAggregateDeviceTapListKey), tap_list.as_ref() as &CFType as *const CFType),
+        ]);
+
+        let mut agg_id: AudioObjectID = 0;
+        if AudioHardwareCreateAggregateDevice(&agg_desc, NonNull::from(&mut agg_id)) != 0 || agg_id == 0 {
+            return None;
+        }
+        guard.agg_id = agg_id;
+
+        let mut proc_id: AudioDeviceIOProcID = None;
+        if AudioDeviceCreateIOProcID(agg_id, Some(voice_io_proc), ctx_ptr, NonNull::from(&mut proc_id)) != 0
+            || proc_id.is_none()
+        {
+            return None;
+        }
+        guard.proc_id = proc_id;
+
+        if AudioDeviceStart(agg_id, proc_id) != 0 {
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+/// `--diag-discord-audio`: list Discord's audio process objects, stand up the tap,
+/// and print when the speaking latch flips while you talk in your call.
+pub fn diag_voice() {
+    println!("studioboard --diag-discord-audio\n");
+    let dpids = discord_pids();
+    println!("Discord PIDs (pgrep): {dpids:?}");
+    println!("all audio process objects (obj: pid bundle):");
+    for o in unsafe { process_object_list() } {
+        let pid = unsafe { read_u32(o, kAudioProcessPropertyPID) };
+        let bundle = unsafe { read_cfstring(o, kAudioProcessPropertyBundleID) }.map(|b| b.to_string());
+        let mark = pid.map(|p| dpids.contains(&p)).unwrap_or(false);
+        println!("  {o}: pid={pid:?} bundle={bundle:?} {}", if mark { "← DISCORD" } else { "" });
+    }
+    println!();
+    let objs = unsafe { discord_process_objects() };
+    println!("→ tapping Discord objects: {objs:?}");
+    let s1: Shared = Arc::new(Mutex::new(AppState::default()));
+    let s2: Shared = Arc::new(Mutex::new(AppState::default()));
+    let dcap = if objs.is_empty() { None } else { start_voice(s1, &objs, false) };
+    let gcap = start_voice(s2, &[], true); // GLOBAL tap for comparison
+    println!("  discord tap: {}", if dcap.is_some() {"up"} else {"DOWN"});
+    println!("  global  tap: {}", if gcap.is_some() {"up"} else {"DOWN"});
+    println!("→ talk in your Discord call — watching 20s. Also polling Discord's");
+    println!("  per-process IsRunning/Input/Output flags to see if they track talking:\n");
+    let mut dpeak = 0.0f32;
+    let mut gpeak = 0.0f32;
+    let mut last_flags = String::new();
+    for i in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let dl = dcap.as_ref().map(|c| c.level()).unwrap_or(0.0);
+        let gl = gcap.as_ref().map(|c| c.level()).unwrap_or(0.0);
+        dpeak = dpeak.max(dl);
+        gpeak = gpeak.max(gl);
+        // Aggregate the run-flags across all Discord audio objects (any = on).
+        let mut run = false;
+        let mut rin = false;
+        let mut rout = false;
+        for &o in &objs {
+            run |= unsafe { read_u32(o, kAudioProcessPropertyIsRunning) }.unwrap_or(0) != 0;
+            rin |= unsafe { read_u32(o, kAudioProcessPropertyIsRunningInput) }.unwrap_or(0) != 0;
+            rout |= unsafe { read_u32(o, kAudioProcessPropertyIsRunningOutput) }.unwrap_or(0) != 0;
+        }
+        let flags = format!("running={run} input={rin} output={rout}");
+        if flags != last_flags {
+            println!("  [flags change] {flags}");
+            last_flags = flags.clone();
+        }
+        if i % 10 == 9 {
+            println!("  … global {gl:.5} (peak {gpeak:.5})   discord-tap {dl:.5}   {flags}");
+        }
+    }
+    println!("\ndone. discord-tap peak {dpeak:.5} | global peak {gpeak:.5}");
+}
+
+/// Background manager: keep a Discord-scoped tap alive whenever Discord has audio
+/// processes, rebuild it if Discord relaunches (its process objects change), and
+/// clear the speaking flag when Discord goes away. Cheap 2 s poll; the tap itself
+/// does the realtime work.
+pub fn spawn_voice(shared: Shared) {
+    // Opt-in: on this rig Discord's audio is laundered through WaveLink's HAL
+    // driver, so its per-process tap is silent and this can never fire (see
+    // --diag-discord-audio). It DOES work on a standard audio chain where Discord
+    // outputs directly to a real/aggregate device, so it's available behind a flag.
+    if std::env::var("STUDIOBOARD_DISCORD_AUDIO").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut cap: Option<VoiceCapture> = None;
+        let mut built_for: Vec<AudioObjectID> = Vec::new();
+        loop {
+            let objs = unsafe { discord_process_objects() };
+            let still_valid = !built_for.is_empty() && built_for.iter().any(|o| objs.contains(o));
+            if objs.is_empty() {
+                if cap.take().is_some() {
+                    if let Ok(mut s) = shared.lock() {
+                        s.discord.voice_speaking = false;
+                    }
+                }
+                built_for.clear();
+            } else if cap.is_none() || !still_valid {
+                cap = start_voice(shared.clone(), &objs, false);
+                built_for = if cap.is_some() { objs } else { Vec::new() };
+                if cap.is_none() {
+                    if let Ok(mut s) = shared.lock() {
+                        s.discord.voice_speaking = false;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
 }
