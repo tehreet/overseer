@@ -140,6 +140,7 @@ pub fn spawn_system(shared: Shared) {
                 } else {
                     0.0
                 };
+                let gpu_pct = s.silicon.gpu_pct; // from the macmon thread (its own lane)
                 s.res_samples.push_back((
                     now,
                     vec![
@@ -147,6 +148,7 @@ pub fn spawn_system(shared: Shared) {
                         (rx_bps / 1024.0) as f32,
                         (tx_bps / 1024.0) as f32,
                         (disk_io_bps / 1024.0) as f32,
+                        gpu_pct,
                     ],
                 ));
                 while s.res_samples.len() > 16 {

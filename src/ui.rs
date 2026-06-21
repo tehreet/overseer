@@ -335,9 +335,10 @@ fn sampled_cores(samples: &VecDeque<(Instant, Vec<f32>)>, target: Instant) -> Ve
 /// Order of sacrifice under pressure: trailing slack → messaging content above its
 /// floor (bottom-up) → WEATHER gives a couple rows → and only an extreme-tiny
 /// terminal clips further (bottom-up, last resort).
-fn left_card_heights(avail: u16, s: &AppState) -> [u16; 11] {
-    // [0..6) system (rigid), [6..10) messaging (content), [10] slack.
-    let mut h = [9u16, 9, 11, 9, 10, 7, 0, 0, 0, 0, 0];
+fn left_card_heights(avail: u16, s: &AppState) -> [u16; 10] {
+    // [0..5) system (rigid): cpu-eq, resources (big — its 5-lane wave is the show),
+    // proc, robots, weather. [5..9) messaging (content). [9] slack.
+    let mut h = [9u16, 16, 9, 10, 7, 0, 0, 0, 0, 0];
     let want = [
         card_height(&s.messages, s.msg_ui.active),
         card_height(&s.signal, false),
@@ -345,36 +346,39 @@ fn left_card_heights(avail: u16, s: &AppState) -> [u16; 11] {
         doctor_height(&s.doctor),
     ];
     for (i, &w) in want.iter().enumerate() {
-        h[6 + i] = w;
+        h[5 + i] = w;
     }
 
     let sum: u16 = h.iter().sum();
     if sum <= avail {
-        h[10] = avail - sum; // slack absorbs the remainder; cards stay content-tight
+        h[9] = avail - sum; // slack absorbs the remainder; cards stay content-tight
         return h;
     }
     let mut deficit = sum - avail;
 
     // 1) shrink messaging cards from content toward a small floor, bottom-up so the
     //    most important (iMESSAGE) keeps its content longest.
-    for i in [9usize, 8, 7, 6] {
+    for i in [8usize, 7, 6, 5] {
         if deficit == 0 {
             break;
         }
-        let floor = want[i - 6].min(5); // title + unread badge + a line or two
+        let floor = want[i - 5].min(5); // title + unread badge + a line or two
         let take = h[i].saturating_sub(floor).min(deficit);
         h[i] -= take;
         deficit -= take;
     }
-    // 2) let WEATHER give a couple rows before we start sacrificing the floors.
-    if deficit > 0 {
-        let take = h[5].saturating_sub(5).min(deficit);
-        h[5] -= take;
+    // 2) let WEATHER, then the big RESOURCES wave, give rows before sacrificing floors.
+    for i in [4usize, 1] {
+        if deficit == 0 {
+            break;
+        }
+        let take = h[i].saturating_sub(if i == 1 { 9 } else { 5 }).min(deficit);
+        h[i] -= take;
         deficit -= take;
     }
     // 3) extreme-tiny terminal: clip bottom-up through the floors, then the system
     //    cards, so the column never overflows.
-    for i in [9usize, 8, 7, 6, 5, 4, 3, 2, 1, 0] {
+    for i in [8usize, 7, 6, 5, 4, 3, 2, 1, 0] {
         if deficit == 0 {
             break;
         }
@@ -418,14 +422,13 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
 
     cpu_eq_panel(f, left[0], s);
     resources_panel(f, left[1], s);
-    silicon_panel(f, left[2], s, t);
-    proc_panel(f, left[3], s);
-    robots_panel(f, left[4], s, t);
-    weather_panel(f, left[5], s);
-    messages_panel(f, left[6], s, t);
-    signal_panel(f, left[7], s, t);
-    discord_panel(f, left[8], s, t);
-    doctor_panel(f, left[9], s, t);
+    proc_panel(f, left[2], s);
+    robots_panel(f, left[3], s, t);
+    weather_panel(f, left[4], s);
+    messages_panel(f, left[5], s, t);
+    signal_panel(f, left[6], s, t);
+    discord_panel(f, left[7], s, t);
+    doctor_panel(f, left[8], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
@@ -935,11 +938,12 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     // both derive from this list, so the colours in the legend always match.
     let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
     let pct: fn(f32) -> f32 = |p| (p / 100.0).clamp(0.0, 1.0);
-    let channels: [(f32, &str, fn(f32) -> f32, usize); 4] = [
-        (0.46, "mem", pct, 0),     // memory used
-        (0.66, "net ↓", lograte, 1), // network down
-        (0.82, "net ↑", lograte, 2), // network up
-        (0.96, "disk", lograte, 3),  // disk I/O
+    let channels: [(f32, &str, fn(f32) -> f32, usize); 5] = [
+        (0.42, "mem", pct, 0),     // memory used
+        (0.56, "gpu", pct, 4),     // GPU utilization
+        (0.70, "net ↓", lograte, 1), // network down
+        (0.84, "net ↑", lograte, 2), // network up
+        (0.97, "disk", lograte, 3),  // disk I/O
     ];
 
     // --- Key: one row, a colour swatch per wave shade + what it means. Clean and
@@ -980,110 +984,6 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
             })
             .collect();
         stacked_wave(f, plot, &plot_bands);
-    }
-}
-
-fn silicon_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
-    let hot = s.silicon.gpu_temp_c > 80.0 || s.silicon.cpu_temp_c > 90.0;
-    let block = panel("APPLE SILICON", hot);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if !s.silicon.fresh {
-        f.render_widget(
-            Paragraph::new(Span::styled("waiting for macmon…", Style::default().fg(c::DIM))),
-            inner,
-        );
-        return;
-    }
-
-    // Smooth, delay-interpolated metrics so every gauge glides like CPU/net.
-    let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
-    let v = sampled_cores(&s.silicon_samples, target);
-    let g = |i: usize, fallback: f32| v.get(i).copied().unwrap_or(fallback);
-    let si = &s.silicon;
-    let gpu = g(0, si.gpu_pct);
-    let ctemp = g(2, si.cpu_temp_c);
-    let gtemp = g(3, si.gpu_temp_c);
-    let gpw = g(5, si.gpu_power_w);
-    let spw = g(6, si.sys_power_w);
-    let ecpu = g(7, si.ecpu_pct);
-    let pcpu = g(8, si.pcpu_pct);
-
-    // Gauges in a fixed-width column on the left; the smooth power-draw graph
-    // fills everything to the right edge so it sits snug against the gauges
-    // (no awkward gap) and reads the same width as the NET wave.
-    // 34 (not 38) so the right-side stat block keeps ~22 cols: the strings
-    // 'cpu 9.2W   ane 0.0W' need 21, and at bw=10 the gauge line still fits.
-    let gauge_w = 34u16.min(inner.width);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(gauge_w), Constraint::Min(0)])
-        .split(inner);
-    let gauge_area = cols[0];
-    let graph_area = cols[1];
-
-    let bw = (gauge_area.width as usize).saturating_sub(24).clamp(8, 30);
-    let tnorm = |t: f32| ((t - 30.0) / 70.0).clamp(0.0, 1.0); // 30–100 °C → 0–1
-    let gpu_share = if spw > 0.1 { (gpw / spw * 100.0).clamp(0.0, 100.0) } else { 0.0 };
-
-    // label, value bar (0..1), bar color, trailing text
-    let gauge = |label: &str, frac: f32, col: ratatui::style::Color, tail: String| {
-        let mut spans = vec![Span::styled(format!("{label:<6} "), Style::default().fg(c::DIM))];
-        spans.extend(bar_spans(frac, bw, col));
-        spans.push(Span::styled(tail, Style::default().fg(c::TEXT)));
-        Line::from(spans)
-    };
-
-    // Jazzy synthwave bars: blue→violet→pink→white by fill, so the whole box
-    // reads purple/pink/blue/white. Magnitude still scans (low=blue, high=white).
-    let lines = vec![
-        gauge("gpu", gpu / 100.0, c::jazz(gpu / 100.0), format!(" {:>4.0}%  {} MHz", gpu, si.gpu_freq_mhz)),
-        gauge("e-cpu", ecpu / 100.0, c::jazz(ecpu / 100.0), format!(" {:>4.0}%  {} MHz", ecpu, si.ecpu_freq_mhz)),
-        gauge("p-cpu", pcpu / 100.0, c::jazz(pcpu / 100.0), format!(" {:>4.0}%  {} MHz", pcpu, si.pcpu_freq_mhz)),
-        {
-            let pf = (spw / 120.0).clamp(0.0, 1.0);
-            let mut spans = vec![Span::styled("power  ", Style::default().fg(c::DIM))];
-            spans.extend(bar_spans(pf, bw, c::jazz(pf)));
-            spans.push(Span::styled(format!(" {:>4.1}W", spw), Style::default().fg(c::pink()).add_modifier(Modifier::BOLD)));
-            Line::from(spans)
-        },
-        Line::from(""), // padding under the power bar
-        Line::from(vec![
-            Span::styled("       gpu ", Style::default().fg(c::FAINT)),
-            Span::styled(format!("{gpw:.1} W", ), Style::default().fg(c::DIM)),
-            Span::styled(format!("  ·  {gpu_share:.0}% of draw"), Style::default().fg(c::FAINT)),
-        ]),
-        Line::from(""),
-        gauge("cpu °C", tnorm(ctemp), c::jazz(tnorm(ctemp)), format!(" {ctemp:>3.0}°C")),
-        gauge("gpu °C", tnorm(gtemp), c::jazz(tnorm(gtemp)), format!(" {gtemp:>3.0}°C")),
-    ];
-    f.render_widget(Paragraph::new(lines), gauge_area);
-
-    // Right side: a shimmering SoC power-breakdown stat block, then the live
-    // system-power draw scrolling smoothly over GRAPH_WINDOW (jazz gradient).
-    if graph_area.width > 6 {
-        let g = graph_area;
-        let si = &s.silicon;
-        let stats = [
-            format!("cpu {:>4.1}W   ane {:>4.1}W", si.cpu_power_w, si.ane_power_w),
-            format!("gpu {:>4.1}W   pkg {:>4.1}W", si.gpu_power_w, si.all_power_w),
-        ];
-        for (i, line) in stats.iter().enumerate() {
-            f.render_widget(
-                Paragraph::new(shimmer_text(line, t, i as f32)),
-                Rect { x: g.x, y: g.y + i as u16, width: g.width, height: 1 },
-            );
-        }
-        let top = stats.len() as u16 + 1; // stats + one blank row
-        let plot = Rect { x: g.x, y: g.y + top, width: g.width, height: g.height.saturating_sub(top) };
-        let vals = series(
-            &s.silicon_samples,
-            plot.width as usize,
-            |buf, t| sampled_channel(buf, 6, t),
-            |w| (w / 120.0).clamp(0.0, 1.0),
-        );
-        area_graph(f, plot, &vals, Fill::Jazz);
     }
 }
 

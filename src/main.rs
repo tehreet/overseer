@@ -572,7 +572,8 @@ fn sample_data(st: &mut AppState, compose: bool) {
         let down = (300.0 + 2200.0 * (ph * 0.8).sin().abs()).max(1.0);
         let up = (60.0 + 380.0 * (ph * 0.6 + 1.0).sin().abs()).max(1.0);
         let io = (40.0 + 9000.0 * (ph * 0.9 + 0.5).sin().abs()).max(1.0);
-        st.res_samples.push_back((ts, vec![memp, down, up, io]));
+        let gpup = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0); // GPU %
+        st.res_samples.push_back((ts, vec![memp, down, up, io, gpup]));
     }
     for (i, v) in [12, 20, 35, 50, 41, 30, 48, 62, 55, 37].iter().enumerate() {
         let _ = i;
