@@ -4,7 +4,7 @@ If what you are building is not SMOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOTH in the TUI,
 
 **studioboard** — an always-on, buttery-smooth Ratatui TUI dashboard for a Mac Studio (M4 Max): system + Apple Silicon metrics, Claude Code usage, and Apple Music with karaoke-synced lyrics. Smoothness is the whole point — see line 1.
 
-This repo was split out of the `battlestation` rig-config repo; the kiosk/Hammerspoon integration that launches and pins this binary still lives there and invokes the installed `studioboard` command.
+This repo was split out of the `battlestation` rig-config repo. The only rig-side hook left there is the Hammerspoon keybind-registry export that feeds this app's KEYBINDS card (Hyper+H). The TUI runs as a normal full-window app — there is no kiosk mode.
 
 ## studioboard
 
