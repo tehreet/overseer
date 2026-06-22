@@ -1294,7 +1294,7 @@ fn read_queue() -> Vec<crate::state::QueueTrack> {
 // seek/pause and a song heard once loads its facts instantly across restarts —
 // with zero network/LLM calls on replay.
 // ---------------------------------------------------------------------------
-const FACTS_UA: &str = "overseer/0.1 (https://github.com/tehreet/battlestation)";
+const FACTS_UA: &str = "overseer/0.1 (https://github.com/tehreet/overseer)";
 
 pub fn spawn_facts(shared: Shared) {
     thread::spawn(move || {
@@ -1952,12 +1952,12 @@ fn sentences(text: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Git: pulse of the battlestation repo (branch, dirty, ahead/behind, last).
+// Git: pulse of the overseer repo (branch, dirty, ahead/behind, last).
 // ---------------------------------------------------------------------------
 pub fn spawn_git(shared: Shared) {
     let repo = std::env::var("OVERSEER_REPO").ok().unwrap_or_else(|| {
         dirs::home_dir()
-            .map(|h| h.join("workspace/battlestation").to_string_lossy().to_string())
+            .map(|h| h.join("workspace/overseer").to_string_lossy().to_string())
             .unwrap_or_default()
     });
     thread::spawn(move || loop {

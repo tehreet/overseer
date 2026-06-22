@@ -367,7 +367,7 @@ pub struct GitStats {
     pub commits_today: u32,
     /// Pull requests authored by the user on this repo (all states).
     pub pr_count: u32,
-    /// Repo directory name (shown before the branch, e.g. "battlestation").
+    /// Repo directory name (shown before the branch, e.g. "overseer").
     pub repo: String,
     /// Branch activity vs origin/main: lines added/removed across the branch's
     /// commits, commit count, and merge-commit count ("merges to main").
