@@ -776,7 +776,7 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Headless probe of the TV now-watching path (`studioboard --diag-tv`).
+/// Headless probe of the TV now-watching path (`overseer --diag-tv`).
 pub fn diag_tv() {
     println!("Probing TV.app …\n");
     match probe_tv_np() {
@@ -976,7 +976,7 @@ return "OK"
 
 pub fn spawn_artwork(shared: Shared) {
     thread::spawn(move || {
-        let path = std::env::temp_dir().join("studioboard_art.dat");
+        let path = std::env::temp_dir().join("overseer_art.dat");
         let path_str = path.to_string_lossy().to_string();
         let mut current = String::new();
         loop {
@@ -1047,7 +1047,7 @@ pub fn spawn_artwork(shared: Shared) {
 
 /// One-shot artwork probe for diagnostics: dump + decode the current art.
 pub fn probe_artwork() -> Option<(usize, usize, usize, [u8; 3])> {
-    let path = std::env::temp_dir().join("studioboard_art.dat");
+    let path = std::env::temp_dir().join("overseer_art.dat");
     let path_str = path.to_string_lossy().to_string();
     let out = Command::new("osascript")
         .arg("-e")
@@ -1065,7 +1065,7 @@ pub fn probe_artwork() -> Option<(usize, usize, usize, [u8; 3])> {
 /// Album art for the off-screen visual-verify path (`--cells` / `--snapshot`):
 /// decode the most recent real artwork dump if present, else a radial gradient.
 pub fn sample_album_art(id: String) -> crate::state::AlbumArt {
-    let dump = std::env::temp_dir().join("studioboard_art.dat");
+    let dump = std::env::temp_dir().join("overseer_art.dat");
     if dump.exists() {
         let art = decode_art(&dump, &id);
         if !art.px.is_empty() {
@@ -1082,7 +1082,7 @@ pub fn sample_album_art(id: String) -> crate::state::AlbumArt {
     crate::state::AlbumArt { track_id: id, w: dim, h: dim, px }
 }
 
-/// Persist the downscaled RGB thumb to `~/.cache/studioboard/art/<hash>.bin`.
+/// Persist the downscaled RGB thumb to `~/.cache/overseer/art/<hash>.bin`.
 /// Format: little-endian u32 `w`, u32 `h`, then `w*h*3` raw RGB bytes. Skips
 /// empty thumbs so a failed decode isn't cached as a permanent blank.
 fn save_art_cache(id: &str, art: &crate::state::AlbumArt) {
@@ -1290,11 +1290,11 @@ fn read_queue() -> Vec<crate::state::QueueTrack> {
 // LINER NOTES: interesting facts about the current track/album/artist. Claude
 // (Haiku) writes punchy trivia when ANTHROPIC_API_KEY is present; otherwise we
 // fall back to a Wikipedia extract so the card is never empty. Cached per track
-// in-memory AND on disk (~/.cache/studioboard/facts/) so it never regenerates on
+// in-memory AND on disk (~/.cache/overseer/facts/) so it never regenerates on
 // seek/pause and a song heard once loads its facts instantly across restarts —
 // with zero network/LLM calls on replay.
 // ---------------------------------------------------------------------------
-const FACTS_UA: &str = "studioboard/0.1 (https://github.com/tehreet/battlestation)";
+const FACTS_UA: &str = "overseer/0.1 (https://github.com/tehreet/battlestation)";
 
 pub fn spawn_facts(shared: Shared) {
     thread::spawn(move || {
@@ -1470,7 +1470,7 @@ impl FactSubject {
     }
 }
 
-/// One-shot facts probe for diagnostics (`studioboard --facts`).
+/// One-shot facts probe for diagnostics (`overseer --facts`).
 pub fn probe_facts(artist: &str, track: &str, album: &str) -> crate::state::MusicFacts {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(4))
@@ -1955,7 +1955,7 @@ fn sentences(text: &str) -> Vec<String> {
 // Git: pulse of the battlestation repo (branch, dirty, ahead/behind, last).
 // ---------------------------------------------------------------------------
 pub fn spawn_git(shared: Shared) {
-    let repo = std::env::var("STUDIOBOARD_REPO").ok().unwrap_or_else(|| {
+    let repo = std::env::var("OVERSEER_REPO").ok().unwrap_or_else(|| {
         dirs::home_dir()
             .map(|h| h.join("workspace/battlestation").to_string_lossy().to_string())
             .unwrap_or_default()
@@ -2386,7 +2386,7 @@ const TAIL_BYTES: u64 = 96 * 1024;
 
 /// Headless probe of the live-session feed: runs the real scan against
 /// `~/.claude/projects` and prints the roster, so the collector can be verified
-/// without the TUI. `studioboard --diag-live`.
+/// without the TUI. `overseer --diag-live`.
 pub fn diag_live_sessions() {
     use crate::state::ActionKind as K;
     let live = scan_live_sessions();
@@ -2765,7 +2765,8 @@ SELECT c.ROWID AS chat_id, \
        CASE WHEN (m.text IS NULL OR m.text='') AND m.attributedBody IS NOT NULL \
             THEN quote(m.attributedBody) ELSE '' END AS ab, \
        (SELECT count(*) FROM chat_message_join j2 JOIN message m2 ON m2.ROWID=j2.message_id \
-        WHERE j2.chat_id=c.ROWID AND m2.is_from_me=0 AND m2.is_read=0) AS unread_n, \
+        WHERE j2.chat_id=c.ROWID AND m2.is_from_me=0 AND m2.is_read=0 \
+          AND m2.associated_message_type=0 AND m2.item_type=0) AS unread_n, \
        COALESCE(sh.id,'') AS sender_handle \
 FROM chat c \
 JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID \
@@ -2875,7 +2876,7 @@ pub fn diag_messages() {
     };
     let db = home.join("Library/Messages/chat.db");
     let uri = format!("file:{}?mode=ro", db.display()); // read WAL (see spawn_messages)
-    println!("studioboard --diag-msg\n");
+    println!("overseer --diag-msg\n");
     println!("chat.db: {}", db.display());
 
     // 1) Raw query: does MSG_SQL run against THIS chat.db schema at all?
@@ -3552,7 +3553,7 @@ pub fn diag_signal() {
         return;
     };
     let src_db = home.join("Library/Application Support/Signal/sql/db.sqlite");
-    println!("studioboard --diag-signal\n");
+    println!("overseer --diag-signal\n");
     let Some(key) = signal_db_key() else {
         println!("could not derive Signal key (keychain/openssl).");
         return;
@@ -3611,7 +3612,7 @@ fn signal_db_key() -> Option<String> {
     let enc = v.get("encryptedKey")?.as_str()?;
     // Strip the "v10" prefix (3 bytes = 6 hex chars) and hex-decode the ciphertext.
     let cipher = hex_decode(enc.get(6..)?)?;
-    let cipher_path = std::env::temp_dir().join("studioboard-signal-cipher.bin");
+    let cipher_path = std::env::temp_dir().join("overseer-signal-cipher.bin");
     std::fs::write(&cipher_path, &cipher).ok()?;
 
     // Keychain secret Chromium's safeStorage used to wrap the DB key.
@@ -3723,7 +3724,7 @@ fn hex_encode(b: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // Discord: live voice presence over the gateway (sync tungstenite, one thread)
 // + recent text channels' last message over REST (another thread). Bot token and
-// guild id live in the Keychain ("studioboard-discord-bot" / "-guild"). Read-only.
+// guild id live in the Keychain ("overseer-discord-bot" / "-guild"). Read-only.
 // ---------------------------------------------------------------------------
 
 const DISCORD_INTENTS: u64 = 1 | (1 << 7); // GUILDS | GUILD_VOICE_STATES
@@ -3740,10 +3741,10 @@ fn name_allowed(list: &[&str], name: &str) -> bool {
 }
 
 fn discord_token() -> Option<String> {
-    keychain_secret("studioboard-discord-bot")
+    keychain_secret("overseer-discord-bot")
 }
 fn discord_guild() -> Option<String> {
-    keychain_secret("studioboard-discord-guild")
+    keychain_secret("overseer-discord-guild")
 }
 fn keychain_secret(service: &str) -> Option<String> {
     let out = Command::new("security")
@@ -3921,17 +3922,17 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
 
     // Opt-in voice "who's talking" detection. To receive Discord's per-user
     // Speaking events the bot has to JOIN the voice channel (so it shows up in
-    // voice) — off unless STUDIOBOARD_DISCORD_VOICE_LISTEN is set. We then track
+    // voice) — off unless OVERSEER_DISCORD_VOICE_LISTEN is set. We then track
     // our own session + the voice server creds and run a side voice-WS thread.
     use std::sync::atomic::{AtomicBool, Ordering};
-    let listen = std::env::var("STUDIOBOARD_DISCORD_VOICE_LISTEN")
+    let listen = std::env::var("OVERSEER_DISCORD_VOICE_LISTEN")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let mut bot_id: Option<String> = None;
     // Our MAIN gateway session_id (from READY). This is the authoritative session
     // for our connection and is what the voice IDENTIFY must use — grabbing it from
     // a VOICE_STATE_UPDATE can pick up a stale/foreign session (e.g. when another
-    // studioboard instance is connected as the same bot) → voice close 4006.
+    // overseer instance is connected as the same bot) → voice close 4006.
     let mut gw_session: Option<String> = None;
     let mut voice_session: Option<String> = None; // session_id from the bot's VOICE_STATE_UPDATE
     let mut voice_server: Option<(String, String)> = None; // (token, endpoint) from VOICE_SERVER_UPDATE
@@ -3951,13 +3952,13 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
         if listen {
             // Once Discord has rejected us with 4017 (DAVE/E2EE required), stop
             // trying — leave voice and never rejoin this session. Otherwise pick the
-            // channel to listen in. STUDIOBOARD_DISCORD_VOICE_FORCE forces a join for
+            // channel to listen in. OVERSEER_DISCORD_VOICE_FORCE forces a join for
             // diagnosing the handshake.
             let blocked = shared.lock().map(|s| s.discord.voice_e2ee_blocked).unwrap_or(false);
             let target = if blocked {
                 None
             } else {
-                std::env::var("STUDIOBOARD_DISCORD_VOICE_FORCE")
+                std::env::var("OVERSEER_DISCORD_VOICE_FORCE")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .or_else(|| voice_target(&who, &chan, &bot_id))
@@ -4042,7 +4043,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     "d": {
                         "token": tok,
                         "intents": DISCORD_INTENTS,
-                        "properties": {"os":"macos","browser":"studioboard","device":"studioboard"}
+                        "properties": {"os":"macos","browser":"overseer","device":"overseer"}
                     }
                 });
                 sock.send(Message::Text(identify.to_string().into())).map_err(|e| e.to_string())?;
@@ -4309,12 +4310,12 @@ fn discord_voice_ws(
     alive.store(false, Ordering::Relaxed);
 }
 
-/// Append a line to ~/.cache/studioboard/voice.log so the opt-in Discord voice
+/// Append a line to ~/.cache/overseer/voice.log so the opt-in Discord voice
 /// listener can be diagnosed without disturbing the TUI (which owns the screen).
 fn voice_log(msg: &str) {
     use std::io::Write;
     let Some(home) = dirs::home_dir() else { return };
-    let path = home.join(".cache/studioboard/voice.log");
+    let path = home.join(".cache/overseer/voice.log");
     if let Some(p) = path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
@@ -4583,10 +4584,10 @@ fn read_doctor() -> crate::state::Doctor {
         }
     }
 
-    // Preview override: STUDIOBOARD_FAKE_DOCTOR=running forces the diagnosing
+    // Preview override: OVERSEER_FAKE_DOCTOR=running forces the diagnosing
     // state live (overlaid on real incident data) so the in-flight card can be
     // seen without waiting for an actual threshold breach.
-    if std::env::var("STUDIOBOARD_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false) {
+    if std::env::var("OVERSEER_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false) {
         d.available = true;
         d.running = true;
         if d.step.is_empty() {
@@ -4603,7 +4604,7 @@ fn read_doctor() -> crate::state::Doctor {
 // Hammerspoon keybinds: mirror the live cheat sheet.
 //
 // init.lua exports its self-documenting `doc` registry to
-// ~/Library/Application Support/studioboard/keybinds.json on every reload. We
+// ~/Library/Application Support/overseer/keybinds.json on every reload. We
 // read + parse it (poll on mtime) so the KEYBINDS card always matches the real
 // bindings with no second list to maintain.
 // ----------------------------------------------------------------------------
@@ -4628,13 +4629,13 @@ struct KbExport {
 
 fn keybinds_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join("Library/Application Support/studioboard/keybinds.json")
+    std::path::Path::new(&home).join("Library/Application Support/overseer/keybinds.json")
 }
 
 /// Flag file Hammerspoon's Hyper+H writes; its presence hides the KEYBINDS card.
 fn keybinds_hidden_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join("Library/Application Support/studioboard/keybinds.hidden")
+    std::path::Path::new(&home).join("Library/Application Support/overseer/keybinds.hidden")
 }
 
 pub fn spawn_keybinds(shared: Shared) {

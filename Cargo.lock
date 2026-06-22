@@ -885,6 +885,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "overseer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "image",
+ "objc2",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "ratatui",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tungstenite",
+ "unicode-width 0.1.14",
+ "ureq",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,30 +1405,6 @@ dependencies = [
  "quote",
  "rustversion",
  "syn",
-]
-
-[[package]]
-name = "studioboard"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "dirs",
- "image",
- "objc2",
- "objc2-core-audio",
- "objc2-core-audio-types",
- "objc2-core-foundation",
- "objc2-foundation",
- "ratatui",
- "rustfft",
- "serde",
- "serde_json",
- "sysinfo",
- "tungstenite",
- "unicode-width 0.1.14",
- "ureq",
 ]
 
 [[package]]

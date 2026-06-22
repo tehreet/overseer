@@ -283,7 +283,7 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
             CATapDescription::alloc(),
             &empty,
         );
-        desc.setName(&objc2_foundation::NSString::from_str("studioboard-eq"));
+        desc.setName(&objc2_foundation::NSString::from_str("overseer-eq"));
         desc.setPrivate(true);
         desc.setMuteBehavior(objc2_core_audio::CATapMuteBehavior(0)); // CATapUnmuted
 
@@ -310,8 +310,8 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
             (cfstr(kAudioSubTapDriftCompensationKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
         ]);
         let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType]);
-        let agg_uid = CFString::from_str("com.studioboard.eq.aggregate");
-        let agg_name = CFString::from_str("studioboard EQ");
+        let agg_uid = CFString::from_str("com.overseer.eq.aggregate");
+        let agg_name = CFString::from_str("overseer EQ");
         let agg_desc: CFRetained<CFDictionary> = cf_dict(&[
             (cfstr(kAudioAggregateDeviceUIDKey), agg_uid.as_ref() as &CFType as *const CFType),
             (cfstr(kAudioAggregateDeviceNameKey), agg_name.as_ref() as &CFType as *const CFType),
@@ -365,7 +365,7 @@ fn cf_array(items: &[*const CFType]) -> CFRetained<CFArray> {
 /// whether real capture is working — so the user can tell at a glance if the
 /// EQ is measuring sound or falling back to the synthetic flourish.
 pub fn diag() {
-    println!("studioboard --diag-audio\n");
+    println!("overseer --diag-audio\n");
     let shared: Shared = Arc::new(Mutex::new(AppState::default()));
     print!("creating Core Audio process tap… ");
     let cap = start(shared.clone());
@@ -640,7 +640,7 @@ fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<V
         } else {
             CATapDescription::initMonoMixdownOfProcesses(CATapDescription::alloc(), &arr)
         };
-        desc.setName(&objc2_foundation::NSString::from_str("studioboard-discord-voice"));
+        desc.setName(&objc2_foundation::NSString::from_str("overseer-discord-voice"));
         desc.setPrivate(true);
         desc.setMuteBehavior(objc2_core_audio::CATapMuteBehavior(0)); // CATapUnmuted
 
@@ -668,8 +668,8 @@ fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<V
         // Distinct aggregate UIDs per variant so two taps can coexist (the diag
         // runs a discord tap + a global tap at once; same UID would collide).
         let kind = if global { "global" } else { "discord" };
-        let agg_uid = CFString::from_str(&format!("com.studioboard.voicelevel.{kind}"));
-        let agg_name = CFString::from_str(&format!("studioboard voice {kind}"));
+        let agg_uid = CFString::from_str(&format!("com.overseer.voicelevel.{kind}"));
+        let agg_name = CFString::from_str(&format!("overseer voice {kind}"));
         let agg_desc: CFRetained<CFDictionary> = cf_dict(&[
             (cfstr(kAudioAggregateDeviceUIDKey), agg_uid.as_ref() as &CFType as *const CFType),
             (cfstr(kAudioAggregateDeviceNameKey), agg_name.as_ref() as &CFType as *const CFType),
@@ -702,7 +702,7 @@ fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<V
 /// `--diag-discord-audio`: list Discord's audio process objects, stand up the tap,
 /// and print when the speaking latch flips while you talk in your call.
 pub fn diag_voice() {
-    println!("studioboard --diag-discord-audio\n");
+    println!("overseer --diag-discord-audio\n");
     let dpids = discord_pids();
     println!("Discord PIDs (pgrep): {dpids:?}");
     println!("all audio process objects (obj: pid bundle):");
@@ -762,7 +762,7 @@ pub fn spawn_voice(shared: Shared) {
     // driver, so its per-process tap is silent and this can never fire (see
     // --diag-discord-audio). It DOES work on a standard audio chain where Discord
     // outputs directly to a real/aggregate device, so it's available behind a flag.
-    if std::env::var("STUDIOBOARD_DISCORD_AUDIO").map(|v| v.trim().is_empty()).unwrap_or(true) {
+    if std::env::var("OVERSEER_DISCORD_AUDIO").map(|v| v.trim().is_empty()).unwrap_or(true) {
         return;
     }
     std::thread::spawn(move || {

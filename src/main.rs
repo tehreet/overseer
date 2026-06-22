@@ -1,4 +1,4 @@
-//! studioboard — a buttery-smooth always-on TUI for the Mac Studio.
+//! overseer — a buttery-smooth always-on TUI for the Mac Studio.
 //!
 //! Collectors run on background threads; the render loop is decoupled and
 //! frame-paced (up to 120 fps while music is playing so the progress bar and
@@ -74,11 +74,11 @@ fn main() -> Result<()> {
         // Headless: run only the Discord collector with voice listening on and
         // stream the handshake log, so the voice path can be diagnosed without
         // the TUI (which needs a real terminal). Joins voice — use briefly.
-        std::env::set_var("STUDIOBOARD_DISCORD_VOICE_LISTEN", "1");
+        std::env::set_var("OVERSEER_DISCORD_VOICE_LISTEN", "1");
         let shared = Arc::new(Mutex::new(AppState::default()));
         collectors::spawn_discord(shared);
         let log = dirs::home_dir()
-            .map(|h| h.join(".cache/studioboard/voice.log"))
+            .map(|h| h.join(".cache/overseer/voice.log"))
             .unwrap_or_default();
         let _ = std::fs::remove_file(&log);
         println!("--diag-voice: listening 20s (need someone in a voice channel)…\n");
@@ -644,10 +644,10 @@ fn advance_queue(s: &mut AppState) {
 }
 
 /// Exercise the real music + lyrics code paths and print what they return.
-/// Run from the terminal you actually use studioboard in, so it reflects that
+/// Run from the terminal you actually use overseer in, so it reflects that
 /// app's Automation (Music control) permission.
 fn diag() -> Result<()> {
-    println!("studioboard --diag\n");
+    println!("overseer --diag\n");
     let (running, playing, track, artist, album, dur, pos) = collectors::probe_music();
     println!("Apple Music:");
     println!("  running   : {running}");
@@ -711,7 +711,7 @@ fn diag() -> Result<()> {
 
 /// Render a single frame to a text buffer for headless verification:
 fn facts_diag() -> Result<()> {
-    println!("studioboard --facts\n");
+    println!("overseer --facts\n");
     let (running, _playing, track, artist, album, _dur, _pos) = collectors::probe_music();
     if !running || track.is_empty() {
         println!("Apple Music idle — no current track.");
@@ -731,10 +731,10 @@ fn facts_diag() -> Result<()> {
     Ok(())
 }
 
-/// Wipe the persistent disk cache (`~/.cache/studioboard/{lyrics,facts,art}`) and
+/// Wipe the persistent disk cache (`~/.cache/overseer/{lyrics,facts,art}`) and
 /// report what was removed, so a song re-fetches lyrics + facts + art next play.
 fn clear_cache() -> Result<()> {
-    println!("studioboard --clear-cache\n");
+    println!("overseer --clear-cache\n");
     if let Some(root) = cache::root() {
         println!("cache root: {}", root.display());
     }
@@ -744,7 +744,7 @@ fn clear_cache() -> Result<()> {
     Ok(())
 }
 
-///   studioboard --snapshot [WIDTHxHEIGHT]
+///   overseer --snapshot [WIDTHxHEIGHT]
 fn snapshot(args: &[String]) -> Result<()> {
     use ratatui::backend::TestBackend;
     let (w, h) = args
@@ -786,7 +786,7 @@ fn snapshot(args: &[String]) -> Result<()> {
 }
 
 /// Dump every rendered cell with its fg/bg color for off-screen image
-/// rendering: `studioboard --cells [WxH] [--idle]`. One line per cell:
+/// rendering: `overseer --cells [WxH] [--idle]`. One line per cell:
 ///   x\ty\tfr\tfg\tfb\tbr\tbg\tbb\t<symbol>
 fn cells(args: &[String]) -> Result<()> {
     use ratatui::backend::TestBackend;
@@ -902,7 +902,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
         uptime_secs: 367_200,
         proc_count: 612,
         top_procs: vec![
-            ("studioboard".into(), 18.4, 28_000_000, 367_200),
+            ("overseer".into(), 18.4, 28_000_000, 367_200),
             ("WindowServer".into(), 12.1, 480_000_000, 367_200),
             ("Music".into(), 6.3, 320_000_000, 7_860),
             ("Warp".into(), 4.8, 540_000_000, 14_400),
@@ -1027,9 +1027,9 @@ fn sample_data(st: &mut AppState, compose: bool) {
         polled: true,
         ..Default::default()
     };
-    // STUDIOBOARD_FAKE_WATCH previews the "now watching" band off-screen:
-    // `=movie` a film, anything else a TV episode. Mirrors STUDIOBOARD_FAKE_VOICE.
-    if let Ok(kind) = std::env::var("STUDIOBOARD_FAKE_WATCH") {
+    // OVERSEER_FAKE_WATCH previews the "now watching" band off-screen:
+    // `=movie` a film, anything else a TV episode. Mirrors OVERSEER_FAKE_VOICE.
+    if let Ok(kind) = std::env::var("OVERSEER_FAKE_WATCH") {
         let movie = kind == "movie";
         st.music = MusicStats {
             running: true,
@@ -1101,7 +1101,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
         ahead: 2,
         behind: 0,
         last_hash: "9a554a6".into(),
-        last_msg: "feat(studioboard): merge Robots Working card".into(),
+        last_msg: "feat(overseer): merge Robots Working card".into(),
         last_rel: "16 minutes ago".into(),
         commits_today: 7,
         pr_count: 0,
@@ -1244,15 +1244,15 @@ fn sample_data(st: &mut AppState, compose: bool) {
             },
         ],
         voice_join_at: None,
-        voice_speaking: std::env::var("STUDIOBOARD_FAKE_SPEAKING")
+        voice_speaking: std::env::var("OVERSEER_FAKE_SPEAKING")
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false),
         voice_speaking_tap: false,
         voice_e2ee_blocked: false,
     };
-    // MAC-DOCTOR card preview. Idle by default; STUDIOBOARD_FAKE_DOCTOR=running
+    // MAC-DOCTOR card preview. Idle by default; OVERSEER_FAKE_DOCTOR=running
     // previews the in-flight (diagnosing) state.
-    let doc_running = std::env::var("STUDIOBOARD_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false);
+    let doc_running = std::env::var("OVERSEER_FAKE_DOCTOR").map(|v| v == "running").unwrap_or(false);
     st.doctor = state::Doctor {
         available: true,
         running: doc_running,

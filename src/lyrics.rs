@@ -9,11 +9,11 @@
 //!
 //! Speed strategy:
 //!   * a shared pooled `ureq::Agent` avoids per-call TLS handshakes,
-//!   * synced results are cached to disk (`~/.cache/studioboard/lyrics`), so a
+//!   * synced results are cached to disk (`~/.cache/overseer/lyrics`), so a
 //!     song heard once loads instantly forever — even across restarts.
 //!
 //! Misses don't vanish: every track we fail to resolve is appended to a JSONL
-//! miss log (`~/.cache/studioboard/misses.jsonl`) with the sources tried, so the
+//! miss log (`~/.cache/overseer/misses.jsonl`) with the sources tried, so the
 //! LYRICS card can surface a count and a reconcile pass can retry them later
 //! (catalogs grow — a miss today may hit next week).
 
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::state::{LyricLine, Lyrics};
 
-const UA: &str = "studioboard (https://github.com/local/studioboard)";
+const UA: &str = "overseer (https://github.com/local/overseer)";
 const FETCH_BUDGET: Duration = Duration::from_secs(13);
 
 enum Msg {
@@ -364,7 +364,7 @@ fn search_once(
 // wrong-artist cover can't win.
 
 const NETEASE_UA: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) studioboard";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) overseer";
 
 /// Best synced lyrics from NetEase, or `None`.
 fn netease_synced(agent: &ureq::Agent, artist: &str, track: &str, duration: f64) -> Option<Vec<LyricLine>> {
@@ -636,7 +636,7 @@ fn synced_from(v: &serde_json::Value) -> Option<Vec<LyricLine>> {
 }
 
 // --- disk cache ------------------------------------------------------------
-// Stored as standard `.lrc` files under `~/.cache/studioboard/lyrics/`, keyed by
+// Stored as standard `.lrc` files under `~/.cache/overseer/lyrics/`, keyed by
 // the shared track hash (see `crate::cache`) so a song heard once loads instantly
 // forever — even across restarts.
 

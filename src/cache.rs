@@ -1,4 +1,4 @@
-//! Persistent on-disk cache under `~/.cache/studioboard/<kind>/`.
+//! Persistent on-disk cache under `~/.cache/overseer/<kind>/`.
 //!
 //! A song heard once loads its lyrics, liner-note facts, and album art instantly
 //! forever — with zero network/LLM calls on replay — because each is written to
@@ -13,9 +13,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-/// Root cache directory: `~/.cache/studioboard`.
+/// Root cache directory: `~/.cache/overseer`.
 pub fn root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("studioboard"))
+    Some(dirs::cache_dir()?.join("overseer"))
 }
 
 /// A per-kind subdirectory (e.g. "lyrics" / "facts" / "art"), created on demand.
@@ -33,7 +33,7 @@ pub fn track_key(track_id: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Path to a cache entry: `~/.cache/studioboard/<kind>/<hash>.<ext>`.
+/// Path to a cache entry: `~/.cache/overseer/<kind>/<hash>.<ext>`.
 pub fn entry_path(kind: &str, track_id: &str, ext: &str) -> Option<PathBuf> {
     Some(cache_dir(kind)?.join(format!("{}.{}", track_key(track_id), ext)))
 }
@@ -65,7 +65,7 @@ pub fn put_json<T: serde::Serialize>(kind: &str, track_id: &str, value: &T) {
 }
 
 /// Wipe every cache subdirectory and report what was removed, one line per kind
-/// (used by `studioboard --clear-cache`).
+/// (used by `overseer --clear-cache`).
 pub fn clear() -> Vec<String> {
     let mut report = Vec::new();
     let Some(root) = root() else {

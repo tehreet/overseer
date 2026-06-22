@@ -2185,7 +2185,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             Paragraph::new(vec![
                 Line::from(Span::styled("✉  can't read Messages", Style::default().fg(c::DIM))),
                 Line::from(Span::styled(
-                    "grant Full Disk Access to studioboard",
+                    "grant Full Disk Access to overseer",
                     Style::default().fg(c::FAINT),
                 )),
             ]),
@@ -2470,12 +2470,12 @@ const DISCORD_MAX_VOICE: usize = 3;
 const DISCORD_MAX_TEXT: usize = 3;
 
 /// Overlay an env-gated fake voice member so a join can be previewed live:
-/// `STUDIOBOARD_FAKE_VOICE="200 club:Ghosty"` (or just a bare name → "200 club").
+/// `OVERSEER_FAKE_VOICE="200 club:Ghosty"` (or just a bare name → "200 club").
 /// Returns the real list untouched when the env var is unset.
 fn fake_voice(real: &[crate::state::VoiceChannel]) -> Vec<crate::state::VoiceChannel> {
     use crate::state::VoiceChannel;
     let mut voice = real.to_vec();
-    let spec = match std::env::var("STUDIOBOARD_FAKE_VOICE") {
+    let spec = match std::env::var("OVERSEER_FAKE_VOICE") {
         Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return voice,
     };
@@ -2550,12 +2550,12 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // Border shimmer, in priority order:
     //  • someone is TALKING in voice  → bright, fast, white-hot sweep
     //  • unread text / 20s after a voice JOIN → calm attention sweep
-    // STUDIOBOARD_FAKE_SPEAKING / _VOICE light these up for previewing.
+    // OVERSEER_FAKE_SPEAKING / _VOICE light these up for previewing.
     let voice_join = d.voice_join_at.map_or(false, |i| i.elapsed().as_secs_f64() < 20.0);
-    let fake_join = std::env::var("STUDIOBOARD_FAKE_VOICE")
+    let fake_join = std::env::var("OVERSEER_FAKE_VOICE")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let fake_speaking = std::env::var("STUDIOBOARD_FAKE_SPEAKING")
+    let fake_speaking = std::env::var("OVERSEER_FAKE_SPEAKING")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     // Light the border if EITHER detector hears talking: the bot-gateway SSRC events

@@ -1,4 +1,4 @@
-# studioboard
+# overseer
 
 A buttery-smooth, always-on TUI command center for the Mac Studio (Apple M4 Max).
 
@@ -60,7 +60,7 @@ matter what the code does.
 ## Run
 
 ```sh
-studioboard          # installed to ~/.cargo/bin
+overseer          # installed to ~/.cargo/bin
 # or from this dir:
 cargo run --release
 ```
@@ -70,7 +70,7 @@ Quit with `q`, `Esc`, or `Ctrl-C`.
 Headless layout preview (no terminal needed):
 
 ```sh
-studioboard --snapshot 140x42
+overseer --snapshot 140x42
 ```
 
 ## First-run permissions

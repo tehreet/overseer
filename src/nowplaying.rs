@@ -75,7 +75,7 @@ CFRunLoopRun()
 fn script_path() -> Option<&'static std::path::Path> {
     static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     PATH.get_or_init(|| {
-        let p = std::env::temp_dir().join("studioboard_nowplaying.swift");
+        let p = std::env::temp_dir().join("overseer_nowplaying.swift");
         std::fs::write(&p, SWIFT_SRC).ok().map(|_| p)
     })
     .as_deref()
@@ -114,7 +114,7 @@ pub fn get() -> Option<NowPlaying> {
     Some(np)
 }
 
-/// Headless probe (`studioboard --diag-np`): print the raw system now-playing.
+/// Headless probe (`overseer --diag-np`): print the raw system now-playing.
 pub fn diag() {
     println!("Probing MediaRemote via the swift helper …\n");
     match get() {

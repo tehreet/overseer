@@ -1,11 +1,11 @@
 [package]
-name = "studioboard"
+name = "overseer"
 version = "0.1.0"
 edition = "2021"
 description = "A buttery-smooth always-on TUI dashboard for the Mac Studio: system + Apple Silicon metrics, Claude Code usage, and Apple Music with karaoke-synced lyrics."
 
 [[bin]]
-name = "studioboard"
+name = "overseer"
 path = "src/main.rs"
 
 [dependencies]
