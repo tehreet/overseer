@@ -14,3 +14,7 @@ A Rust/Ratatui TUI. Collectors run on background threads; the render loop is dec
 - **Build/run gotcha:** the live `overseer` command is a symlink to the **release** binary. After editing, run `cargo build --release` (a plain `cargo build` only writes `target/debug/` and the running app won't change), then quit + relaunch. Watch for a stale `~/.cargo/bin/overseer` shadowing the symlink — `cargo install --path . --force` from this repo fixes it.
 - **Visual verify (no TTY needed):** `overseer --cells WxH [t=1.3]` dumps every rendered cell with colors; a Pillow script rasterizes it to a PNG so you can actually SEE colors/animation off-screen. `--snapshot` is glyph-only.
 - **Palette:** synthwave graphite — violet/cyan/pink/green on a near-black bg, with a `jazz()` blue→violet→pink→white ramp for the lively bits. Keep new work on-palette and animated.
+
+## Working process — GitHub issues are the source of truth
+
+Work on overseer is tracked in **GitHub issues** on [`tehreet/overseer`](https://github.com/tehreet/overseer/issues). Before starting any feature or fix, check the open issues (`gh issue list`) and pick up or file one — don't work off chat history or memory. New ideas become issues so the backlog stays the single source of truth. Reference the issue in the commit/PR and close it on completion (e.g. `Fixes #N`).
