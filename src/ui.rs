@@ -990,23 +990,23 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     // the cyan end — its own lane + shade, folded in from the retired CPU card.
     let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
     let pct: fn(f32) -> f32 = |p| (p / 100.0).clamp(0.0, 1.0);
-    let channels: [(f32, &str, fn(f32) -> f32, usize); 6] = [
-        (0.10, "cpu", pct, 5),       // CPU overall %  (its own lane + shade)
-        (0.42, "mem", pct, 0),       // memory used
-        (0.56, "gpu", pct, 4),       // GPU utilization
-        (0.70, "net ↓", lograte, 1), // network down
-        (0.84, "net ↑", lograte, 2), // network up
-        (0.97, "disk", lograte, 3),  // disk I/O
+    let channels: [(Color, &str, fn(f32) -> f32, usize); 6] = [
+        (Color::Rgb(86, 214, 255), "cpu", pct, 5), // fixed cyan (CYAN_BASE) — no album drift
+        (c::jazz(0.42), "mem", pct, 0),            // memory used
+        (c::jazz(0.56), "gpu", pct, 4),            // GPU utilization
+        (c::jazz(0.70), "net ↓", lograte, 1),      // network down
+        (c::jazz(0.84), "net ↑", lograte, 2),      // network up
+        (c::jazz(0.97), "disk", lograte, 3),       // disk I/O
     ];
 
     // --- Key: one row, a colour swatch per wave shade + what it means. Clean and
     // quiet (swatch bold in the shade, label dim) so the wave stays the show.
     let mut key: Vec<Span> = Vec::new();
-    for (i, (t, name, _, _)) in channels.iter().enumerate() {
+    for (i, (col, name, _, _)) in channels.iter().enumerate() {
         if i > 0 {
             key.push(Span::raw("   "));
         }
-        key.push(Span::styled("█ ", Style::default().fg(c::jazz(*t)).add_modifier(Modifier::BOLD)));
+        key.push(Span::styled("█ ", Style::default().fg(*col).add_modifier(Modifier::BOLD)));
         key.push(Span::styled(*name, Style::default().fg(c::DIM)));
     }
     let text_h = 1u16;
@@ -1031,9 +1031,9 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
         let pw = plot.width as usize;
         let plot_bands: Vec<(ratatui::style::Color, Vec<f32>)> = channels
             .iter()
-            .map(|(t, _, norm, ch)| {
+            .map(|(col, _, norm, ch)| {
                 let ch = *ch;
-                (c::jazz(*t), series(&s.res_samples, pw, move |b, tt| sampled_channel(b, ch, tt), *norm))
+                (*col, series(&s.res_samples, pw, move |b, tt| sampled_channel(b, ch, tt), *norm))
             })
             .collect();
         stacked_wave(f, plot, &plot_bands);
@@ -1317,14 +1317,14 @@ fn doctor_feed_line(d: &crate::state::Doctor, w: usize, t: f64) -> Line<'static>
     let actionf = fit_width(&action, rem.max(1));
     rem = rem.saturating_sub(dwidth(&actionf));
 
-    // While actively triaging, glyph + project + action shimmer as one urgent band
-    // so a live run reads instantly. A past incident that merely "needs a look" shows
-    // calm and static (severity-tinted) — present, but not nagging with motion forever.
+    // Only an actively-running triage shimmers (urgent traveling band, severity-
+    // tinted). A past incident that merely "needs a look" reads as plain, calm text
+    // — present in the feed but visually like a quiet session, never nagging.
     let label = format!("✚ {projf} {actionf}");
     let mut spans = if d.running {
         shimmer_spans(&label, t, 0.0, base, 1.1, 0.10, true)
     } else {
-        vec![Span::styled(label, Style::default().fg(base).add_modifier(Modifier::BOLD))]
+        vec![Span::styled(label, Style::default().fg(c::DIM))]
     };
     if rem > 0 {
         spans.push(Span::raw(" ".repeat(rem)));
@@ -2685,7 +2685,10 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let fake_speaking = std::env::var("STUDIOBOARD_FAKE_SPEAKING")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let speaking = d.voice_speaking || fake_speaking;
+    // Light the border if EITHER detector hears talking: the bot-gateway SSRC events
+    // OR the local Core Audio tap (which works past Discord's E2EE). They write
+    // separate flags so one can't clobber the other to false.
+    let speaking = d.voice_speaking || d.voice_speaking_tap || fake_speaking;
     if d.available && speaking {
         // Pulse the glow a touch so "talking" reads as alive, not just lit.
         let glow = 0.45 + 0.20 * (t * 5.0).sin().abs() as f32;

@@ -539,7 +539,7 @@ unsafe extern "C-unwind" fn voice_io_proc(
         if !*speaking {
             *speaking = true;
             if let Ok(mut s) = ctx.shared.lock() {
-                s.discord.voice_speaking = true;
+                s.discord.voice_speaking_tap = true;
             }
         }
     } else if *speaking {
@@ -549,7 +549,7 @@ unsafe extern "C-unwind" fn voice_io_proc(
         if quiet_for >= VOICE_HANG_MS {
             *speaking = false;
             if let Ok(mut s) = ctx.shared.lock() {
-                s.discord.voice_speaking = false;
+                s.discord.voice_speaking_tap = false;
             }
         }
     }
