@@ -333,50 +333,51 @@ fn sampled_cores(samples: &VecDeque<(Instant, Vec<f32>)>, target: Instant) -> Ve
 /// Order of sacrifice under pressure: trailing slack → messaging content above its
 /// floor (bottom-up) → WEATHER gives a couple rows → and only an extreme-tiny
 /// terminal clips further (bottom-up, last resort).
-fn left_card_heights(avail: u16, s: &AppState) -> [u16; 9] {
-    // [0..5) system (rigid): cpu-eq, resources (big — its 5-lane wave is the show),
-    // proc, robots, weather. [5..8) messaging (content): iMessage, Signal, Discord.
-    // [8] slack. (mac-doctor no longer has a card — it folds into ROBOTS.)
-    let mut h = [9u16, 16, 9, 10, 7, 0, 0, 0, 0];
+fn left_card_heights(avail: u16, s: &AppState) -> [u16; 8] {
+    // [0..4) system (rigid): resources (big — its 6-lane wave is the show, with CPU
+    // folded in as its own lane), proc, robots, weather. [4..7) messaging (content):
+    // iMessage, Signal, Discord. [7] slack. (CPU and mac-doctor no longer own cards —
+    // CPU folds into RESOURCES, doctor folds into ROBOTS.)
+    let mut h = [16u16, 9, 10, 7, 0, 0, 0, 0];
     let want = [
         card_height(&s.messages, s.msg_ui.active),
         card_height(&s.signal, false),
         discord_height(&s.discord),
     ];
     for (i, &w) in want.iter().enumerate() {
-        h[5 + i] = w;
+        h[4 + i] = w;
     }
 
     let sum: u16 = h.iter().sum();
     if sum <= avail {
-        h[8] = avail - sum; // slack absorbs the remainder; cards stay content-tight
+        h[7] = avail - sum; // slack absorbs the remainder; cards stay content-tight
         return h;
     }
     let mut deficit = sum - avail;
 
     // 1) shrink messaging cards from content toward a small floor, bottom-up so the
     //    most important (iMESSAGE) keeps its content longest.
-    for i in [7usize, 6, 5] {
+    for i in [6usize, 5, 4] {
         if deficit == 0 {
             break;
         }
-        let floor = want[i - 5].min(5); // title + unread badge + a line or two
+        let floor = want[i - 4].min(5); // title + unread badge + a line or two
         let take = h[i].saturating_sub(floor).min(deficit);
         h[i] -= take;
         deficit -= take;
     }
     // 2) let WEATHER, then the big RESOURCES wave, give rows before sacrificing floors.
-    for i in [4usize, 1] {
+    for i in [3usize, 0] {
         if deficit == 0 {
             break;
         }
-        let take = h[i].saturating_sub(if i == 1 { 9 } else { 5 }).min(deficit);
+        let take = h[i].saturating_sub(if i == 0 { 9 } else { 5 }).min(deficit);
         h[i] -= take;
         deficit -= take;
     }
     // 3) extreme-tiny terminal: clip bottom-up through the floors, then the system
     //    cards, so the column never overflows.
-    for i in [7usize, 6, 5, 4, 3, 2, 1, 0] {
+    for i in [6usize, 5, 4, 3, 2, 1, 0] {
         if deficit == 0 {
             break;
         }
@@ -426,14 +427,13 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
         .constraints(lh.map(Constraint::Length))
         .split(body[0]);
 
-    cpu_eq_panel(f, left[0], s);
-    resources_panel(f, left[1], s);
-    proc_panel(f, left[2], s);
-    robots_panel(f, left[3], s, t);
-    weather_panel(f, left[4], s);
-    messages_panel(f, left[5], s, t);
-    signal_panel(f, left[6], s, t);
-    discord_panel(f, left[7], s, t);
+    resources_panel(f, left[0], s);
+    proc_panel(f, left[1], s);
+    robots_panel(f, left[2], s, t);
+    weather_panel(f, left[3], s);
+    messages_panel(f, left[4], s, t);
+    signal_panel(f, left[5], s, t);
+    discord_panel(f, left[6], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
     // never flash the wrong thing before the real state is known. After that:
@@ -508,23 +508,21 @@ fn render_kiosk(f: &mut Frame, s: &AppState, t: f64) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(outer[0]);
 
-    // Left column — the five system cards, each given a generous share of the
+    // Left column — the four system cards, each given a generous share of the
     // column so they breathe (no messaging cards squeezing them anymore).
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(20), // cpu + EQ spectrum
-            Constraint::Percentage(28), // RESOURCES wave — the show, blown up
-            Constraint::Percentage(16), // top processes
-            Constraint::Percentage(20), // robots working
-            Constraint::Percentage(16), // weather
+            Constraint::Percentage(34), // RESOURCES wave — the show, blown up (CPU folds in here)
+            Constraint::Percentage(22), // top processes
+            Constraint::Percentage(24), // robots working
+            Constraint::Percentage(20), // weather
         ])
         .split(body[0]);
-    cpu_eq_panel(f, left[0], s);
-    resources_panel(f, left[1], s);
-    proc_panel(f, left[2], s);
-    robots_panel(f, left[3], s, t);
-    weather_panel(f, left[4], s);
+    resources_panel(f, left[0], s);
+    proc_panel(f, left[1], s);
+    robots_panel(f, left[2], s, t);
+    weather_panel(f, left[3], s);
 
     // Right column — NOW PLAYING + LYRICS up top; the four messaging cards fill
     // the bottom (the old KEYBINDS slot).
@@ -978,93 +976,6 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Half-width CPU equalizer: one vertical bar per core, height = that core's
-/// real, delay-interpolated load. The Catmull-Rom playback (sampled at
-/// `now - EQ_DELAY`, advanced every frame) makes the bars glide smoothly
-/// between the 1 Hz samples — honest data, buttery motion. Green→red gradient.
-fn cpu_eq_panel(f: &mut Frame, area: Rect, s: &AppState) {
-    let target = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
-    let vals = sampled_cores(&s.cpu_samples, target);
-    let n = vals.len();
-    let overall = if n > 0 { vals.iter().sum::<f32>() / n as f32 } else { 0.0 };
-    let load = s.system.load.0;
-    let title = format!("CPU   {overall:>2.0}%   loadavg {load:.1}%");
-    let block = panel(&title, overall > 80.0);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if n == 0 || inner.height < 2 || inner.width < 8 {
-        return;
-    }
-
-    // Per-core heights = real, delay-interpolated load. No fabricated motion;
-    // the smoothness is the continuous Catmull-Rom playback between samples.
-    let heights: Vec<f32> = (0..n).map(|core| (vals[core] / 100.0).clamp(0.0, 1.0)).collect();
-
-    let bar_rows = (inner.height as usize).saturating_sub(1); // reserve last row for labels
-    let iw = inner.width as usize;
-    let slot = (iw / n).max(2);
-    let gap = if slot >= 6 { 2 } else { 1 };
-    let bar_w = slot.saturating_sub(gap).max(1);
-    let used = n * slot;
-    let lead = iw.saturating_sub(used) / 2; // center the whole equalizer
-
-    let mut lines: Vec<Line> = Vec::with_capacity(bar_rows + 1);
-    for r in 0..bar_rows {
-        let row_top = (bar_rows - r) as f32 / bar_rows as f32;
-        let row_bot = (bar_rows - r - 1) as f32 / bar_rows as f32;
-        let mid = (row_top + row_bot) * 0.5;
-        let mut spans: Vec<Span> = Vec::with_capacity(n * 2 + 1);
-        if lead > 0 {
-            spans.push(Span::raw(" ".repeat(lead)));
-        }
-        for core in 0..n {
-            let h = heights[core];
-            let glyph = if h >= row_top {
-                '█'
-            } else if h > row_bot {
-                c::vblock((h - row_bot) / (row_top - row_bot))
-            } else {
-                ' '
-            };
-            if glyph == ' ' {
-                spans.push(Span::raw(" ".repeat(bar_w)));
-            } else {
-                // Synthwave spectrum: hue follows the core's REAL load (0.75*h)
-                // with a gentle vertical lift (0.25*mid) so each column keeps a
-                // legible bottom→top gradient. Idle cores stay blue, busy cores
-                // climb violet→pink→white. No green/orange heat anywhere.
-                let col = c::jazz((0.25 * mid + 0.75 * h).clamp(0.0, 1.0));
-                let st = Style::default().fg(col);
-                spans.push(Span::styled(glyph.to_string().repeat(bar_w), st));
-            }
-            if core < n {
-                spans.push(Span::raw(" ".repeat(gap)));
-            }
-        }
-        lines.push(Line::from(spans));
-    }
-
-    // Bottom row: faint core indices centered under each bar.
-    let mut label_spans: Vec<Span> = Vec::with_capacity(n + 1);
-    if lead > 0 {
-        label_spans.push(Span::raw(" ".repeat(lead)));
-    }
-    for c in 0..n {
-        let lab = format!("{c}");
-        let padl = (bar_w.saturating_sub(lab.len())) / 2;
-        let padr = bar_w.saturating_sub(lab.len()).saturating_sub(padl);
-        label_spans.push(Span::styled(
-            format!("{}{}{}", " ".repeat(padl), lab, " ".repeat(padr)),
-            Style::default().fg(c::FAINT),
-        ));
-        label_spans.push(Span::raw(" ".repeat(gap)));
-    }
-    lines.push(Line::from(label_spans));
-
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = panel("RESOURCES", false);
     let inner = block.inner(area);
@@ -1073,14 +984,16 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    // The wave's four channels: jazz-ramp shade (violet→pink→white), label, the
-    // 0..1 normaliser, and which res_samples slot it reads. The key and the wave
-    // both derive from this list, so the colours in the legend always match.
+    // The wave's six channels: jazz-ramp shade (cyan→violet→pink→white), label, the
+    // 0..1 normaliser, and which res_samples slot it reads. The key and the wave both
+    // derive from this list, so the colours in the legend always match. CPU leads on
+    // the cyan end — its own lane + shade, folded in from the retired CPU card.
     let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
     let pct: fn(f32) -> f32 = |p| (p / 100.0).clamp(0.0, 1.0);
-    let channels: [(f32, &str, fn(f32) -> f32, usize); 5] = [
-        (0.42, "mem", pct, 0),     // memory used
-        (0.56, "gpu", pct, 4),     // GPU utilization
+    let channels: [(f32, &str, fn(f32) -> f32, usize); 6] = [
+        (0.10, "cpu", pct, 5),       // CPU overall %  (its own lane + shade)
+        (0.42, "mem", pct, 0),       // memory used
+        (0.56, "gpu", pct, 4),       // GPU utilization
         (0.70, "net ↓", lograte, 1), // network down
         (0.84, "net ↑", lograte, 2), // network up
         (0.97, "disk", lograte, 3),  // disk I/O
@@ -1249,11 +1162,11 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let loc = Line::from(vec![
         Span::styled(format!("+{}", g.loc_added), Style::default().fg(c::GREEN).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" -{}", g.loc_removed), Style::default().fg(if g.loc_removed > 0 { c::RED } else { c::FAINT })),
-        Span::styled(" loc", Style::default().fg(c::FAINT)),
+        Span::styled(" loc today", Style::default().fg(c::FAINT)),
     ]);
     let commits = Line::from(vec![
-        Span::styled(format!("{}", g.branch_commits), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
-        Span::styled(" commits", Style::default().fg(c::DIM)),
+        Span::styled(format!("{}", g.commits_today), Style::default().fg(c::TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(" commits today", Style::default().fg(c::DIM)),
     ]);
     let prs = Line::from(vec![
         Span::styled(format!("{}", g.pr_count), Style::default().fg(c::pink()).add_modifier(Modifier::BOLD)),
@@ -1264,7 +1177,7 @@ fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
             format!("{}", g.merges_main),
             Style::default().fg(if g.merges_main > 0 { c::GREEN } else { c::TEXT }).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" merges → main", Style::default().fg(c::DIM)),
+        Span::styled(" merges today", Style::default().fg(c::DIM)),
     ]);
     f.render_widget(
         Paragraph::new(vec![branch, commit, age, Line::from(""), loc, commits, prs, merges]),
@@ -1404,9 +1317,15 @@ fn doctor_feed_line(d: &crate::state::Doctor, w: usize, t: f64) -> Line<'static>
     let actionf = fit_width(&action, rem.max(1));
     rem = rem.saturating_sub(dwidth(&actionf));
 
-    // glyph + project + action shimmer as one urgent band; the age stays calm/dim.
+    // While actively triaging, glyph + project + action shimmer as one urgent band
+    // so a live run reads instantly. A past incident that merely "needs a look" shows
+    // calm and static (severity-tinted) — present, but not nagging with motion forever.
     let label = format!("✚ {projf} {actionf}");
-    let mut spans = shimmer_spans(&label, t, 0.0, base, 1.1, 0.10, true);
+    let mut spans = if d.running {
+        shimmer_spans(&label, t, 0.0, base, 1.1, 0.10, true)
+    } else {
+        vec![Span::styled(label, Style::default().fg(base).add_modifier(Modifier::BOLD))]
+    };
     if rem > 0 {
         spans.push(Span::raw(" ".repeat(rem)));
     }

@@ -141,6 +141,7 @@ pub fn spawn_system(shared: Shared) {
                     0.0
                 };
                 let gpu_pct = s.silicon.gpu_pct; // from the macmon thread (its own lane)
+                let cpu_pct = s.system.cpu_overall; // [5] → RESOURCES cpu lane
                 s.res_samples.push_back((
                     now,
                     vec![
@@ -149,6 +150,7 @@ pub fn spawn_system(shared: Shared) {
                         (tx_bps / 1024.0) as f32,
                         (disk_io_bps / 1024.0) as f32,
                         gpu_pct,
+                        cpu_pct,
                     ],
                 ));
                 while s.res_samples.len() > 16 {
@@ -2018,25 +2020,30 @@ fn scan_git(repo: &str) -> crate::state::GitStats {
             }
         }
     }
-    // Branch activity vs the main line: commits/loc/merges this branch carries
-    // that aren't yet on origin/main (its own work). Falls back gracefully.
+    // Today's churn + merges on the active branch. Measuring work "ahead of
+    // origin/main" reads a misleading zero the instant everything's pushed; today's
+    // activity keeps the card honest about the day's work, synced or not. (commits
+    // today is counted above.)
+    if let Some(stat) =
+        git(repo, &["log", "--since=midnight", "--numstat", "--pretty=tformat:", &g.branch])
+    {
+        for l in stat.lines() {
+            let mut it = l.split('\t');
+            g.loc_added += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+            g.loc_removed += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+        }
+    }
+    if let Some(n) = git(repo, &["rev-list", "--count", "--merges", "--since=midnight", &g.branch]) {
+        g.merges_main = n.trim().parse().unwrap_or(0);
+    }
+    // Commits this branch carries that aren't yet on origin/main — kept for the
+    // hot-border "unpushed work" cue even though the card now shows today's count.
     if let Some(base) = ["origin/main", "origin/master", "main", "master"]
         .into_iter()
         .find(|r| git(repo, &["rev-parse", "--verify", "--quiet", r]).map(|h| !h.trim().is_empty()).unwrap_or(false))
     {
-        let range = format!("{base}..HEAD");
-        if let Some(n) = git(repo, &["rev-list", "--count", &range]) {
+        if let Some(n) = git(repo, &["rev-list", "--count", &format!("{base}..HEAD")]) {
             g.branch_commits = n.trim().parse().unwrap_or(0);
-        }
-        if let Some(n) = git(repo, &["rev-list", "--count", "--merges", &range]) {
-            g.merges_main = n.trim().parse().unwrap_or(0);
-        }
-        if let Some(stat) = git(repo, &["diff", "--numstat", &format!("{base}...HEAD")]) {
-            for l in stat.lines() {
-                let mut it = l.split('\t');
-                g.loc_added += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
-                g.loc_removed += it.next().and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
-            }
         }
     }
     // PRs authored by the user (all states). Best-effort — needs gh + auth.
@@ -3015,7 +3022,11 @@ fn read_messages(
                 p
             }
         };
-        let unread = unread_n > 0;
+        // A chat counts as unread only if its LATEST message is inbound. If you
+        // sent the last message you've necessarily seen the thread, so a stale
+        // never-cleared is_read=0 on an older inbound message (common in group
+        // chats) must not light up the dot/badge or shimmer your own reply.
+        let unread = unread_n > 0 && !from_me;
         items.push(MessageItem {
             chat_id,
             rowid,
@@ -4510,6 +4521,18 @@ fn read_doctor() -> crate::state::Doctor {
     }
     d.available = true;
     d.running = dir.join("diagnose.lock").exists();
+    // A crashed/killed run can leave diagnose.lock behind, which would otherwise
+    // pin the ROBOTS feed to a permanent "investigating" shimmer. A live diagnosis
+    // is chatty, so only trust the lock if the log was written in the last 5 min.
+    if d.running {
+        let live = std::fs::metadata(dir.join("syswatch.log"))
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|e| e < Duration::from_secs(300)).unwrap_or(false))
+            .unwrap_or(false);
+        if !live {
+            d.running = false;
+        }
+    }
 
     // Live step + (while running) the breach that triggered the run, from the log.
     if let Some(tail) = tail_lines(&dir.join("syswatch.log"), 120) {

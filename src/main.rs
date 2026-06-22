@@ -30,6 +30,9 @@ use state::AppState;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--demo") {
+        return run_demo();
+    }
     if args.iter().any(|a| a == "--snapshot") {
         return snapshot(&args);
     }
@@ -149,6 +152,255 @@ fn run() -> Result<()> {
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen, crossterm::cursor::Show)?;
     term.show_cursor()?;
     res
+}
+
+/// `--demo`: every card alive with entirely fictional data — no real messages,
+/// contacts, music, or system readings are ever touched. Seeds the metric
+/// scaffolding from `sample_data`, replaces every human-facing field with
+/// invented content, then runs the normal render loop with a lightweight fake
+/// "collector" feeding the time-windowed animations. A pure smoothness showcase.
+fn run_demo() -> Result<()> {
+    let mut st = AppState::default();
+    sample_data(&mut st, false);
+    demo_anonymize(&mut st);
+    let shared = Arc::new(Mutex::new(st));
+
+    // One fake collector: pushes fresh synthetic samples each second so the EQ,
+    // RESOURCES wave and silicon gauges keep gliding (a frozen sample window goes
+    // flat after ~1 s), and loops the track so the progress bar + karaoke wipe
+    // never run out. No real data source is opened.
+    {
+        let sh = shared.clone();
+        std::thread::spawn(move || demo_ticker(sh));
+    }
+
+    terminal::enable_raw_mode()?;
+    let mut out = io::stdout();
+    execute!(out, terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, crossterm::cursor::Show);
+        default_hook(info);
+    }));
+    let backend = CrosstermBackend::new(out);
+    let mut term = Terminal::new(backend)?;
+    let res = event_loop(&mut term, &shared);
+    terminal::disable_raw_mode()?;
+    execute!(term.backend_mut(), terminal::LeaveAlternateScreen, crossterm::cursor::Show)?;
+    term.show_cursor()?;
+    res
+}
+
+/// Overwrite every human-facing field with invented content so `--demo` never
+/// shows a real name, message, contact, track, or location. The metric cards
+/// (CPU/RESOURCES/proc/silicon/weather) keep their `sample_data` shapes; only the
+/// people-and-media surfaces are replaced.
+fn demo_anonymize(st: &mut AppState) {
+    use state::{ActionKind, LiveSession, LiveSessions, Lyrics, LyricLine, MusicFacts, MusicStats,
+        Queue, QueueTrack, TextChannel, VoiceChannel};
+    let now = Instant::now();
+
+    // --- now playing: a fictional synthwave track, looping ---
+    st.music = MusicStats {
+        running: true,
+        playing: true,
+        track: "Midnight Vector".into(),
+        artist: "The Vapor Lines".into(),
+        album: "Neon Horizons".into(),
+        duration: 204.0,
+        base_pos: 0.0,
+        sampled_at: now,
+        polled: true,
+        ..Default::default()
+    };
+    // Re-derive art + palette for the new (uncached → gradient) track so accents stay coherent.
+    st.album_art = collectors::sample_album_art(st.music.track_id());
+    let target = theme::theme_from_art(&st.album_art.px);
+    st.dynamic_theme.retarget(st.music.track_id(), [target.0, target.1, target.2]);
+    st.dynamic_theme.blend_start = now - Duration::from_secs(1);
+
+    // --- lyrics: original lines (synced) so the karaoke wipe has something to ride ---
+    st.lyrics = Lyrics {
+        synced: true,
+        track_id: st.music.track_id(),
+        note: String::new(),
+        lines: [
+            (0.0, "neon hums along the empty street"),
+            (8.5, "the engine warm beneath our feet"),
+            (17.0, "headlights paint the falling rain"),
+            (25.5, "chrome and violet, here again"),
+            (34.0, "hold the line, the night runs long"),
+            (42.5, "every signal turns to song"),
+            (51.0, "we drive until the morning shows"),
+            (59.5, "where the quiet river goes"),
+        ]
+        .into_iter()
+        .map(|(t, s)| LyricLine { t, text: s.to_string() })
+        .collect(),
+    };
+
+    // --- queue: fictional up-next ---
+    st.queue = Queue {
+        fresh: true,
+        source_track_id: st.music.track_id(),
+        items: vec![
+            QueueTrack { track: "Afterglow".into(), artist: "Cassette Future".into(), duration: 188.0 },
+            QueueTrack { track: "Glass Avenue".into(), artist: "Nightset".into(), duration: 211.0 },
+            QueueTrack { track: "Lightyears".into(), artist: "Aria Volt".into(), duration: 196.0 },
+        ],
+    };
+
+    // --- facts: about the dashboard itself (no real trivia/people) ---
+    st.facts = MusicFacts {
+        track_id: st.music.track_id(),
+        source: "demo".into(),
+        note: String::new(),
+        lines: vec![
+            "Demo mode — every name, message, and reading on screen is invented.".into(),
+            "The render loop runs up to 120 fps while music plays.".into(),
+            "Gauges interpolate between samples, so nothing ever steps.".into(),
+            "The karaoke wipe tracks the real playback position.".into(),
+        ],
+    };
+
+    // --- iMessage / Signal: invented chats, no real contacts ---
+    let msg = |sender: &str, preview: &str, rel: &str, unread: bool, from_me: bool| state::MessageItem {
+        chat_id: 0,
+        rowid: 0,
+        sender: sender.into(),
+        handle: String::new(),
+        preview: preview.into(),
+        full_text: preview.into(),
+        ts_unix: 0.0,
+        rel: rel.into(),
+        is_rich: false,
+        unread,
+        from_me,
+        is_shortcode: false,
+    };
+    st.messages.unread_count = 2;
+    st.messages.items = vec![
+        msg("Jordan", "are we still on for tonight?", "2m", true, false),
+        msg("Book Club", "Sam: chapter four wrecked me", "9m", true, false),
+        msg("Riley", "You: on my way", "14m", false, true),
+        msg("Coffee Crew", "Pat: who's in friday?", "1h", false, false),
+        msg("Dana", "You: 😂", "yd", false, true),
+    ];
+    st.msg_ui = state::MsgUi { active: true, queue_pos: 0, ..Default::default() };
+    st.signal.unread_count = 1;
+    st.signal.items = vec![
+        msg("Trailhead", "Max: 8am at the gate?", "6m", true, false),
+        msg("Kai", "You: sounds perfect", "1h", false, true),
+        msg("Studio", "Remy: new mix is up", "3h", false, false),
+    ];
+
+    // --- Discord: invented voice + text channels (voice section showcased) ---
+    st.discord.voice = vec![
+        VoiceChannel { name: "lounge".into(), members: vec!["Pixel".into(), "Echo".into(), "Nova".into()] },
+        VoiceChannel { name: "co-work".into(), members: vec!["Sol".into()] },
+    ];
+    st.discord.text = vec![
+        TextChannel { name: "general".into(), author: "Echo".into(), preview: "gm everyone".into(), rel: "4m".into(), unread: true },
+        TextChannel { name: "builds".into(), author: "Pixel".into(), preview: "[image]".into(), rel: "51m".into(), unread: false },
+        TextChannel { name: "music".into(), author: "Nova".into(), preview: "new playlist".into(), rel: "2h".into(), unread: false },
+    ];
+    st.discord.voice_join_at = Some(now); // a gentle 20s join shimmer on open
+
+    // --- ROBOTS feed: invented sessions; doctor calm (no alert/shimmer) ---
+    let mk = |project: &str, model: &str, kind, action: &str, age: f64| LiveSession {
+        session_id: project.into(),
+        project: project.into(),
+        branch: "main".into(),
+        model: model.into(),
+        action: action.into(),
+        kind,
+        age_secs: age,
+    };
+    st.live = LiveSessions {
+        fresh: true,
+        sessions: vec![
+            mk("aurora-ui", "Opus", ActionKind::Edit, "editing panel.rs", 1.2),
+            mk("aurora-ui", "Opus", ActionKind::Run, "cargo build --release", 3.8),
+            mk("ledger", "Sonnet", ActionKind::Read, "scanning routes", 7.5),
+            mk("pipeline", "Haiku", ActionKind::Think, "thinking", 15.0),
+            mk("sandbox", "Sonnet", ActionKind::Idle, "awaiting you", 42.0),
+        ],
+    };
+    st.doctor.running = false;
+    st.doctor.last_outcome = "resolved".into();
+
+    // --- git pulse + weather: invented repo + place ---
+    st.git.repo = "aurora-ui".into();
+    st.git.branch = "main".into();
+    st.git.last_hash = "c0ffee1".into();
+    st.git.last_msg = "feat(ui): glide the resource wave".into();
+    st.git.last_rel = "12 minutes ago".into();
+    st.git.commits_today = 9;
+    st.git.loc_added = 412;
+    st.git.loc_removed = 88;
+    st.git.merges_main = 1;
+    st.git.pr_count = 3;
+    st.weather.location = "Harbor City".into();
+}
+
+/// Demo's fake collector: every second, push fresh synthetic samples into the
+/// time-windowed buffers (so the EQ, RESOURCES wave, net wave and silicon gauges
+/// keep their buttery delayed-interpolation motion instead of flatlining), and
+/// loop the track so the progress bar + lyrics never run dry.
+fn demo_ticker(shared: Arc<Mutex<AppState>>) {
+    let mut k: u64 = 16; // continue past sample_data's pre-fill phase
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        k += 1;
+        let ph = k as f32 * 0.5;
+        let now = Instant::now();
+        let mut s = shared.lock().unwrap();
+
+        let base = if s.system.per_core.is_empty() { vec![22.0f32; 10] } else { s.system.per_core.clone() };
+        let cores: Vec<f32> = base
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v + 18.0 * (ph + i as f32 * 0.6).sin()).clamp(0.0, 100.0))
+            .collect();
+        s.cpu_samples.push_back((now, cores));
+        while s.cpu_samples.len() > 16 { s.cpu_samples.pop_front(); }
+
+        let net = (2_400_000.0 * (1.0 + 0.6 * (ph as f64 * 0.8).sin())).max(1000.0) as f32;
+        s.net_samples.push_back((now, net));
+        while s.net_samples.len() > 16 { s.net_samples.pop_front(); }
+
+        let gpu = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
+        let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
+        s.silicon_samples.push_back((now, vec![gpu, 18.4, 58.0, 52.0, 9.2, 3.1, pwr, 41.0, 23.0, 0.2]));
+        while s.silicon_samples.len() > 16 { s.silicon_samples.pop_front(); }
+
+        let memp = (60.0 + 6.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
+        let down = (300.0 + 2200.0 * (ph * 0.8).sin().abs()).max(1.0);
+        let up = (60.0 + 380.0 * (ph * 0.6 + 1.0).sin().abs()).max(1.0);
+        let io = (40.0 + 9000.0 * (ph * 0.9 + 0.5).sin().abs()).max(1.0);
+        let cpup = (44.0 + 28.0 * (ph * 1.1 + 0.3).sin()).clamp(0.0, 100.0);
+        s.res_samples.push_back((now, vec![memp, down, up, io, gpu, cpup]));
+        while s.res_samples.len() > 16 { s.res_samples.pop_front(); }
+
+        let procs = s.system.top_procs.clone();
+        s.proc_samples.push_back((now, procs));
+        while s.proc_samples.len() > 16 { s.proc_samples.pop_front(); }
+
+        s.net_rx_hist.push(down as u64);
+        s.net_tx_hist.push(up as u64);
+        s.mem_hist.push(memp as u64);
+        s.disk_io_hist.push(io as u64);
+        s.disk_free_hist.push(46);
+
+        // Loop the track so the progress bar + karaoke wipe run forever.
+        let pos = s.music.position();
+        let dur = s.music.duration;
+        if s.music.playing && pos >= dur - 0.5 {
+            s.music.base_pos = 0.0;
+            s.music.sampled_at = now;
+        }
+    }
 }
 
 /// Longest iMessage animation duration; once a transition's clock passes this we
@@ -678,14 +930,15 @@ fn sample_data(st: &mut AppState, compose: bool) {
         let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
         st.silicon_samples
             .push_back((ts, vec![gpu, 18.4, 58.0, 52.0, 9.2, 3.1, pwr, 41.0, 23.0, 0.2]));
-        // RESOURCES wave channels: mem %, net down/up KB/s, disk I/O KB/s — gently
-        // varying so visual-verify shows the smooth four-shade stacked wave.
+        // RESOURCES wave channels: mem %, net down/up KB/s, disk I/O KB/s, GPU %,
+        // CPU % — gently varying so visual-verify shows the smooth stacked wave.
         let memp = (60.0 + 6.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
         let down = (300.0 + 2200.0 * (ph * 0.8).sin().abs()).max(1.0);
         let up = (60.0 + 380.0 * (ph * 0.6 + 1.0).sin().abs()).max(1.0);
         let io = (40.0 + 9000.0 * (ph * 0.9 + 0.5).sin().abs()).max(1.0);
         let gpup = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0); // GPU %
-        st.res_samples.push_back((ts, vec![memp, down, up, io, gpup]));
+        let cpup = (44.0 + 28.0 * (ph * 1.1 + 0.3).sin()).clamp(0.0, 100.0); // CPU %
+        st.res_samples.push_back((ts, vec![memp, down, up, io, gpup, cpup]));
     }
     for (i, v) in [12, 20, 35, 50, 41, 30, 48, 62, 55, 37].iter().enumerate() {
         let _ = i;
