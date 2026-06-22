@@ -640,6 +640,8 @@ pub struct WatchInfo {
     pub synopsis: String,
     pub director: String,
     pub cast: Vec<String>,
+    /// Producers (and exec producers) for the credits page of the watch card.
+    pub producers: Vec<String>,
     /// Status line while gathering (e.g. "gathering synopsis…").
     pub note: String,
 }
@@ -708,6 +710,17 @@ pub struct AppState {
     /// Disk free space (percent of root, 0..100) — a wave band.
     pub disk_free_hist: History,
     pub started: Instant,
+    /// Whether the QUEUE card is currently "open" (has tracks to show). When it
+    /// goes empty the card smoothly collapses and the LYRICS card expands to fill
+    /// the width; `queue_toggle_at` stamps the last open↔closed flip so the render
+    /// can ease the split. Driven by `settle_queue_anim` each frame.
+    pub queue_open: bool,
+    pub queue_toggle_at: Instant,
+    /// Whether studioboard's KEYBINDS card is shown. Toggled by Hyper+H via a
+    /// flag file Hammerspoon writes; `keybinds_toggle_at` stamps the flip so the
+    /// card eases open/closed (same mechanism as the QUEUE collapse).
+    pub keybinds_visible: bool,
+    pub keybinds_toggle_at: Instant,
 }
 
 impl Default for AppState {
@@ -749,6 +762,16 @@ impl Default for AppState {
             disk_io_hist: History::new(120),
             disk_free_hist: History::new(120),
             started: Instant::now(),
+            queue_open: false,
+            // Stamped in the past so a cold start reads as a settled, collapsed
+            // queue (no flash of an empty QUEUE card before the first poll).
+            queue_toggle_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            keybinds_visible: true,
+            keybinds_toggle_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         }
     }
 }

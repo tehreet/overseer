@@ -169,9 +169,14 @@ fn event_loop<B: ratatui::backend::Backend>(
         {
             let mut s = shared.lock().unwrap();
             settle_msg_anim(&mut s);
+            settle_queue_anim(&mut s);
             let t = s.started.elapsed().as_secs_f64();
             playing = s.music.playing;
-            animating = s.msg_ui.animating();
+            // Keep painting at high fps while the QUEUE↔LYRICS width glide or the
+            // KEYBINDS show/hide collapse is live.
+            animating = s.msg_ui.animating()
+                || s.queue_toggle_at.elapsed() < QUEUE_ANIM
+                || s.keybinds_toggle_at.elapsed() < KEYBINDS_ANIM;
             term.draw(|f| ui::render(f, &s, t))?;
         }
 
@@ -201,6 +206,26 @@ fn event_loop<B: ratatui::backend::Backend>(
                 }
             }
         }
+    }
+}
+
+/// Duration of the QUEUE collapse / LYRICS expand glide. Kept in sync with the
+/// easing window `ui::queue_open_frac` reads.
+const QUEUE_ANIM: Duration = Duration::from_millis(380);
+
+/// Duration of the KEYBINDS show/hide collapse. Kept in sync with the easing
+/// window `ui::keybinds_open_frac` reads.
+const KEYBINDS_ANIM: Duration = Duration::from_millis(360);
+
+/// Detect when the QUEUE goes empty↔non-empty and stamp the transition so the
+/// render can ease the lyrics/queue split width. The queue is "open" only when
+/// music is playing a track AND there are upcoming items; otherwise it collapses
+/// and the LYRICS (or synopsis) card expands to fill the row.
+fn settle_queue_anim(s: &mut AppState) {
+    let want = s.music.running && !s.music.track.is_empty() && !s.queue.items.is_empty();
+    if want != s.queue_open {
+        s.queue_open = want;
+        s.queue_toggle_at = Instant::now();
     }
 }
 
@@ -482,6 +507,14 @@ fn snapshot(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--idle") {
         st.music.playing = false;
     }
+    // `kbhide=1` previews the KEYBINDS card hidden (Hyper+H); `kbhide=mid` half.
+    if let Some(v) = args.iter().find_map(|a| a.strip_prefix("kbhide=")) {
+        st.keybinds_visible = false;
+        let back = if v == "mid" { 170 } else { 1000 };
+        st.keybinds_toggle_at = Instant::now()
+            .checked_sub(Duration::from_millis(back))
+            .unwrap_or_else(Instant::now);
+    }
 
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend)?;
@@ -516,6 +549,35 @@ fn cells(args: &[String]) -> Result<()> {
     sample_data(&mut st, args.iter().any(|a| a == "--compose"));
     if args.iter().any(|a| a == "--idle") {
         st.music.playing = false;
+    }
+    // Visual-verify hook for the QUEUE collapse: `qopen=0` forces the settled
+    // collapsed state (LYRICS full width), `qopen=1` the settled open state.
+    if let Some(open) = args.iter().find_map(|a| a.strip_prefix("qopen=")) {
+        if open == "mid" {
+            // Mid-collapse: opened, ~0.17s ago → smoothstep ≈ half width.
+            st.queue_open = true;
+            st.queue_toggle_at = Instant::now()
+                .checked_sub(Duration::from_millis(170))
+                .unwrap_or_else(Instant::now);
+        } else {
+            st.queue_open = open != "0";
+            // Push the toggle well into the past so the smoothstep reads as settled.
+            st.queue_toggle_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+            if !st.queue_open {
+                st.queue.items.clear();
+            }
+        }
+    }
+    // Visual-verify hook for the KEYBINDS collapse: `kbhide=1` forces the settled
+    // hidden state (card gone), `kbhide=mid` a half-collapsed frame.
+    if let Some(v) = args.iter().find_map(|a| a.strip_prefix("kbhide=")) {
+        st.keybinds_visible = false;
+        let back = if v == "mid" { 170 } else { 1000 };
+        st.keybinds_toggle_at = Instant::now()
+            .checked_sub(Duration::from_millis(back))
+            .unwrap_or_else(Instant::now);
     }
     if args.iter().any(|a| a == "--nolyrics") {
         st.lyrics = state::Lyrics {
@@ -865,16 +927,16 @@ fn sample_data(st: &mut AppState, compose: bool) {
         fresh: true,
         available: true,
         unread_count: 1,
-        // Signal conversations — read-only, same row style. (sender,text,rel,unread,from_me)
+        // Signal conversations — read-only, same row style. (sender,text,rel,unread,from_me,rich)
         items: vec![
-            ("Marcin W", "I miss hacking on cars man", "3m", true, false),
-            ("The Other CW Back Channel", "Elijah: Nice! 🔥", "1h", false, false),
-            ("Peter Salanki", "You: Very smooth", "5h", false, true),
-            ("Alex Stalmakov", "You: but yes i am streaming from my pc", "8h", false, true),
-            ("Erik Gomez", "You: 💀", "yd", false, true),
+            ("The Other CW Back Channel", "Elijah: [photo]", "6m", true, false, true),
+            ("Alex Stalmakov", "You: Feels bad man", "1h", false, true, false),
+            ("Marcin W", "You: Lmao", "9h", false, true, false),
+            ("Rob", "Oh cool! I was wondering what exists", "yd", false, false, false),
+            ("Adam", "You: Jesus", "yd", false, true, false),
         ]
         .into_iter()
-        .map(|(sender, text, rel, unread, from_me): (&str, &str, &str, bool, bool)| {
+        .map(|(sender, text, rel, unread, from_me, rich): (&str, &str, &str, bool, bool, bool)| {
             state::MessageItem {
                 chat_id: 0,
                 rowid: 0,
@@ -884,7 +946,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
                 full_text: text.into(),
                 ts_unix: 0.0,
                 rel: rel.into(),
-                is_rich: false,
+                is_rich: rich,
                 unread,
                 from_me,
                 is_shortcode: false,
@@ -1033,7 +1095,16 @@ fn sample_data(st: &mut AppState, compose: bool) {
                        selves collapses."
                 .into(),
             director: "Ben Stiller".into(),
-            cast: vec!["Adam Scott".into(), "Britt Lower".into(), "Tramell Tillman".into(), "Patricia Arquette".into()],
+            cast: vec![
+                "Adam Scott".into(),
+                "Britt Lower".into(),
+                "Tramell Tillman".into(),
+                "Patricia Arquette".into(),
+                "John Turturro".into(),
+                "Christopher Walken".into(),
+                "Zach Cherry".into(),
+            ],
+            producers: vec!["Ben Stiller".into(), "Dan Erickson".into(), "Mark Friedman".into()],
             note: String::new(),
         };
     }

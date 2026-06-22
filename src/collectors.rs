@@ -939,7 +939,10 @@ pub fn spawn_lyrics_reconcile(shared: Shared) {
 // ---------------------------------------------------------------------------
 // Album art: dump current track artwork to a temp PNG/JPEG, decode + downscale.
 // ---------------------------------------------------------------------------
-const ART_THUMB: u32 = 160;
+/// Longest-edge size of the decoded art thumbnail. Generous so a movie poster
+/// (portrait, detailed) still reads as the real cover when the card is large —
+/// the half-block renderer box-averages this down to the card's pixel grid.
+const ART_THUMB: u32 = 512;
 
 fn artwork_script(app: &str, path: &str) -> String {
     format!(
@@ -1137,7 +1140,10 @@ fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
     // (Music writes a raw PNG/JPEG to a .dat path).
     if let Ok(bytes) = std::fs::read(path) {
         if let Ok(img) = image::load_from_memory(&bytes) {
-            let small = img.resize_exact(ART_THUMB, ART_THUMB, FilterType::Lanczos3).to_rgb8();
+            // Preserve aspect ratio: album covers stay square, but a movie poster
+            // keeps its true portrait shape instead of being squashed into a box.
+            // `resize` fits within ART_THUMB×ART_THUMB without distorting.
+            let small = img.resize(ART_THUMB, ART_THUMB, FilterType::Lanczos3).to_rgb8();
             art.w = small.width() as usize;
             art.h = small.height() as usize;
             art.px = small.pixels().map(|p| [p[0], p[1], p[2]]).collect();
@@ -1151,18 +1157,24 @@ fn decode_art(path: &std::path::Path, id: &str) -> crate::state::AlbumArt {
 // true dynamic "Up Next" list, so we read the current playlist and take the
 // tracks after the current one (correct for in-order playback; shuffle reorders).
 // ---------------------------------------------------------------------------
+// Two modes, because Music has no real "up next" API:
+//   1. Playlist playback → walk the current playlist's track order from the
+//      current track (matched by database ID, since `index of current track` is
+//      unreliable).
+//   2. Album playback → there is NO `current playlist` (it throws), so fall back
+//      to the album: find the current track in its album (by name, since a
+//      streamed track's own `track number` can read 0) and take the following
+//      tracks by track number. Only works for albums present in the library.
 const QUEUE_SCRIPT: &str = r#"
 if application "Music" is running then
   tell application "Music"
+    set out to ""
     try
       set cp to current playlist
       set ct to current track
       set ctid to database ID of ct
       set trks to tracks of cp
       set n to count of trks
-      -- `index of current track` is unreliable (it can return the library index,
-      -- not the position in the current playlist), so find the real position by
-      -- matching the database ID — this is what makes "up next" actually resolve.
       set pos to 0
       repeat with k from 1 to n
         if database ID of (item k of trks) is ctid then
@@ -1170,19 +1182,42 @@ if application "Music" is running then
           exit repeat
         end if
       end repeat
-      if pos is 0 then return "NOQUEUE"
-      set out to ""
-      repeat with k from (pos + 1) to (pos + 3)
-        if k is less than or equal to n then
-          set tr to item k of trks
-          set out to out & (name of tr) & "\t" & (artist of tr) & "\t" & (duration of tr) & "\n"
-        end if
-      end repeat
-      if out is "" then return "NOQUEUE"
-      return out
-    on error
-      return "NOQUEUE"
+      if pos > 0 then
+        repeat with k from (pos + 1) to (pos + 3)
+          if k is less than or equal to n then
+            set tr to item k of trks
+            set out to out & (name of tr) & "\t" & (artist of tr) & "\t" & (duration of tr) & "\n"
+          end if
+        end repeat
+      end if
     end try
+    if out is "" then
+      try
+        set ct to current track
+        set alb to album of ct
+        set curName to name of ct
+        set albTracks to (every track of library playlist 1 whose album is alb)
+        set curNum to 0
+        repeat with tr in albTracks
+          if (name of tr) is curName then
+            set curNum to (track number of tr)
+            exit repeat
+          end if
+        end repeat
+        if curNum > 0 then
+          repeat with kk from (curNum + 1) to (curNum + 3)
+            repeat with tr in albTracks
+              if (track number of tr) is kk then
+                set out to out & (name of tr) & "\t" & (artist of tr) & "\t" & (duration of tr) & "\n"
+                exit repeat
+              end if
+            end repeat
+          end repeat
+        end if
+      end try
+    end if
+    if out is "" then return "NOQUEUE"
+    return out
   end tell
 else
   return "NOTRUNNING"
@@ -1523,12 +1558,14 @@ fn facts_via_claude_watch(
     key: &str,
     subject: &FactSubject,
 ) -> Option<Vec<String>> {
-    let system = "You are a film & TV buff writing punchy trivia for a now-watching \
-dashboard. Output ONLY the facts — one per line, no numbering, no bullets, no \
-preamble, no caveats, no sign-off. NEVER refuse and NEVER add commentary about \
-your confidence. If unsure of a hyper-specific detail, give a fact you ARE \
-confident about (a lead actor, the director, the production, its reception or \
-cultural impact). Every line is a concrete, surprising fact under 18 words.";
+    let system = "You are a film & TV obsessive — the kind who has read the oral \
+history, the director's commentary, and every cast interview — writing trivia for \
+a now-watching dashboard. Dig DEEP: skip the obvious logline everyone knows and go \
+for the surprising, specific, behind-the-scenes detail. Output ONLY the facts — \
+one per line, no numbering, no bullets, no preamble, no caveats, no sign-off. \
+NEVER refuse and NEVER comment on your confidence. If unsure of a hyper-specific \
+detail, give a different fact you ARE confident about. Every line is one concrete, \
+surprising fact under 20 words.";
     let mut ctx = String::new();
     if !subject.director.is_empty() {
         ctx.push_str(&format!(" Directed by {}.", subject.director));
@@ -1536,16 +1573,29 @@ cultural impact). Every line is a concrete, surprising fact under 18 words.";
     if !subject.genre.is_empty() {
         ctx.push_str(&format!(" Genre: {}.", subject.genre));
     }
+    // Dig deep, and deliberately branch OFF the film itself: roughly half the
+    // facts should be about the people — a lead actor or the director's career,
+    // off-screen life, casting near-misses, other defining roles, a rivalry or
+    // a record they hold — not just plot/production of THIS title. Ask for a
+    // generous set so the slow-rotating card always has something fresh to show.
     let prompt = format!(
-        "Four facts about {}.{} Favor the main cast (who stars in it), the \
-         director, production lore, awards or box-office/streaming feats, and \
-         behind-the-scenes trivia a superfan would geek out over.",
+        "Ten deep-cut facts about {}.{} Make about HALF of them about the \
+         PEOPLE rather than the film itself: a lead actor's or the director's \
+         career, off-screen life, how they landed (or nearly lost) the role, \
+         another role they're famous for, a feud, or a record. ALSO include the \
+         awards picture — list its major-award NOMINATIONS and wins (Oscars, \
+         Golden Globes, BAFTAs, SAG, Emmys for TV), naming the specific \
+         categories (e.g. 'nominated for 7 Oscars including Best Visual Effects'). \
+         Spend the rest on production lore, casting history, box-office/streaming \
+         feats, and behind-the-scenes detail a superfan would geek out over. \
+         Avoid the basic one-line synopsis — every fact should make someone say \
+         'I didn't know that.'",
         subject.phrase(),
         ctx
     );
     let body = serde_json::json!({
         "model": "claude-sonnet-4-6",
-        "max_tokens": 400,
+        "max_tokens": 900,
         "system": system,
         "messages": [{ "role": "user", "content": prompt }]
     });
@@ -1566,7 +1616,7 @@ cultural impact). Every line is a concrete, surprising fact under 18 words.";
         .lines()
         .filter_map(clean_fact)
         .filter(|l| !looks_like_refusal(l))
-        .take(6)
+        .take(10)
         .collect();
     if lines.len() < 2 {
         None
@@ -1601,12 +1651,15 @@ fn build_watch_info(agent: &ureq::Agent, subject: &FactSubject) -> crate::state:
         wi.cast = capture_list(&extract, &["stars ", "starring ", "featuring "]);
     }
     if let Some(key) = anthropic_key() {
-        if let Some((dir, cast)) = watch_credits_via_claude(agent, &key, subject) {
+        if let Some((dir, cast, producers)) = watch_credits_via_claude(agent, &key, subject) {
             if !dir.is_empty() {
                 wi.director = dir;
             }
             if !cast.is_empty() {
                 wi.cast = cast;
+            }
+            if !producers.is_empty() {
+                wi.producers = producers;
             }
         }
     }
@@ -1616,21 +1669,23 @@ fn build_watch_info(agent: &ureq::Agent, subject: &FactSubject) -> crate::state:
     wi
 }
 
-/// Ask Claude for the director + top-billed cast as two clean lines.
+/// Ask Claude for the director, the principal cast, and the producers as three
+/// clean lines — enough to fill the credits page of the watch card.
 fn watch_credits_via_claude(
     agent: &ureq::Agent,
     key: &str,
     subject: &FactSubject,
-) -> Option<(String, Vec<String>)> {
+) -> Option<(String, Vec<String>, Vec<String>)> {
     let prompt = format!(
-        "For {}, output EXACTLY two lines and nothing else:\n\
-         Director: <director full name>\n\
-         Cast: <the 4 top-billed actors, comma-separated>",
+        "For {}, output EXACTLY three lines and nothing else:\n\
+         Director: <director full name(s), comma-separated if more than one>\n\
+         Cast: <the principal cast, up to 10 actors, billing order, comma-separated>\n\
+         Producers: <the producers and executive producers, up to 5, comma-separated>",
         subject.phrase()
     );
     let body = serde_json::json!({
         "model": "claude-sonnet-4-6",
-        "max_tokens": 200,
+        "max_tokens": 400,
         "messages": [{ "role": "user", "content": prompt }]
     });
     let resp: serde_json::Value = agent
@@ -1643,25 +1698,35 @@ fn watch_credits_via_claude(
         .into_json()
         .ok()?;
     let text = resp.get("content")?.get(0)?.get("text")?.as_str()?;
+    let list = |rest: &str, n: usize| -> Vec<String> {
+        rest.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).take(n).collect()
+    };
     let mut director = String::new();
     let mut cast = Vec::new();
+    let mut producers = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("Director:").or_else(|| l.strip_prefix("director:")) {
+        if let Some(rest) = strip_ci(l, "Director:") {
             director = rest.trim().to_string();
-        } else if let Some(rest) = l.strip_prefix("Cast:").or_else(|| l.strip_prefix("cast:")) {
-            cast = rest
-                .split(',')
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .take(4)
-                .collect();
+        } else if let Some(rest) = strip_ci(l, "Cast:") {
+            cast = list(rest, 10);
+        } else if let Some(rest) = strip_ci(l, "Producers:").or_else(|| strip_ci(l, "Producer:")) {
+            producers = list(rest, 5);
         }
     }
-    if director.is_empty() && cast.is_empty() {
+    if director.is_empty() && cast.is_empty() && producers.is_empty() {
         None
     } else {
-        Some((director, cast))
+        Some((director, cast, producers))
+    }
+}
+
+/// Case-insensitive `strip_prefix` for a label like "Cast:".
+fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
     }
 }
 
@@ -4543,14 +4608,34 @@ fn keybinds_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join("Library/Application Support/studioboard/keybinds.json")
 }
 
+/// Flag file Hammerspoon's Hyper+H writes; its presence hides the KEYBINDS card.
+fn keybinds_hidden_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join("Library/Application Support/studioboard/keybinds.hidden")
+}
+
 pub fn spawn_keybinds(shared: Shared) {
-    thread::spawn(move || loop {
-        let snap = read_keybinds();
-        {
-            let mut s = shared.lock().unwrap();
-            s.keybinds = snap;
+    thread::spawn(move || {
+        // Re-read the (rarely-changing) cheat sheet every ~3s, but poll the much
+        // faster Hyper+H visibility flag every tick so the toggle feels instant.
+        let mut since_reload = Duration::from_secs(99);
+        loop {
+            if since_reload >= Duration::from_secs(3) {
+                let snap = read_keybinds();
+                shared.lock().unwrap().keybinds = snap;
+                since_reload = Duration::ZERO;
+            }
+            let hidden = keybinds_hidden_path().exists();
+            {
+                let mut s = shared.lock().unwrap();
+                if s.keybinds_visible == hidden {
+                    s.keybinds_visible = !hidden;
+                    s.keybinds_toggle_at = std::time::Instant::now();
+                }
+            }
+            thread::sleep(Duration::from_millis(120));
+            since_reload += Duration::from_millis(120);
         }
-        thread::sleep(Duration::from_secs(3));
     });
 }
 
