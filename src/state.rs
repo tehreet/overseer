@@ -390,7 +390,9 @@ pub struct MessageItem {
     pub chat_id: i64,        // conversation id (chat.ROWID) — mark-read / reply target
     pub rowid: i64,          // latest message's ROWID in this conversation
     pub sender: String,      // contact name · group-chat name · pretty handle
-    pub handle: String,      // 1:1 reply target (phone/email); empty for group chats
+    #[allow(dead_code)] // raw 1:1 address; superseded by `guid` as the reply target, kept for display/debug
+    pub handle: String,      // 1:1 sender address (phone/email); empty for group chats
+    pub guid: String,        // chat.guid (e.g. "SMS;-;+1…" / "iMessage;-;…" / group) — reply target
     pub preview: String,     // latest message: real text, summarized, or truncated
     pub full_text: String,   // untruncated latest text (summarize input / send context)
     pub ts_unix: f64,        // unix seconds of the latest message
@@ -502,8 +504,10 @@ pub enum MsgPhase {
 #[derive(Clone)]
 pub struct MsgUi {
     pub active: bool,                 // is the iMessage card focused?
-    pub queue_pos: usize,             // index into the unread queue (focused row)
+    pub focus_chat_id: Option<i64>,   // focused conversation (click/'m'); identity, not index
     pub last_key_at: Option<Instant>, // double-press window for 'm'
+    pub last_click_at: Option<Instant>, // double-click window for the mouse
+    pub last_click_chat: Option<i64>, // chat the last click landed on (double-click must match)
     pub composing: bool,              // inline reply input open?
     pub draft: String,                // reply being typed
     pub phase: MsgPhase,              // current transition
@@ -515,8 +519,10 @@ impl Default for MsgUi {
     fn default() -> Self {
         Self {
             active: false,
-            queue_pos: 0,
+            focus_chat_id: None,
             last_key_at: None,
+            last_click_at: None,
+            last_click_chat: None,
             composing: false,
             draft: String::new(),
             phase: MsgPhase::Idle,

@@ -255,7 +255,34 @@ fn left_card_heights(avail: u16, s: &AppState) -> [u16; 8] {
     h
 }
 
-pub fn render(f: &mut Frame, s: &AppState, t: f64) {
+/// Clickable iMessage conversation rows captured during a render, so a mouse
+/// click — handled in the event loop, which only holds the render *snapshot* and
+/// so can't read hitboxes back out of shared state — can be mapped to a chat_id.
+/// Rebuilt every frame by `messages_panel`.
+#[derive(Default)]
+pub struct MsgHit {
+    rows: Vec<(u16, i64)>, // (screen y, chat_id) for each drawn conversation row
+    x0: u16,
+    x1: u16, // inclusive screen-x range of the card's clickable area
+}
+
+impl MsgHit {
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.x0 = 0;
+        self.x1 = 0;
+    }
+    /// chat_id at a click position, if it lands on a conversation row.
+    pub fn chat_at(&self, col: u16, row: u16) -> Option<i64> {
+        if col < self.x0 || col > self.x1 {
+            return None;
+        }
+        self.rows.iter().find(|(y, _)| *y == row).map(|(_, id)| *id)
+    }
+}
+
+pub fn render(f: &mut Frame, s: &AppState, t: f64, hit: &mut MsgHit) {
+    hit.clear();
     // Push this frame's cross-faded, album-biased accents into the live palette
     // store up front so every card below reads a coherent, glided value (#8).
     c::apply_dynamic(&s.dynamic_theme);
@@ -290,7 +317,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     proc_panel(f, left[1], s);
     robots_panel(f, left[2], s, t);
     weather_panel(f, left[3], s);
-    messages_panel(f, left[4], s, t);
+    messages_panel(f, left[4], s, t, hit);
     signal_panel(f, left[5], s, t);
     discord_panel(f, left[6], s, t);
 
@@ -1932,7 +1959,7 @@ fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'stat
 /// (focus marker · sender · preview · rel-time · unread dot), and an inline reply
 /// input that wipes open on a double-press. All motion is interpolated each
 /// frame off `s.msg_ui.anim_start` — never a discrete flip.
-fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut MsgHit) {
     use crate::state::MsgPhase;
     let msgs = &s.messages;
     let ui = &s.msg_ui;
@@ -2039,15 +2066,19 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         .saturating_sub(footer_rows);
     let shown = list_rows.min(msgs.items.len());
 
-    // Index (within items) of the focused unread message, for the slide marker.
-    let unread_indices: Vec<usize> = msgs
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.unread)
-        .map(|(i, _)| i)
-        .collect();
-    let focus_idx = unread_indices.get(ui.queue_pos).copied();
+    // Record the clickable conversation rows for mouse hit-testing: row i is
+    // drawn at inner.y + i (the list renders as a Paragraph into `inner`).
+    hit.x0 = inner.x;
+    hit.x1 = inner.x.saturating_add(inner.width.saturating_sub(1));
+    for (i, m) in msgs.items.iter().take(shown).enumerate() {
+        hit.rows.push((inner.y + i as u16, m.chat_id));
+    }
+
+    // Index (within items) of the focused conversation, for the slide marker —
+    // now identity-based (focus_chat_id), so it works for read rows too.
+    let focus_idx = ui
+        .focus_chat_id
+        .and_then(|id| msgs.items.iter().position(|m| m.chat_id == id));
 
     // Reserved column budget: marker(2) + sender(18) + gap(1) + reltime(4) + dot(2).
     let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);

@@ -2749,7 +2749,8 @@ SELECT c.ROWID AS chat_id, \
        (SELECT count(*) FROM chat_message_join j2 JOIN message m2 ON m2.ROWID=j2.message_id \
         WHERE j2.chat_id=c.ROWID AND m2.is_from_me=0 AND m2.is_read=0 \
           AND m2.associated_message_type=0 AND m2.item_type=0) AS unread_n, \
-       COALESCE(sh.id,'') AS sender_handle \
+       COALESCE(sh.id,'') AS sender_handle, \
+       COALESCE(c.guid,'') AS guid \
 FROM chat c \
 JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID \
 JOIN message m ON m.ROWID = cmj.message_id \
@@ -2830,11 +2831,9 @@ pub fn spawn_messages(shared: Shared) {
                     s.messages.available = true;
                     s.messages.unread_count = unread;
                     s.messages.items = items;
-                    // Keep the focus queue position in bounds as rows change.
-                    let n = s.messages.items.iter().filter(|i| i.unread).count();
-                    if s.msg_ui.queue_pos >= n.max(1) {
-                        s.msg_ui.queue_pos = n.saturating_sub(1);
-                    }
+                    // Focus is identity-based (focus_chat_id), so it survives row
+                    // reordering automatically and resolves to None if the focused
+                    // conversation drops out of the window — no index to clamp.
                 }
                 None => {
                     let mut s = shared.lock().unwrap();
@@ -2934,10 +2933,11 @@ fn read_messages(
     let mut seen_chats = std::collections::HashSet::new();
     for line in body.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 10 {
+        if f.len() < 11 {
             continue;
         }
         let chat_id: i64 = f[0].parse().unwrap_or(0);
+        let guid = f[10].to_string();
         // A chat can tie on MAX(date) across two messages; keep the first only.
         if !seen_chats.insert(chat_id) {
             continue;
@@ -3015,6 +3015,7 @@ fn read_messages(
             rowid,
             sender,
             handle: if is_group { String::new() } else { chat_ident },
+            guid,
             preview,
             full_text: body_text,
             ts_unix: ts,
@@ -3281,24 +3282,48 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Send an iMessage reply via osascript, fire-and-forget so the event loop never
-/// blocks. Targets the iMessage service buddy for the given handle.
-pub fn send_imessage(handle: &str, body: &str) {
+/// Send a reply to an existing conversation by its `chat.guid` (e.g.
+/// "iMessage;-;+1…", "SMS;-;+1…", or a group "iMessage;+;chat…"). Targeting the
+/// chat directly uses whatever service that thread already uses — so it works for
+/// iMessage, SMS, 1:1 and group alike, where the old per-buddy/iMessage-only
+/// `account whose service type = iMessage` path errored (-1728) on modern macOS.
+///
+/// Runs osascript on a background thread so the render loop never blocks, but —
+/// unlike the old fire-and-forget — it WAITS for the exit status and, on failure,
+/// surfaces it: it re-opens the composer with the draft restored and flips
+/// `send_failed_at` so the border flashes red. Success is left to the optimistic
+/// "whoosh" close already playing in the UI.
+pub fn send_imessage(shared: Shared, guid: String, body: String) {
     let script = format!(
         "tell application \"Messages\"\n\
-         set targetService to 1st account whose service type = iMessage\n\
-         set targetBuddy to participant \"{h}\" of targetService\n\
-         send \"{b}\" to targetBuddy\n\
+         send \"{b}\" to chat id \"{g}\"\n\
          end tell",
-        h = applescript_escape(handle),
-        b = applescript_escape(body),
+        g = applescript_escape(&guid),
+        b = applescript_escape(&body),
     );
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    std::thread::spawn(move || {
+        let ok = Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            if let Ok(mut s) = shared.lock() {
+                s.msg_ui.send_failed_at = Some(Instant::now());
+                // Restore the draft so the user can retry — but don't clobber a
+                // new compose they may already have started in the meantime.
+                if !s.msg_ui.composing {
+                    s.msg_ui.composing = true;
+                    s.msg_ui.draft = body;
+                    s.msg_ui.phase = crate::state::MsgPhase::Idle;
+                    s.msg_ui.anim_start = None;
+                }
+            }
+        }
+    });
 }
 
 /// Mark every unread inbound message in one conversation read, persisting to
@@ -3511,6 +3536,7 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
             rowid: 0,
             sender: who,
             handle: String::new(), // read-only: no reply target
+            guid: String::new(),   // read-only: Signal Desktop has no send API
             preview,
             full_text: text,
             ts_unix: ts,
