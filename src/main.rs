@@ -559,15 +559,24 @@ fn handle_key(
                         // to shimmer for a few seconds as a sent glow.
                         if let Some(id) = s.msg_ui.focus_chat_id {
                             let preview = format!("You: {draft}");
-                            if let Some(m) =
-                                s.messages.items.iter_mut().find(|m| m.chat_id == id)
+                            if let Some(pos) =
+                                s.messages.items.iter().position(|m| m.chat_id == id)
                             {
-                                m.preview = preview.clone();
-                                m.full_text = draft.clone();
-                                m.from_me = true;
-                                m.unread = false;
-                                m.is_rich = false;
-                                m.rel = "now".into();
+                                {
+                                    let m = &mut s.messages.items[pos];
+                                    m.preview = preview.clone();
+                                    m.full_text = draft.clone();
+                                    m.from_me = true;
+                                    m.unread = false;
+                                    m.is_rich = false;
+                                    m.rel = "now".into();
+                                }
+                                // Sending bumps the thread to the top of the list
+                                // immediately (like Messages), not after delivery.
+                                if pos != 0 {
+                                    let item = s.messages.items.remove(pos);
+                                    s.messages.items.insert(0, item);
+                                }
                             }
                             s.msg_ui.pending_echo = Some(state::PendingEcho {
                                 chat_id: id,
@@ -681,14 +690,21 @@ fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hit: &ui::MsgHit) 
         s.msg_ui.active = true;
         s.msg_ui.focus_chat_id = Some(chat_id);
         s.msg_ui.composing = true;
+        s.msg_ui.typed_at = None;
         s.msg_ui.draft.clear();
         s.msg_ui.phase = MsgPhase::Opening;
         s.msg_ui.anim_start = Some(now);
     } else if !s.msg_ui.composing {
-        // Single click just highlights — don't disturb an open composer.
+        // Single click focuses AND clears the unread notification on that
+        // conversation (with the read crossfade if it was unread).
         s.msg_ui.active = true;
         s.msg_ui.focus_chat_id = Some(chat_id);
-        s.msg_ui.phase = MsgPhase::Idle;
+        if mark_conversation_read(&mut s, chat_id) {
+            s.msg_ui.phase = MsgPhase::Advancing;
+            s.msg_ui.anim_start = Some(now);
+        } else {
+            s.msg_ui.phase = MsgPhase::Idle;
+        }
     }
 }
 
@@ -715,23 +731,35 @@ fn focused_guid(s: &AppState) -> Option<String> {
         .filter(|g| !g.is_empty())
 }
 
-/// Mark the focused conversation read — flip it in our snapshot for an instant
-/// response, persist to chat.db so the next poll doesn't resurrect it — then
-/// advance focus to the next conversation in the list.
-fn advance_queue(s: &mut AppState) {
-    let Some(id) = s.msg_ui.focus_chat_id else { return };
-    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == id) else { return };
+/// Mark one conversation read — flip it in our snapshot for an instant response
+/// (clears the unread dot + badge), and persist to chat.db so the next poll
+/// doesn't resurrect it. Returns true if it was actually unread.
+fn mark_conversation_read(s: &mut AppState, chat_id: i64) -> bool {
+    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == chat_id) else {
+        return false;
+    };
     let (was_unread, is_shortcode) = {
         let m = &s.messages.items[pos];
         (m.unread, m.is_shortcode)
     };
-    for it in s.messages.items.iter_mut().filter(|it| it.chat_id == id) {
+    if !was_unread {
+        return false;
+    }
+    for it in s.messages.items.iter_mut().filter(|it| it.chat_id == chat_id) {
         it.unread = false;
     }
-    if was_unread && !is_shortcode {
+    if !is_shortcode {
         s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
     }
-    collectors::mark_chat_read(id);
+    collectors::mark_chat_read(chat_id);
+    true
+}
+
+/// Mark the focused conversation read, then advance focus to the next one.
+fn advance_queue(s: &mut AppState) {
+    let Some(id) = s.msg_ui.focus_chat_id else { return };
+    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == id) else { return };
+    mark_conversation_read(s, id);
     // Advance focus to the next conversation (stay put if this was the last).
     if let Some(next) = s.messages.items.get(pos + 1).map(|m| m.chat_id) {
         s.msg_ui.focus_chat_id = Some(next);

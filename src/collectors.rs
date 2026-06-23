@@ -3339,12 +3339,22 @@ fn apply_pending_echo(s: &mut AppState) {
         s.msg_ui.pending_echo = None;
         return;
     }
-    let Some(m) = s.messages.items.iter_mut().find(|m| m.chat_id == echo.chat_id) else {
+    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == echo.chat_id) else {
         return; // conversation not in the current window; let the cap expire it
     };
-    if m.from_me && m.full_text == echo.full_text {
-        s.msg_ui.pending_echo = None; // real send landed — stop forcing the echo
-    } else {
+    let landed = {
+        let m = &s.messages.items[pos];
+        m.from_me && m.full_text == echo.full_text
+    };
+    if landed {
+        s.msg_ui.pending_echo = None; // real send landed — the poll already orders it
+        return;
+    }
+    // Poll ran before the send landed: keep showing the reply as the latest
+    // message AND keep the thread pinned to the top, so neither the preview nor
+    // the list order flickers back until the real row arrives.
+    {
+        let m = &mut s.messages.items[pos];
         if m.unread {
             s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
         }
@@ -3354,6 +3364,10 @@ fn apply_pending_echo(s: &mut AppState) {
         m.unread = false;
         m.is_rich = false;
         m.rel = "now".into();
+    }
+    if pos != 0 {
+        let item = s.messages.items.remove(pos);
+        s.messages.items.insert(0, item);
     }
 }
 
