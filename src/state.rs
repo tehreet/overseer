@@ -1,29 +1,11 @@
 //! Shared application state. Collector threads write; the render loop reads a snapshot.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Ring-buffer history for sparklines. Fixed capacity, cheap push.
-#[derive(Clone)]
-pub struct History {
-    pub data: Vec<u64>,
-    cap: usize,
-}
-
-impl History {
-    pub fn new(cap: usize) -> Self {
-        Self { data: Vec::with_capacity(cap), cap }
-    }
-    pub fn push(&mut self, v: u64) {
-        if self.data.len() == self.cap {
-            self.data.remove(0);
-        }
-        self.data.push(v);
-    }
-    pub fn last(&self) -> u64 {
-        self.data.last().copied().unwrap_or(0)
-    }
-}
+/// One top-process row: (name, cpu% of one core, memory bytes, uptime secs).
+pub type ProcSample = (String, f32, u64, u64);
 
 #[derive(Clone, Default)]
 pub struct SystemStats {
@@ -43,7 +25,7 @@ pub struct SystemStats {
     pub uptime_secs: u64,
     pub proc_count: usize,
     /// Top processes by CPU: (name, cpu% of one core, memory bytes, uptime secs).
-    pub top_procs: Vec<(String, f32, u64, u64)>,
+    pub top_procs: Vec<ProcSample>,
 }
 
 /// Apple Silicon metrics straight from `macmon pipe`.
@@ -359,7 +341,9 @@ pub struct GitStats {
     pub dirty: u32,
     pub untracked: u32,
     pub staged: u32,
+    #[allow(dead_code)] // collected git state, kept for the card's display options
     pub ahead: i32,
+    #[allow(dead_code)] // collected git state, kept for the card's display options
     pub behind: i32,
     pub last_hash: String,
     pub last_msg: String,
@@ -413,6 +397,7 @@ pub struct MessageItem {
     pub rel: String,         // "2m" "1h" "yesterday"
     pub is_rich: bool,       // attributedBody-only → "[rich message]" marker
     pub unread: bool,        // conversation has >=1 unread inbound message
+    #[allow(dead_code)] // outbound flag, populated for preview prefixing decisions
     pub from_me: bool,       // latest message is outbound → preview prefixed "You: "
     pub is_shortcode: bool,  // 5-6 digit shortcode (e.g. 32665) — excluded from badge
 }
@@ -496,7 +481,9 @@ pub struct Messages {
 
 /// Phase of the iMessage card's interaction animation.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum MsgPhase {
+    #[default]
     Idle,
     /// Marking the focused message read + sliding the marker to the next unread.
     Advancing,
@@ -508,11 +495,6 @@ pub enum MsgPhase {
     Closing,
 }
 
-impl Default for MsgPhase {
-    fn default() -> Self {
-        MsgPhase::Idle
-    }
-}
 
 /// iMessage interaction state. Lives on AppState so the pure render fn can read
 /// it; mutated only by the main.rs event loop. Animations are interpolated each
@@ -567,7 +549,6 @@ pub struct UsageStats {
     pub today_cache_read: u64,
     pub today_cache_write: u64,
     pub today_cost: f64,
-    pub month_cost: f64,
     pub today_messages: u64,
     pub top_model: String,
     pub sessions_today: u64,
@@ -610,6 +591,7 @@ pub enum ActionKind {
 /// thread so the ROBOTS card can show a realtime "who's working" feed.
 #[derive(Clone, Default)]
 pub struct LiveSession {
+    #[allow(dead_code)] // session identity, populated by the collector for future use
     pub session_id: String,
     /// Basename of the session's cwd, e.g. `battlestation`.
     pub project: String,
@@ -652,17 +634,13 @@ pub struct WatchInfo {
 pub struct AppState {
     pub system: SystemStats,
     pub silicon: SiliconStats,
-    /// Timestamped per-core CPU samples for delayed, interpolated playback.
-    pub cpu_samples: VecDeque<(Instant, Vec<f32>)>,
-    /// Timestamped total network throughput (bytes/sec) for the net visualizer.
-    pub net_samples: VecDeque<(Instant, f32)>,
     /// Timestamped Apple-Silicon metrics for smooth, delayed gauges. Indices:
     /// [gpu%, all_power, cpu_temp, gpu_temp, cpu_power, gpu_power, sys_power].
     pub silicon_samples: VecDeque<(Instant, Vec<f32>)>,
     /// Timestamped top-process snapshots for delay-interpolated playback: the
     /// proc_panel eases each process's cpu%/mem and slides rows toward their new
-    /// rank between samples, keyed by name (same pattern as cpu_samples).
-    pub proc_samples: VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>,
+    /// rank between samples, keyed by name (same delay-interpolation pattern).
+    pub proc_samples: VecDeque<(Instant, Vec<ProcSample>)>,
     /// Timestamped log-spaced audio spectrum bands (each 0..1) captured from a
     /// real Core Audio process tap of the system output. Fed to the NOW PLAYING
     /// / LYRICS spectrum the same delay-interpolated way the EQ plays back, so
@@ -670,8 +648,8 @@ pub struct AppState {
     /// audio thread produces a frame; `audio_live` flips true once it does.
     pub audio_samples: VecDeque<(Instant, Vec<f32>)>,
     /// Timestamped resource metrics for the RESOURCES wave — [mem %, net down
-    /// KB/s, net up KB/s, disk I/O KB/s] — played back delay-interpolated (like
-    /// net_samples) so the wave glides per-frame instead of stepping at 1 Hz.
+    /// KB/s, net up KB/s, disk I/O KB/s] — played back delay-interpolated so the
+    /// wave glides per-frame instead of stepping at 1 Hz.
     pub res_samples: VecDeque<(Instant, Vec<f32>)>,
     /// True once the audio tap is capturing (the visualizer then reflects real
     /// sound); false keeps the honest synthetic resting flourish.
@@ -681,7 +659,10 @@ pub struct AppState {
     /// How many distinct tracks are sitting in the lyrics miss log waiting to be
     /// reconciled — surfaced as the "N missing" badge on the LYRICS card.
     pub lyrics_misses: usize,
-    pub album_art: AlbumArt,
+    /// Decoded art is up to ART_THUMB² (~768 KB). Held behind an `Arc` so the
+    /// per-frame AppState snapshot clone in the event loop (issue #16) is a
+    /// refcount bump, not a 768 KB copy on the render hot path.
+    pub album_art: Arc<AlbumArt>,
     /// Album-art-derived accent palette, cross-faded per frame (issue #8).
     pub dynamic_theme: DynamicTheme,
     pub facts: MusicFacts,
@@ -699,17 +680,6 @@ pub struct AppState {
     pub discord: Discord, // Discord voice presence + recent text channels
     pub doctor: Doctor,   // mac-doctor / syswatch triage agent status
     pub keybinds: Keybinds, // Hammerspoon keybind cheat sheet
-    pub cpu_hist: History,
-    pub gpu_hist: History,
-    pub power_hist: History,
-    pub net_rx_hist: History,
-    pub net_tx_hist: History,
-    /// Memory-used percent (0..100) history — a band of the MEM·DISK·NET wave.
-    pub mem_hist: History,
-    /// Disk I/O rate (KB/s, read+written across all procs) — a wave band.
-    pub disk_io_hist: History,
-    /// Disk free space (percent of root, 0..100) — a wave band.
-    pub disk_free_hist: History,
     pub started: Instant,
     /// Whether the QUEUE card is currently "open" (has tracks to show). When it
     /// goes empty the card smoothly collapses and the LYRICS card expands to fill
@@ -729,8 +699,6 @@ impl Default for AppState {
         Self {
             system: SystemStats::default(),
             silicon: SiliconStats::default(),
-            cpu_samples: VecDeque::new(),
-            net_samples: VecDeque::new(),
             res_samples: VecDeque::new(),
             silicon_samples: VecDeque::new(),
             proc_samples: VecDeque::new(),
@@ -739,7 +707,7 @@ impl Default for AppState {
             music: MusicStats::default(),
             lyrics: Lyrics::default(),
             lyrics_misses: 0,
-            album_art: AlbumArt::default(),
+            album_art: Arc::new(AlbumArt::default()),
             dynamic_theme: DynamicTheme::default(),
             facts: MusicFacts::default(),
             queue: Queue::default(),
@@ -754,14 +722,6 @@ impl Default for AppState {
             discord: Discord::default(),
             doctor: Doctor::default(),
             keybinds: Keybinds::default(),
-            cpu_hist: History::new(120),
-            gpu_hist: History::new(120),
-            power_hist: History::new(120),
-            net_rx_hist: History::new(120),
-            net_tx_hist: History::new(120),
-            mem_hist: History::new(120),
-            disk_io_hist: History::new(120),
-            disk_free_hist: History::new(120),
             started: Instant::now(),
             queue_open: false,
             // Stamped in the past so a cold start reads as a settled, collapsed

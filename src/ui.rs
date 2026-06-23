@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::state::AppState;
+use crate::state::{AppState, ProcSample};
 use crate::theme as c;
 
 /// How far behind real time the equalizer plays back. We render the value at
@@ -35,7 +35,7 @@ fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, u: f32) -> f32 {
 const GRAPH_WINDOW: Duration = Duration::from_millis(12_000);
 
 /// Delayed Catmull-Rom value of channel `ch` from a multi-channel sample buffer
-/// at `target` time (companion to `sampled_scalar` / `sampled_cores`).
+/// at `target` time.
 fn sampled_channel(samples: &VecDeque<(Instant, Vec<f32>)>, ch: usize, target: Instant) -> f32 {
     let m = samples.len();
     if m == 0 {
@@ -89,97 +89,24 @@ fn smoothed(v: &[f32], radius: usize, passes: usize) -> Vec<f32> {
     if n < 3 || radius == 0 {
         return cur;
     }
+    // Ping-pong between `cur` and one reusable scratch buffer, swapping roles each
+    // pass — so each pass reads from the previous result and writes into the other
+    // buffer (no per-pass clone). `scratch` starts as a sized placeholder.
+    let mut scratch = vec![0.0f32; n];
     for _ in 0..passes {
-        let src = cur.clone();
-        for i in 0..n {
+        // `cur` is the source this pass; `scratch` receives the blurred output.
+        for (i, out) in scratch.iter_mut().enumerate().take(n) {
             let lo = i.saturating_sub(radius);
             let hi = (i + radius).min(n - 1);
             let mut sum = 0.0f32;
-            for &x in &src[lo..=hi] {
+            for &x in &cur[lo..=hi] {
                 sum += x;
             }
-            cur[i] = sum / (hi - lo + 1) as f32;
+            *out = sum / (hi - lo + 1) as f32;
         }
+        std::mem::swap(&mut cur, &mut scratch); // result is now in `cur` again
     }
     cur
-}
-
-/// How an area graph colours its fill.
-#[derive(Clone, Copy)]
-enum Fill {
-    /// One hue, dim at the baseline → vivid at the crest.
-    #[allow(dead_code)]
-    Tint(ratatui::style::Color),
-    /// Funky synthwave bands: blue→violet→pink→white up the height.
-    Jazz,
-}
-
-/// Render a buttery, continuously-scrolling filled area graph into `area`.
-/// `vals` holds one normalized value (0..1) per column, oldest→newest. The fill
-/// is a vertical gradient — dim at the baseline, vivid at the crest — so spikes
-/// glow; the top edge uses 1/8 vertical blocks for sub-cell smoothness.
-fn area_graph(f: &mut Frame, area: Rect, vals: &[f32], fill: Fill) {
-    use ratatui::style::Color;
-    let w = area.width as usize;
-    let h = area.height as usize;
-    if w == 0 || h == 0 || vals.is_empty() {
-        return;
-    }
-    // Blur the column series so every area graph glides — bursty signals (net)
-    // and smoother ones (cpu/gpu/power) all read as one buttery curve, no cliffs.
-    let vals = smoothed(vals, 2, 4);
-    let vals = vals.as_slice();
-    let mut lines: Vec<Line> = Vec::with_capacity(h);
-    for row in 0..h {
-        let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
-        let crest = ((r_bot + 0.5) / h as f32).clamp(0.0, 1.0);
-        // Run-length merge same-coloured cells so each row is a few spans.
-        let mut spans: Vec<Span> = Vec::new();
-        let mut run = String::new();
-        let mut run_col: Option<Color> = None;
-        for x in 0..w {
-            let v = vals.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            let fh = v * h as f32; // fill height in rows
-            let lit = fh > r_bot;
-            let ch = if !lit {
-                ' '
-            } else if fh >= r_bot + 1.0 {
-                '█'
-            } else {
-                c::vblock(fh - r_bot)
-            };
-            let cell_col = if !lit {
-                None
-            } else {
-                let base = match fill {
-                    Fill::Tint(col) => col,
-                    Fill::Jazz => c::jazz(crest),
-                };
-                Some(c::blend(c::BG, base, 0.28 + 0.72 * crest))
-            };
-            if cell_col == run_col {
-                run.push(ch);
-            } else {
-                if !run.is_empty() {
-                    let prev = std::mem::take(&mut run);
-                    spans.push(match run_col {
-                        Some(col) => Span::styled(prev, Style::default().fg(col)),
-                        None => Span::raw(prev),
-                    });
-                }
-                run.push(ch);
-                run_col = cell_col;
-            }
-        }
-        if !run.is_empty() {
-            spans.push(match run_col {
-                Some(col) => Span::styled(run, Style::default().fg(col)),
-                None => Span::raw(run),
-            });
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Render the RESOURCES wave: the live channels **stacked** into one smooth,
@@ -201,9 +128,9 @@ fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(ratatui::style::Color, Vec<
         bands.iter().map(|(col, v)| (*col, smoothed(v, 2, 4))).collect();
     // Per-column stack totals → scale so the tallest column ~fills the plot.
     let mut totals = vec![0.0f32; w];
-    for x in 0..w {
+    for (x, total) in totals.iter_mut().enumerate().take(w) {
         for (_, v) in &bands {
-            totals[x] += v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            *total += v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         }
     }
     let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.8);
@@ -216,8 +143,8 @@ fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(ratatui::style::Color, Vec<
         let mut spans: Vec<Span> = Vec::new();
         let mut run = String::new();
         let mut run_col: Option<Color> = None;
-        for x in 0..w {
-            let total = totals[x] * scale; // stack top, in rows
+        for (x, &col_total) in totals.iter().enumerate().take(w) {
+            let total = col_total * scale; // stack top, in rows
             let (ch, col) = if total <= r_bot {
                 (' ', None) // above the wave
             } else {
@@ -261,66 +188,6 @@ fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(ratatui::style::Color, Vec<
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
-}
-
-/// Scalar version of the delayed Catmull-Rom interpolation (for net energy).
-fn sampled_scalar(samples: &VecDeque<(Instant, f32)>, target: Instant) -> f32 {
-    let m = samples.len();
-    if m == 0 {
-        return 0.0;
-    }
-    if m == 1 || target <= samples[0].0 {
-        return samples[0].1;
-    }
-    if target >= samples[m - 1].0 {
-        return samples[m - 1].1;
-    }
-    let mut i = m - 2;
-    for j in 0..m - 1 {
-        if samples[j].0 <= target && target < samples[j + 1].0 {
-            i = j;
-            break;
-        }
-    }
-    let span = (samples[i + 1].0 - samples[i].0).as_secs_f32().max(1e-3);
-    let u = ((target - samples[i].0).as_secs_f32() / span).clamp(0.0, 1.0);
-    let i0 = i.saturating_sub(1);
-    let i3 = (i + 2).min(m - 1);
-    catmull(samples[i0].1, samples[i].1, samples[i + 1].1, samples[i3].1, u).max(0.0)
-}
-
-/// Interpolate per-core CPU values at `target` time from the sample buffer,
-/// using a Catmull-Rom spline through the bracketing samples.
-fn sampled_cores(samples: &VecDeque<(Instant, Vec<f32>)>, target: Instant) -> Vec<f32> {
-    let m = samples.len();
-    if m == 0 {
-        return Vec::new();
-    }
-    if m == 1 || target <= samples[0].0 {
-        return samples[0].1.clone();
-    }
-    if target >= samples[m - 1].0 {
-        return samples[m - 1].1.clone();
-    }
-    // Segment [i, i+1] that brackets the target time.
-    let mut i = m - 2;
-    for j in 0..m - 1 {
-        if samples[j].0 <= target && target < samples[j + 1].0 {
-            i = j;
-            break;
-        }
-    }
-    let span = (samples[i + 1].0 - samples[i].0).as_secs_f32().max(1e-3);
-    let u = ((target - samples[i].0).as_secs_f32() / span).clamp(0.0, 1.0);
-    let i0 = i.saturating_sub(1);
-    let i3 = (i + 2).min(m - 1);
-    let n = samples[i].1.len();
-    let mut out = Vec::with_capacity(n);
-    for c in 0..n {
-        let g = |k: usize| samples[k].1.get(c).copied().unwrap_or(0.0);
-        out.push(catmull(g(i0), g(i), g(i + 1), g(i3), u).clamp(0.0, 100.0));
-    }
-    out
 }
 
 /// Row heights for the 11-slot left column given the available height `avail`.
@@ -470,36 +337,6 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64) {
     }
 }
 
-/// A horizontal gauge: a coloured filled portion, then plain background for the
-/// remainder. The unfilled track is spaces (no glyph), so it vanishes into the
-/// terminal background like the CPU bars' empty space — the spaces still hold
-/// the width so trailing text stays aligned.
-fn bar_spans(frac: f32, width: usize, color: ratatui::style::Color) -> Vec<Span<'static>> {
-    let frac = frac.clamp(0.0, 1.0) as f64;
-    let eighths = (frac * width as f64 * 8.0).round() as usize;
-    let full = (eighths / 8).min(width);
-    let rem = eighths % 8;
-    let mut fill = "█".repeat(full);
-    let mut drawn = full;
-    if drawn < width && rem > 0 {
-        fill.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][rem]);
-        drawn += 1;
-    }
-    vec![
-        Span::styled(fill, Style::default().fg(color)),
-        Span::raw(" ".repeat(width.saturating_sub(drawn))),
-    ]
-}
-
-/// Render `text` with a soft sheen of light that glides smoothly across it — a
-/// narrow bright band (toward pink/white) sweeps left→right over an otherwise
-/// calm base colour, so stat readouts shimmer like brushed metal. `row` offsets
-/// the sweep per line so stacked rows don't shimmer in lockstep. Per-character
-/// truecolor blend → buttery, and the band wraps so it never pops.
-fn shimmer_text(text: &str, t: f64, row: f32) -> Line<'static> {
-    Line::from(shimmer_spans(text, t, row, c::DIM, 0.22, 0.07, false))
-}
-
 /// Per-character sheen sweep over `text` from `base` toward a pink-white glint.
 /// `speed` sets how fast the band travels, `sigma` its width (bigger = broader,
 /// more pronounced shimmer), `bold` keeps weight for titles. `row` phase-offsets
@@ -517,25 +354,47 @@ fn shimmer_spans(
     let n = chars.len().max(1);
     let head = ((t * speed + row as f64 * 0.18).rem_euclid(1.0)) as f32; // 0..1 sweep
     let sheen = c::jazz(0.9); // pink-white glint
-    let mut spans = Vec::with_capacity(n);
+    // Run-length merge adjacent chars that resolve to the same colour into one
+    // Span (spaces stay unstyled runs of their own) — same per-char output, fewer
+    // allocations.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_col: Option<Color> = None; // None == an unstyled (space) run
+    let flush = |run: &mut String, run_col: Option<Color>, spans: &mut Vec<Span>| {
+        if run.is_empty() {
+            return;
+        }
+        let prev = std::mem::take(run);
+        spans.push(match run_col {
+            Some(col) => {
+                let mut st = Style::default().fg(col);
+                if bold {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                Span::styled(prev, st)
+            }
+            None => Span::raw(prev),
+        });
+    };
     for (i, ch) in chars.iter().enumerate() {
-        if *ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
+        let cell_col = if *ch == ' ' {
+            None
+        } else {
+            let p = i as f32 / n as f32;
+            let mut d = (p - head).abs();
+            if d > 0.5 {
+                d = 1.0 - d; // wrap so the glint is continuous
+            }
+            let b = (-(d * d) / (2.0 * sigma * sigma)).exp(); // bright band 0..1
+            Some(c::blend(base, sheen, b)) // calm base -> glint
+        };
+        if cell_col != run_col {
+            flush(&mut run, run_col, &mut spans);
+            run_col = cell_col;
         }
-        let p = i as f32 / n as f32;
-        let mut d = (p - head).abs();
-        if d > 0.5 {
-            d = 1.0 - d; // wrap so the glint is continuous
-        }
-        let b = (-(d * d) / (2.0 * sigma * sigma)).exp(); // bright band 0..1
-        let col = c::blend(base, sheen, b); // calm base -> glint
-        let mut st = Style::default().fg(col);
-        if bold {
-            st = st.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(ch.to_string(), st));
+        run.push(*ch);
     }
+    flush(&mut run, run_col, &mut spans);
     spans
 }
 
@@ -601,24 +460,46 @@ fn shimmer_window(
     let total_cols = width.max(1) as f32;
     let f = 1.0 - alpha.clamp(0.0, 1.0);
     let mut spans = lead;
+    // Run-length merge adjacent tokens that resolve to the same (colour, bold) into
+    // one Span; spaces are unstyled runs. Same per-char output, fewer allocations.
+    let mut run = String::new();
+    let mut run_key: Option<(Color, bool)> = None; // None == an unstyled (space) run
+    let flush = |run: &mut String, run_key: Option<(Color, bool)>, spans: &mut Vec<Span>| {
+        if run.is_empty() {
+            return;
+        }
+        let prev = std::mem::take(run);
+        spans.push(match run_key {
+            Some((col, bold)) => {
+                let mut st = Style::default().fg(col);
+                if bold {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                Span::styled(prev, st)
+            }
+            None => Span::raw(prev),
+        });
+    };
     for (k, (ch, base, bold)) in toks.iter().enumerate() {
-        if *ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
+        let key = if *ch == ' ' {
+            None
+        } else {
+            let p = (lead_w + k) as f32 / total_cols;
+            let mut d = (p - head).abs();
+            if d > 0.5 {
+                d = 1.0 - d;
+            }
+            let b = (-(d * d) / (2.0 * 0.16 * 0.16)).exp();
+            let col = c::blend(c::blend(*base, sheen, b), c::BG, f);
+            Some((col, *bold))
+        };
+        if key != run_key {
+            flush(&mut run, run_key, &mut spans);
+            run_key = key;
         }
-        let p = (lead_w + k) as f32 / total_cols;
-        let mut d = (p - head).abs();
-        if d > 0.5 {
-            d = 1.0 - d;
-        }
-        let b = (-(d * d) / (2.0 * 0.16 * 0.16)).exp();
-        let col = c::blend(c::blend(*base, sheen, b), c::BG, f);
-        let mut st = Style::default().fg(col);
-        if *bold {
-            st = st.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(ch.to_string(), st));
+        run.push(*ch);
     }
+    flush(&mut run, run_key, &mut spans);
     Line::from(spans)
 }
 
@@ -849,6 +730,9 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// One RESOURCES wave channel: (shade, label, 0..1 normaliser, res_samples slot).
+type WaveChannel = (Color, &'static str, fn(f32) -> f32, usize);
+
 fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let block = panel("RESOURCES", false);
     let inner = block.inner(area);
@@ -863,7 +747,7 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
     // the cyan end — its own lane + shade, folded in from the retired CPU card.
     let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
     let pct: fn(f32) -> f32 = |p| (p / 100.0).clamp(0.0, 1.0);
-    let channels: [(Color, &str, fn(f32) -> f32, usize); 6] = [
+    let channels: [WaveChannel; 6] = [
         (Color::Rgb(86, 214, 255), "cpu", pct, 5), // fixed cyan (CYAN_BASE) — no album drift
         (c::jazz(0.42), "mem", pct, 0),            // memory used
         (c::jazz(0.56), "gpu", pct, 4),            // GPU utilization
@@ -918,7 +802,6 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
 /// right = the most-recently-active local git branch's pulse. The two halves
 /// are grouped by a soft, static gradient rule rather than a hard split.
 fn robots_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
-    let _ = t;
     let block = panel("ROBOTS WORKING", false);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1309,7 +1192,7 @@ fn queue_open_frac(s: &AppState) -> f32 {
 /// the keybinds collector polls). Mirrors `queue_open_frac` so the card glides
 /// open/closed instead of popping.
 fn keybinds_open_frac(s: &AppState) -> f32 {
-    const DUR: f32 = 0.34; // matches main::KEYBINDS_ANIM
+    const DUR: f32 = 0.36; // matches main::KEYBINDS_ANIM (360ms)
     let p = (s.keybinds_toggle_at.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0);
     let eased = p * p * (3.0 - 2.0 * p); // smoothstep
     if s.keybinds_visible { eased } else { 1.0 - eased }
@@ -1755,65 +1638,6 @@ fn spectrum(n: usize, rows: usize, t: f64, playing: bool, bars: Option<&[f32]>) 
     grid.into_iter().map(Line::from).collect()
 }
 
-/// Right-column filler when music isn't playing: three buttery, continuously-
-/// scrolling area graphs of real SoC telemetry — CPU load, GPU load, and system
-/// power over the last GRAPH_WINDOW. Honest data, frame-smooth motion (the same
-/// delay-interpolated playback the gauges use).
-fn system_panel(f: &mut Frame, area: Rect, s: &AppState) {
-    let si = &s.silicon;
-    let cpu = if si.fresh { si.cpu_pct } else { s.system.cpu_overall };
-    let title = format!("SYSTEM      cpu {cpu:>2.0}%    gpu {:>2.0}%    {:.0} W", si.gpu_pct, si.sys_power_w);
-    let block = panel(&title, false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.height < 3 || inner.width < 8 {
-        return;
-    }
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
-        .split(inner);
-
-    let draw = |f: &mut Frame, r: Rect, label: &str, vals: Vec<f32>, fill: Fill| {
-        if r.height < 2 {
-            return;
-        }
-        f.render_widget(
-            Paragraph::new(Span::styled(label.to_string(), Style::default().fg(c::FAINT))),
-            Rect { x: r.x, y: r.y, width: r.width, height: 1 },
-        );
-        let plot = Rect { x: r.x, y: r.y + 1, width: r.width, height: r.height - 1 };
-        area_graph(f, plot, &vals, fill);
-    };
-
-    let w = rows[0].width as usize;
-    let cpu_vals = series(
-        &s.cpu_samples,
-        w,
-        |buf, t| {
-            let v = sampled_cores(buf, t);
-            if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
-        },
-        |x| (x / 100.0).clamp(0.0, 1.0),
-    );
-    draw(f, rows[0], "cpu load", cpu_vals, Fill::Jazz);
-    draw(
-        f,
-        rows[1],
-        "gpu load",
-        series(&s.silicon_samples, w, |buf, t| sampled_channel(buf, 0, t), |x| (x / 100.0).clamp(0.0, 1.0)),
-        Fill::Jazz,
-    );
-    draw(
-        f,
-        rows[2],
-        "power",
-        series(&s.silicon_samples, w, |buf, t| sampled_channel(buf, 6, t), |x| (x / 120.0).clamp(0.0, 1.0)),
-        Fill::Jazz,
-    );
-}
-
 /// Render the album-art thumbnail as truecolor half-blocks (two vertical
 /// pixels per cell via '▀' with fg=top, bg=bottom). Works in any truecolor
 /// terminal — no image protocol needed.
@@ -1870,7 +1694,7 @@ struct EasedProc {
 /// (newer) bracketing sample so the list never flickers; each process's cpu%/mem
 /// ease via Catmull-Rom and its row rank lerps so reorders slide. Processes that
 /// just appeared/dropped fade in/out via `fade` instead of popping.
-fn eased_procs(samples: &VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>, target: Instant) -> Vec<EasedProc> {
+fn eased_procs(samples: &VecDeque<(Instant, Vec<ProcSample>)>, target: Instant) -> Vec<EasedProc> {
     let m = samples.len();
     if m == 0 {
         return Vec::new();
@@ -1893,7 +1717,7 @@ fn eased_procs(samples: &VecDeque<(Instant, Vec<(String, f32, u64, u64)>)>, targ
     };
     let j = (i + 1).min(m - 1); // destination sample index
     // Rank/value lookups keyed by name. Rank = index in that sample (lower = top).
-    let look = |idx: usize, name: &str| -> Option<(usize, &(String, f32, u64, u64))> {
+    let look = |idx: usize, name: &str| -> Option<(usize, &ProcSample)> {
         samples[idx].1.iter().enumerate().find(|(_, p)| p.0 == name)
     };
     // Catmull endpoints for value easing: one sample either side of [i, j].
@@ -2114,8 +1938,6 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let ui = &s.msg_ui;
 
     // ----- title with unread badge / all-read tick -----
-    let hot = ui.active;
-    let _ = hot;
     let border = c::PANEL_BORDER_HOT;
     // Settle: pink "● n unread" crossfades to green "✓ all read" over 300ms.
     let badge_blend = match ui.phase {
@@ -2163,7 +1985,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     f.render_widget(block, area);
     // Unread → shimmer the border until you've actually checked iMessage (but not
     // while the brief red send-fail flash is playing).
-    let flashing = ui.send_failed_at.map_or(false, |fa| fa.elapsed().as_secs_f32() < 0.36);
+    let flashing = ui.send_failed_at.is_some_and(|fa| fa.elapsed().as_secs_f32() < 0.36);
     if msgs.available && msgs.unread_count > 0 && !flashing {
         shimmer_border(f, area, t, 0.55, 0.0);
     }
@@ -2551,7 +2373,7 @@ fn discord_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     //  • someone is TALKING in voice  → bright, fast, white-hot sweep
     //  • unread text / 20s after a voice JOIN → calm attention sweep
     // OVERSEER_FAKE_SPEAKING / _VOICE light these up for previewing.
-    let voice_join = d.voice_join_at.map_or(false, |i| i.elapsed().as_secs_f64() < 20.0);
+    let voice_join = d.voice_join_at.is_some_and(|i| i.elapsed().as_secs_f64() < 20.0);
     let fake_join = std::env::var("OVERSEER_FAKE_VOICE")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
@@ -2915,7 +2737,7 @@ fn lyrics_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         let h = inner.height as usize;
         let viz_rows = h.saturating_sub(2).clamp(2, 4);
         let upper = h.saturating_sub(viz_rows);
-        let caption_y = inner.y + (upper / 2).max(0) as u16;
+        let caption_y = inner.y + (upper / 2) as u16;
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("♫  ", Style::default().fg(c::FAINT)),
@@ -3115,37 +2937,11 @@ fn karaoke_row(text: &str, cstart: usize, total: usize, frac: f32) -> Line<'stat
     Line::from(spans)
 }
 
-/// A sparkline whose bars are coloured by their own height with the jazz ramp
-/// (blue→violet→pink→white), giving a per-bar vertical-style gradient. Honest:
-/// height = real data; colour is purely a function of that height.
-fn jazz_spark(data: &[u64], width: usize) -> Vec<Span<'static>> {
-    let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    if data.is_empty() {
-        return vec![Span::raw(" ".repeat(width))];
-    }
-    let slice: Vec<u64> = data.iter().rev().take(width).rev().copied().collect();
-    let max = slice.iter().copied().max().unwrap_or(1).max(1);
-    let mut spans: Vec<Span> = Vec::with_capacity(width);
-    let lead = width.saturating_sub(slice.len());
-    if lead > 0 {
-        spans.push(Span::raw(" ".repeat(lead)));
-    }
-    for v in slice {
-        let frac = (v as f32 / max as f32).clamp(0.0, 1.0);
-        let idx = (frac * 8.0).round() as usize;
-        let ch = glyphs[idx.min(8)];
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-        } else {
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(c::jazz(frac))));
-        }
-    }
-    spans
-}
-
-/// Multi-row jazz sparkline: like `jazz_spark` but `rows` cells tall, so the bar
-/// for each sample rises across several text rows for a bigger, easier-to-read
-/// chart. Returns one span-row per chart row, top-to-bottom, each `width` wide.
+/// Multi-row jazz sparkline whose bars are coloured by their own height with the
+/// jazz ramp (blue→violet→pink→white) and stand `rows` cells tall, so the bar for
+/// each sample rises across several text rows for a bigger, easier-to-read chart.
+/// Honest: height = real data; colour is purely a function of that height.
+/// Returns one span-row per chart row, top-to-bottom, each `width` wide.
 /// Each data point is stretched ~2 columns wide so the chart spans the full card.
 fn jazz_spark_rows(data: &[u64], width: usize, rows: usize) -> Vec<Vec<Span<'static>>> {
     let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -3190,16 +2986,6 @@ fn fmt_bytes(b: u64) -> String {
         format!("{gb:.1}G")
     } else {
         format!("{:.0}M", b as f64 / 1_048_576.0)
-    }
-}
-
-fn fmt_rate(bps: f64) -> String {
-    if bps >= 1_048_576.0 {
-        format!("{:.1} MB/s", bps / 1_048_576.0)
-    } else if bps >= 1024.0 {
-        format!("{:.0} KB/s", bps / 1024.0)
-    } else {
-        format!("{bps:.0} B/s")
     }
 }
 

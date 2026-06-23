@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Local, Timelike};
 
 use crate::lyrics;
 use crate::state::AppState;
@@ -122,17 +122,8 @@ pub fn spawn_system(shared: Shared) {
                 s.system.uptime_secs = System::uptime();
                 s.system.proc_count = nproc;
                 s.system.top_procs = procs;
-                // Timestamped sample for the EQ's delayed, interpolated playback.
-                let sample = s.system.per_core.clone();
+                // Timestamped sample for the delayed, interpolated playback.
                 let now = Instant::now();
-                s.cpu_samples.push_back((now, sample));
-                while s.cpu_samples.len() > 16 {
-                    s.cpu_samples.pop_front();
-                }
-                s.net_samples.push_back((now, (rx_bps + tx_bps) as f32));
-                while s.net_samples.len() > 16 {
-                    s.net_samples.pop_front();
-                }
                 // RESOURCES wave channels: mem %, net down/up KB/s, disk I/O KB/s.
                 // Delay-interpolated on playback so the wave glides per-frame.
                 let mem_pct = if s.system.mem_total > 0 {
@@ -163,27 +154,6 @@ pub fn spawn_system(shared: Shared) {
                 while s.proc_samples.len() > 16 {
                     s.proc_samples.pop_front();
                 }
-                s.net_rx_hist.push((rx_bps / 1024.0) as u64);
-                s.net_tx_hist.push((tx_bps / 1024.0) as u64);
-                // Bands of the MEM·DISK·NET wave: memory used %, disk I/O (KB/s),
-                // disk free %. Pushed every tick so the wave scrolls in lockstep.
-                let mem_pct = if s.system.mem_total > 0 {
-                    (s.system.mem_used as f64 / s.system.mem_total as f64 * 100.0) as u64
-                } else {
-                    0
-                };
-                let free_pct = if d_total > 0 {
-                    (d_avail as f64 / d_total as f64 * 100.0) as u64
-                } else {
-                    0
-                };
-                s.mem_hist.push(mem_pct);
-                s.disk_io_hist.push((disk_io_bps / 1024.0) as u64);
-                s.disk_free_hist.push(free_pct);
-                // If macmon isn't feeding silicon CPU%, mirror sysinfo's.
-                if !s.silicon.fresh {
-                    s.cpu_hist.push(overall as u64);
-                }
             }
 
             thread::sleep(Duration::from_millis(1000));
@@ -206,8 +176,11 @@ pub fn spawn_audio(shared: Shared) {
         // inside this thread; the realtime IO proc writes bands on its own.
         match crate::audio::start(shared.clone()) {
             Some(_cap) => {
-                // Hold the tap open. Park until the process exits; on the rare
-                // chance the device tears down we retry after the sleep below.
+                // Hold the AudioCapture handle for the lifetime of the process:
+                // the realtime IO proc keeps writing bands on its own, so this
+                // thread just parks indefinitely. There is no break and no
+                // auto-recovery — if the device tears down, the tap is not
+                // re-created until the process restarts.
                 loop {
                     thread::sleep(Duration::from_secs(3600));
                 }
@@ -312,14 +285,6 @@ pub fn spawn_macmon(shared: Shared) {
                 s.silicon.gpu_temp_c =
                     t.get("gpu_temp_avg").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
             }
-            let (cpu_v, gpu_v, pwr_v) = (
-                s.silicon.cpu_pct as u64,
-                s.silicon.gpu_pct as u64,
-                s.silicon.all_power_w as u64,
-            );
-            s.cpu_hist.push(cpu_v);
-            s.gpu_hist.push(gpu_v);
-            s.power_hist.push(pwr_v);
             // Timestamped sample for smooth, delayed gauges.
             let si = &s.silicon;
             let sample = vec![
@@ -339,7 +304,12 @@ pub fn spawn_macmon(shared: Shared) {
                 s.silicon_samples.pop_front();
             }
         }
-        // Pipe closed (macmon exited) — restart.
+        // Pipe closed (macmon exited) — restart. Mark silicon stale so the
+        // gauges stop trusting frozen values and the sysinfo fallback can step
+        // in until macmon is back up.
+        if let Ok(mut s) = shared.lock() {
+            s.silicon.fresh = false;
+        }
         let _ = child.wait();
         thread::sleep(Duration::from_secs(2));
     });
@@ -742,7 +712,7 @@ fn wiki_summary(title: &str, film: bool) -> Option<(String, String)> {
     for t in titles {
         let url = format!(
             "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
-            urlencode(&t).replace("%20", "%20")
+            urlencode(&t).replace("%20", "_")
         );
         let Ok(resp) = agent.get(&url).set("User-Agent", FACTS_UA).call() else { continue };
         let Ok(v) = resp.into_json::<serde_json::Value>() else { continue };
@@ -1033,7 +1003,7 @@ pub fn spawn_artwork(shared: Shared) {
                     let target = [target.0, target.1, target.2];
                     let mut s = shared.lock().unwrap();
                     if s.music.track_id() == id {
-                        s.album_art = art;
+                        s.album_art = std::sync::Arc::new(art);
                         if s.dynamic_theme.source_track_id != id || s.dynamic_theme.target != target {
                             s.dynamic_theme.retarget(id.clone(), target);
                         }
@@ -1426,7 +1396,9 @@ pub struct FactSubject {
     pub year: String,
     pub genre: String,
     pub director: String,
+    #[allow(dead_code)] // populated for episode grounding; not yet read in the prompt
     pub season: u32,
+    #[allow(dead_code)] // populated for episode grounding; not yet read in the prompt
     pub episode: u32,
 }
 
@@ -1740,7 +1712,7 @@ fn capture_after(text: &str, markers: &[&str]) -> String {
         if let Some(i) = lower.find(m) {
             let rest = &text[i + m.len()..];
             let end = rest
-                .find(|c| c == '.' || c == ',' || c == ';')
+                .find(['.', ',', ';'])
                 .unwrap_or(rest.len());
             let span = rest[..end].trim();
             // Stop at a connective so "George Lucas and produced by…" → "George Lucas".
@@ -2125,12 +2097,27 @@ fn fetch_weather() -> Option<crate::state::Weather> {
         .map(|a| (gs(a, "sunrise"), gs(a, "sunset")))
         .unwrap_or_default();
 
-    // Next ~12 hourly temps (°F) across today + tomorrow for the jazz strip.
+    // Next ~12 hourly temps (°F) starting at "now": wttr's first day carries
+    // every 3-hour slot from midnight, so skip today's slots earlier than the
+    // current local hour (the "time" field is "300"=3:00, "1200"=12:00, so the
+    // slot hour is time/100). Tomorrow's slots are all in the future, kept as-is.
+    let cur_hour = Local::now().hour() as i64;
     let mut temp_strip: Vec<u64> = Vec::new();
     if let Some(days) = v.get("weather").and_then(|w| w.as_array()) {
-        for day in days.iter().take(2) {
+        for (di, day) in days.iter().take(2).enumerate() {
             if let Some(hrs) = day.get("hourly").and_then(|h| h.as_array()) {
                 for hr in hrs {
+                    if di == 0 {
+                        let slot_hour = hr
+                            .get("time")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|t| t / 100)
+                            .unwrap_or(0);
+                        if slot_hour < cur_hour {
+                            continue;
+                        }
+                    }
                     if let Some(t) = hr.get("tempF").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok()) {
                         temp_strip.push(t.max(0) as u64);
                     }
@@ -2216,9 +2203,8 @@ fn pricing(model: &str) -> (f64, f64, f64, f64) {
         (5.0, 25.0, 0.5, 6.25)
     } else if m.contains("haiku") {
         (1.0, 5.0, 0.1, 1.25)
-    } else if m.contains("sonnet") {
-        (3.0, 15.0, 0.3, 3.75)
     } else {
+        // sonnet and any unrecognized model fall through to Sonnet pricing.
         (3.0, 15.0, 0.3, 3.75)
     }
 }
@@ -2238,7 +2224,6 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
     let base = dirs::home_dir()?.join(".claude").join("projects");
     let now = Local::now();
     let today = now.date_naive();
-    let month = (now.year(), now.month());
 
     let d7 = now - chrono::Duration::days(7);
     let d30 = now - chrono::Duration::days(30);
@@ -2318,9 +2303,6 @@ fn scan_usage() -> Option<crate::state::UsageStats> {
             }
             if local >= d7 {
                 st.tokens_7d += tokens;
-            }
-            if (local.year(), local.month()) == month {
-                st.month_cost += cost; // kept for the footer's "Claude today/$" readout
             }
 
             if local.date_naive() == today {
@@ -2814,7 +2796,7 @@ pub fn spawn_messages(shared: Shared) {
 
         loop {
             poll = poll.wrapping_add(1);
-            if poll % 50 == 0 {
+            if poll.is_multiple_of(50) {
                 let fresh = load_contacts();
                 if !fresh.is_empty() {
                     contacts = fresh;
@@ -3534,7 +3516,10 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
             ts_unix: ts,
             rel: fmt_rel((now - ts).max(0.0)),
             is_rich,
-            unread: unread_n > 0,
+            // Mirror iMessage: a chat is only unread if its LATEST message is
+            // inbound — if you sent the last message you've seen the thread, so
+            // a stale never-cleared unread flag must not light the badge.
+            unread: unread_n > 0 && !from_me,
             from_me,
             is_shortcode: false,
         });
@@ -3692,7 +3677,7 @@ fn resolved_tool(bin: &str) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let b = s.as_bytes();
@@ -3821,7 +3806,7 @@ fn fetch_text_channels(
         })
         .filter(|(_, last)| *last > 0)
         .collect();
-    text.sort_by(|a, b| b.1.cmp(&a.1));
+    text.sort_by_key(|t| std::cmp::Reverse(t.1));
 
     let now = Local::now().timestamp() as f64;
     let mut rows: Vec<(f64, TextChannel)> = Vec::new();
@@ -3942,7 +3927,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
     loop {
         if last_hb.elapsed() >= hb_interval {
             let hb = serde_json::json!({ "op": 1, "d": seq });
-            sock.send(Message::Text(hb.to_string().into())).map_err(|e| e.to_string())?;
+            sock.send(Message::Text(hb.to_string())).map_err(|e| e.to_string())?;
             last_hb = Instant::now();
         }
 
@@ -3973,7 +3958,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                         "op": 4,
                         "d": { "guild_id": guild, "channel_id": serde_json::Value::Null, "self_mute": true, "self_deaf": false }
                     });
-                    let _ = sock.send(Message::Text(leave.to_string().into()));
+                    let _ = sock.send(Message::Text(leave.to_string()));
                     thread::sleep(Duration::from_millis(250));
                 }
                 // self_deaf:false so Discord keeps streaming us the others' Speaking
@@ -3982,7 +3967,7 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                     "op": 4,
                     "d": { "guild_id": guild, "channel_id": target, "self_mute": true, "self_deaf": false }
                 });
-                let _ = sock.send(Message::Text(join.to_string().into()));
+                let _ = sock.send(Message::Text(join.to_string()));
                 voice_log(&format!("gateway: op4 join channel={target:?} (pre-leave done)"));
                 joined_channel = target.clone();
                 if target.is_none() {
@@ -4046,13 +4031,13 @@ fn discord_gateway_session(shared: &Shared) -> Result<(), String> {
                         "properties": {"os":"macos","browser":"overseer","device":"overseer"}
                     }
                 });
-                sock.send(Message::Text(identify.to_string().into())).map_err(|e| e.to_string())?;
+                sock.send(Message::Text(identify.to_string())).map_err(|e| e.to_string())?;
                 last_hb = Instant::now();
             }
             Some(1) => {
                 // Server asked us to heartbeat immediately.
                 let hb = serde_json::json!({ "op": 1, "d": seq });
-                sock.send(Message::Text(hb.to_string().into())).map_err(|e| e.to_string())?;
+                sock.send(Message::Text(hb.to_string())).map_err(|e| e.to_string())?;
                 last_hb = Instant::now();
             }
             Some(7) | Some(9) => return Err("reconnect requested".into()),
@@ -4193,7 +4178,7 @@ fn discord_voice_ws(
             nonce = nonce.wrapping_add(1);
             // v8 heartbeat carries the nonce + last-seen sequence to ack.
             let hb = serde_json::json!({ "op": 3, "d": { "t": nonce, "seq_ack": last_seq } });
-            if sock.send(Message::Text(hb.to_string().into())).is_err() {
+            if sock.send(Message::Text(hb.to_string())).is_err() {
                 break;
             }
             last_hb = Instant::now();
@@ -4247,7 +4232,7 @@ fn discord_voice_ws(
                         "max_dave_protocol_version": 0
                     }
                 });
-                let _ = sock.send(Message::Text(identify.to_string().into()));
+                let _ = sock.send(Message::Text(identify.to_string()));
                 voice_log(&format!(
                     "voice: HELLO (hb={}ms) → sent IDENTIFY (server_id={} user_id={} session_len={} token_len={})",
                     hb_interval.as_millis(), server_id, user_id, session_id.len(), token.len()
@@ -4276,7 +4261,7 @@ fn discord_voice_ws(
                             "op": 1,
                             "d": { "protocol": "udp", "data": { "address": my_ip, "port": my_port, "mode": mode } }
                         });
-                        let _ = sock.send(Message::Text(sp.to_string().into()));
+                        let _ = sock.send(Message::Text(sp.to_string()));
                         voice_log(&format!("voice: UDP discovery {my_ip}:{my_port} → SELECT_PROTOCOL mode={mode}"));
                     }
                     None => voice_log("voice: UDP IP DISCOVERY FAILED (no SELECT_PROTOCOL sent)"),

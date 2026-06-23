@@ -64,6 +64,19 @@ struct TapCtx {
     /// Smoothed bands carried between frames so the published series rises fast
     /// but falls gently — classic VU ballistics, no strobing.
     decay: Mutex<Vec<f32>>,
+    /// Pre-allocated realtime scratch reused every `publish()` so the audio
+    /// callback never allocates: the FFT in/out buffer, the rustfft internal
+    /// scratch, and the per-frame bands. Behind one Mutex (only `publish` —
+    /// itself on the IO proc — touches it) so the lock is uncontended.
+    scratch: Mutex<PublishScratch>,
+}
+
+/// Reusable buffers for `publish()`, allocated once at tap setup so the
+/// realtime IO callback stays allocation-free.
+struct PublishScratch {
+    fft_buf: Vec<rustfft::num_complex::Complex<f32>>,
+    fft_scratch: Vec<rustfft::num_complex::Complex<f32>>,
+    bands: Vec<f32>,
 }
 
 /// Live capture handle. Dropping it stops the IO proc and tears the tap +
@@ -147,6 +160,12 @@ fn make_ctx(shared: Shared) -> TapCtx {
         edges.push((bin.round() as usize).clamp(lo, hi));
     }
 
+    let scratch = PublishScratch {
+        fft_buf: vec![rustfft::num_complex::Complex::new(0.0, 0.0); FFT_SIZE],
+        fft_scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()],
+        bands: vec![0.0; BANDS],
+    };
+
     TapCtx {
         shared,
         fft,
@@ -154,6 +173,7 @@ fn make_ctx(shared: Shared) -> TapCtx {
         edges,
         window: Mutex::new(Vec::with_capacity(FFT_SIZE)),
         decay: Mutex::new(vec![0.0; BANDS]),
+        scratch: Mutex::new(scratch),
     }
 }
 
@@ -218,33 +238,37 @@ unsafe extern "C-unwind" fn io_proc(
 /// frame into `AppState::audio_samples`.
 fn publish(ctx: &TapCtx, win: &[f32]) {
     use rustfft::num_complex::Complex;
-    let mut buf: Vec<Complex<f32>> = (0..FFT_SIZE)
-        .map(|i| Complex::new(win[i] * ctx.hann[i], 0.0))
-        .collect();
-    ctx.fft.process(&mut buf);
+    // Reuse the pre-allocated scratch so this realtime callback never allocates.
+    let mut scratch = ctx.scratch.lock().unwrap();
+    let PublishScratch { fft_buf, fft_scratch, bands } = &mut *scratch;
+
+    for i in 0..FFT_SIZE {
+        fft_buf[i] = Complex::new(win[i] * ctx.hann[i], 0.0);
+    }
+    ctx.fft.process_with_scratch(fft_buf, fft_scratch);
 
     // Per-band energy = mean magnitude across its bin slice, then a perceptual
     // compress (sqrt) so quiet detail is visible without the loud parts pinning.
-    let mut bands = vec![0.0f32; BANDS];
-    for b in 0..BANDS {
+    for (b, band) in bands.iter_mut().enumerate().take(BANDS) {
         let lo = ctx.edges[b];
         let hi = ctx.edges[b + 1].max(lo + 1);
         let mut sum = 0.0f32;
-        for k in lo..hi {
-            sum += buf[k].norm();
+        for bin in &fft_buf[lo..hi] {
+            sum += bin.norm();
         }
         let mag = sum / (hi - lo) as f32;
         // A gentle tilt lifts treble bands (which carry less energy) so the top
         // bars don't sit dead — keeps the spectrum lively across its width.
         let tilt = 1.0 + 1.6 * (b as f32 / BANDS as f32);
-        bands[b] = (mag * tilt).sqrt();
+        *band = (mag * tilt).sqrt();
     }
 
-    // Normalize to a soft ceiling so the bars use the full height but loud
-    // passages don't clip flat. The ceiling adapts slowly to the running peak.
-    let peak = bands.iter().cloned().fold(0.0f32, f32::max).max(1e-4);
+    // Normalize each frame to max(this frame's peak, a fixed floor of 0.35) so
+    // the bars use the full height but loud passages don't clip flat. There's no
+    // running ceiling here — temporal smoothing is the VU decay pass below.
+    let peak = bands.iter().cloned().fold(0.0f32, f32::max);
     let norm = 1.0 / peak.max(0.35);
-    for v in &mut bands {
+    for v in bands.iter_mut() {
         *v = (*v * norm).clamp(0.0, 1.0);
     }
 
@@ -259,10 +283,16 @@ fn publish(ctx: &TapCtx, win: &[f32]) {
     }
     drop(decay);
 
+    // Snapshot the smoothed bands into the shared ring (the scratch `bands`
+    // buffer itself is retained for the next frame — only this small copy is
+    // handed off, and the FFT in/out and rustfft scratch are never re-allocated).
+    let frame = bands.clone();
+    drop(scratch);
+
     let now = Instant::now();
     if let Ok(mut s) = ctx.shared.lock() {
         s.audio_live = true;
-        s.audio_samples.push_back((now, bands));
+        s.audio_samples.push_back((now, frame));
         // Keep a short ring — same depth the EQ keeps for delayed playback.
         while s.audio_samples.len() > 16 {
             s.audio_samples.pop_front();
@@ -297,10 +327,7 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
         let mut guard = AudioCapture { agg_id: 0, tap_id, proc_id: None, _ctx: Arc::new(make_ctx(shared.clone())) };
 
         // 2. The tap's UID — the aggregate device references the tap by UID.
-        let tap_uid = match read_cfstring(tap_id, kAudioTapPropertyUID) {
-            Some(u) => u,
-            None => return None,
-        };
+        let tap_uid = read_cfstring(tap_id, kAudioTapPropertyUID)?;
 
         // 3. Build a private aggregate device whose sub-tap is our tap. Keys are
         //    C-string constants from the HAL; values a heterogeneous CF mix, so
@@ -308,8 +335,8 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
         let sub_tap: CFRetained<CFDictionary> = cf_dict(&[
             (cfstr(kAudioSubTapUIDKey), tap_uid.as_ref() as &CFType as *const CFType),
             (cfstr(kAudioSubTapDriftCompensationKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
-        ]);
-        let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType]);
+        ])?;
+        let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType])?;
         let agg_uid = CFString::from_str("com.overseer.eq.aggregate");
         let agg_name = CFString::from_str("overseer EQ");
         let agg_desc: CFRetained<CFDictionary> = cf_dict(&[
@@ -318,7 +345,7 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
             (cfstr(kAudioAggregateDeviceIsPrivateKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
             (cfstr(kAudioAggregateDeviceIsStackedKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
             (cfstr(kAudioAggregateDeviceTapListKey), tap_list.as_ref() as &CFType as *const CFType),
-        ]);
+        ])?;
 
         let mut agg_id: AudioObjectID = 0;
         let st = AudioHardwareCreateAggregateDevice(&agg_desc, NonNull::from(&mut agg_id));
@@ -351,13 +378,14 @@ pub fn start(shared: Shared) -> Option<AudioCapture> {
 }
 
 /// Assemble an immutable CFArray of CF pointers using the default CFType
-/// callbacks (so entries are retained/released for us).
-fn cf_array(items: &[*const CFType]) -> CFRetained<CFArray> {
+/// callbacks (so entries are retained/released for us). `None` if the HAL
+/// refuses to allocate it — the caller degrades to the synthetic visualizer
+/// rather than panicking (panic="abort" would take the whole TUI down).
+fn cf_array(items: &[*const CFType]) -> Option<CFRetained<CFArray>> {
     use objc2_core_foundation::kCFTypeArrayCallBacks;
     let mut vals: Vec<*const c_void> = items.iter().map(|v| *v as *const c_void).collect();
     unsafe {
         CFArray::new(None, vals.as_mut_ptr(), items.len() as isize, &raw const kCFTypeArrayCallBacks)
-            .expect("CFArrayCreate")
     }
 }
 
@@ -404,8 +432,10 @@ fn cfstr(key: &std::ffi::CStr) -> CFRetained<CFString> {
 }
 
 /// Assemble an immutable CFDictionary from (key, value) CF pointers using the
-/// default CFType callbacks (retain/release the entries for us).
-fn cf_dict(pairs: &[(CFRetained<CFString>, *const CFType)]) -> CFRetained<CFDictionary> {
+/// default CFType callbacks (retain/release the entries for us). `None` if the
+/// HAL refuses to allocate it — the caller degrades to the synthetic visualizer
+/// rather than panicking (panic="abort" would take the whole TUI down).
+fn cf_dict(pairs: &[(CFRetained<CFString>, *const CFType)]) -> Option<CFRetained<CFDictionary>> {
     use objc2_core_foundation::{kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks};
     let mut keys: Vec<*const c_void> = pairs.iter().map(|(k, _)| k.as_ref() as *const CFString as *const c_void).collect();
     let mut vals: Vec<*const c_void> = pairs.iter().map(|(_, v)| *v as *const c_void).collect();
@@ -418,7 +448,6 @@ fn cf_dict(pairs: &[(CFRetained<CFString>, *const CFType)]) -> CFRetained<CFDict
             &raw const kCFTypeDictionaryKeyCallBacks,
             &raw const kCFTypeDictionaryValueCallBacks,
         )
-        .expect("CFDictionaryCreate")
     }
 }
 
@@ -465,6 +494,7 @@ impl VoiceCapture {
         *self._ctx.level.lock().unwrap()
     }
     /// Total IO callbacks seen so far (diagnostic: 0 ⇒ the tap is delivering nothing).
+    #[allow(dead_code)] // diagnostic accessor, kept for debugging the audio tap
     pub fn frames(&self) -> u64 {
         self._ctx.frames.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -626,8 +656,8 @@ unsafe fn discord_process_objects() -> Vec<AudioObjectID> {
         .collect()
 }
 
-/// Stand up a private mono tap of just Discord's processes + an aggregate device
-/// + the level-detecting IO proc. None if Discord has no audio object right now
+/// Stand up a private mono tap of just Discord's processes, an aggregate device,
+/// and the level-detecting IO proc. None if Discord has no audio object right now
 /// or any HAL call fails.
 fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<VoiceCapture> {
     use objc2::rc::Retained;
@@ -663,8 +693,8 @@ fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<V
         let sub_tap: CFRetained<CFDictionary> = cf_dict(&[
             (cfstr(kAudioSubTapUIDKey), tap_uid.as_ref() as &CFType as *const CFType),
             (cfstr(kAudioSubTapDriftCompensationKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
-        ]);
-        let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType]);
+        ])?;
+        let tap_list: CFRetained<CFArray> = cf_array(&[sub_tap.as_ref() as &CFType as *const CFType])?;
         // Distinct aggregate UIDs per variant so two taps can coexist (the diag
         // runs a discord tap + a global tap at once; same UID would collide).
         let kind = if global { "global" } else { "discord" };
@@ -676,7 +706,7 @@ fn start_voice(shared: Shared, objs: &[AudioObjectID], global: bool) -> Option<V
             (cfstr(kAudioAggregateDeviceIsPrivateKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
             (cfstr(kAudioAggregateDeviceIsStackedKey), kCFBooleanTrue.unwrap() as *const _ as *const CFType),
             (cfstr(kAudioAggregateDeviceTapListKey), tap_list.as_ref() as &CFType as *const CFType),
-        ]);
+        ])?;
 
         let mut agg_id: AudioObjectID = 0;
         if AudioHardwareCreateAggregateDevice(&agg_desc, NonNull::from(&mut agg_id)) != 0 || agg_id == 0 {
@@ -770,11 +800,20 @@ pub fn spawn_voice(shared: Shared) {
         let mut built_for: Vec<AudioObjectID> = Vec::new();
         loop {
             let objs = unsafe { discord_process_objects() };
-            let still_valid = !built_for.is_empty() && built_for.iter().any(|o| objs.contains(o));
+            // Valid only if the live tap was built for exactly this object set —
+            // compare as sorted sets so a relaunch (different IDs) rebuilds even
+            // when it happens to overlap the old set.
+            let still_valid = {
+                let mut a = built_for.clone();
+                let mut b = objs.clone();
+                a.sort_unstable();
+                b.sort_unstable();
+                !a.is_empty() && a == b
+            };
             if objs.is_empty() {
                 if cap.take().is_some() {
                     if let Ok(mut s) = shared.lock() {
-                        s.discord.voice_speaking = false;
+                        s.discord.voice_speaking_tap = false;
                     }
                 }
                 built_for.clear();
@@ -783,7 +822,7 @@ pub fn spawn_voice(shared: Shared) {
                 built_for = if cap.is_some() { objs } else { Vec::new() };
                 if cap.is_none() {
                     if let Ok(mut s) = shared.lock() {
-                        s.discord.voice_speaking = false;
+                        s.discord.voice_speaking_tap = false;
                     }
                 }
             }

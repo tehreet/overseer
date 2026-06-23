@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::state::{LyricLine, Lyrics};
 
-const UA: &str = "overseer (https://github.com/local/overseer)";
+const UA: &str = "overseer (https://github.com/tehreet/overseer)";
 const FETCH_BUDGET: Duration = Duration::from_secs(13);
 
 enum Msg {
@@ -124,7 +124,8 @@ pub fn fetch(
                     .map(|l| LyricLine { t: -1.0, text: l.trim().to_string() })
                     .collect();
                 out.note = "plain (no synced found)".into();
-                clear_miss(track_id);
+                // Plain-only: leave the miss logged so the reconcile loop keeps
+                // chasing a synced upgrade (don't clear_miss for plain hits).
                 return out;
             }
         }
@@ -133,7 +134,8 @@ pub fn fetch(
     if let Some(lines) = netease_plain(agent, artist, track) {
         out.lines = lines;
         out.note = "plain · netease".into();
-        clear_miss(track_id);
+        // Plain-only: leave the miss logged so the reconcile loop keeps chasing
+        // a synced upgrade (don't clear_miss for plain hits).
         return out;
     }
 
@@ -258,7 +260,7 @@ fn strip_noise_parens(s: &str) -> String {
                 let inner = &s[start..start + rel];
                 if NOISE.iter().any(|n| inner.to_lowercase().contains(n)) {
                     let skip_to = start + rel + cl.len_utf8();
-                    while chars.peek().map_or(false, |&(j, _)| j < skip_to) {
+                    while chars.peek().is_some_and(|&(j, _)| j < skip_to) {
                         chars.next();
                     }
                     continue; // drop the whole credit/edition group
@@ -347,7 +349,10 @@ fn search_once(
         let rdur = r.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let rartist = r.get("artistName").and_then(|x| x.as_str()).unwrap_or("").to_lowercase();
         let artist_ok = pl.is_empty() || rartist.contains(&pl) || pl.contains(&rartist);
-        let score = (rdur - duration).abs() + if artist_ok { 0.0 } else { 10_000.0 };
+        // Guard duration==0 (reconcile path passes 0.0) so duration only ranks
+        // when known — mirrors the netease_song_id dgap guard.
+        let dgap = if duration > 0.0 { (rdur - duration).abs() } else { 0.0 };
+        let score = dgap + if artist_ok { 0.0 } else { 10_000.0 };
         match &best {
             Some((bscore, _)) if *bscore <= score => {}
             _ => best = Some((score, lines)),
@@ -501,7 +506,11 @@ fn urlencode(s: &str) -> String {
 // log is keyed by `track_id`; `clear_miss` removes a row the moment a later fetch
 // (a new catalog upload, the reconcile pass) finally lands lyrics for it.
 
-const MISS_FILE: &str = "misses.jsonl";
+pub(crate) const MISS_FILE: &str = "misses.jsonl";
+
+/// Serialises read-modify-write access to the miss log so concurrent
+/// reconcile/fetch threads can't clobber each other's edits.
+static MISS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One logged lyrics miss.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -549,6 +558,7 @@ pub fn miss_count() -> usize {
 /// Append a miss row (best-effort). De-dup happens on read, so re-logging the
 /// same track just refreshes its timestamp/retry count.
 pub fn log_miss(artist: &str, track: &str, album: &str, track_id: &str, tried: &str) {
+    let _guard = MISS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(root) = crate::cache::root() else { return };
     let _ = std::fs::create_dir_all(&root);
     // Carry forward the prior retry count if this track was already logged.
@@ -577,6 +587,7 @@ pub fn log_miss(artist: &str, track: &str, album: &str, track_id: &str, tried: &
 /// Drop a track from the miss log — called the instant any source resolves it.
 /// Rewrites the file without that `track_id` (no-op if it wasn't logged).
 pub fn clear_miss(track_id: &str) {
+    let _guard = MISS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = miss_path() else { return };
     let misses = load_misses();
     if !misses.iter().any(|m| m.track_id == track_id) {
@@ -594,6 +605,7 @@ pub fn clear_miss(track_id: &str) {
 /// Bump the retry counter for a track after a reconcile pass re-queries it (kept
 /// even when it's still a miss, so we can back off chronic offenders later).
 pub fn bump_retry(track_id: &str) {
+    let _guard = MISS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = miss_path() else { return };
     let mut misses = load_misses();
     let mut changed = false;

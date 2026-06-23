@@ -71,20 +71,23 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { print("NONE"); exit(0) }
 CFRunLoopRun()
 "#;
 
-/// Cache the script to a temp file once so each poll is just `swift <file>`.
-fn script_path() -> Option<&'static std::path::Path> {
-    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let p = std::env::temp_dir().join("overseer_nowplaying.swift");
-        std::fs::write(&p, SWIFT_SRC).ok().map(|_| p)
-    })
-    .as_deref()
+/// The temp-file path for the helper script, computed deterministically once.
+/// Only the `PathBuf` is memoized — the script is (re)written lazily in `get()`
+/// so a transient write failure or a deleted temp file self-heals on the next poll.
+fn script_path() -> &'static std::path::Path {
+    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| std::env::temp_dir().join("overseer_nowplaying.swift"))
 }
 
 /// Run the helper and parse the current system now-playing. `None` when nothing
 /// is loaded, the helper can't run (no `swift`), or MediaRemote returns nothing.
 pub fn get() -> Option<NowPlaying> {
-    let path = script_path()?;
+    let path = script_path();
+    // Lazily (re)write the helper if it's missing — recovers from a transient
+    // write failure at startup or a temp file that got cleaned up between polls.
+    if !path.exists() {
+        std::fs::write(path, SWIFT_SRC).ok()?;
+    }
     let out = Command::new("swift")
         .arg(path)
         .stdin(Stdio::null())

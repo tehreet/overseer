@@ -3,7 +3,6 @@
 //! Collectors run on background threads; the render loop is decoupled and
 //! frame-paced (up to 120 fps while music is playing so the progress bar and
 //! karaoke lyric wipe move every frame).
-#![allow(dead_code)] // full palette + helpers kept available for tweaking
 
 #[cfg(target_os = "macos")]
 mod audio;
@@ -215,7 +214,7 @@ fn demo_anonymize(st: &mut AppState) {
         ..Default::default()
     };
     // Re-derive art + palette for the new (uncached → gradient) track so accents stay coherent.
-    st.album_art = collectors::sample_album_art(st.music.track_id());
+    st.album_art = std::sync::Arc::new(collectors::sample_album_art(st.music.track_id()));
     let target = theme::theme_from_art(&st.album_art.px);
     st.dynamic_theme.retarget(st.music.track_id(), [target.0, target.1, target.2]);
     st.dynamic_theme.blend_start = now - Duration::from_secs(1);
@@ -357,19 +356,6 @@ fn demo_ticker(shared: Arc<Mutex<AppState>>) {
         let now = Instant::now();
         let mut s = shared.lock().unwrap();
 
-        let base = if s.system.per_core.is_empty() { vec![22.0f32; 10] } else { s.system.per_core.clone() };
-        let cores: Vec<f32> = base
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v + 18.0 * (ph + i as f32 * 0.6).sin()).clamp(0.0, 100.0))
-            .collect();
-        s.cpu_samples.push_back((now, cores));
-        while s.cpu_samples.len() > 16 { s.cpu_samples.pop_front(); }
-
-        let net = (2_400_000.0 * (1.0 + 0.6 * (ph as f64 * 0.8).sin())).max(1000.0) as f32;
-        s.net_samples.push_back((now, net));
-        while s.net_samples.len() > 16 { s.net_samples.pop_front(); }
-
         let gpu = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
         let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
         s.silicon_samples.push_back((now, vec![gpu, 18.4, 58.0, 52.0, 9.2, 3.1, pwr, 41.0, 23.0, 0.2]));
@@ -386,12 +372,6 @@ fn demo_ticker(shared: Arc<Mutex<AppState>>) {
         let procs = s.system.top_procs.clone();
         s.proc_samples.push_back((now, procs));
         while s.proc_samples.len() > 16 { s.proc_samples.pop_front(); }
-
-        s.net_rx_hist.push(down as u64);
-        s.net_tx_hist.push(up as u64);
-        s.mem_hist.push(memp as u64);
-        s.disk_io_hist.push(io as u64);
-        s.disk_free_hist.push(46);
 
         // Loop the track so the progress bar + karaoke wipe run forever.
         let pos = s.music.position();
@@ -414,23 +394,28 @@ fn event_loop<B: ratatui::backend::Backend>(
     shared: &Arc<Mutex<AppState>>,
 ) -> Result<()> {
     loop {
-        // Settle any finished iMessage transition before drawing, then snapshot
-        // pacing info while we hold the lock to draw.
-        let playing;
-        let animating;
-        {
+        // Settle any finished iMessage transition, then take a cheap snapshot of
+        // AppState and RELEASE the lock before drawing (issue #16). render() is the
+        // most expensive work per frame; holding the lock across it makes every
+        // collector and the realtime audio IOProc contend on AppState for the whole
+        // frame, causing micro-stutter. AppState derives Clone and owns only plain,
+        // bounded data (no Arc/Mutex/handles), so a snapshot clone is safe and keeps
+        // the critical section to just settle + clone.
+        let snapshot = {
             let mut s = shared.lock().unwrap();
             settle_msg_anim(&mut s);
             settle_queue_anim(&mut s);
-            let t = s.started.elapsed().as_secs_f64();
-            playing = s.music.playing;
-            // Keep painting at high fps while the QUEUE↔LYRICS width glide or the
-            // KEYBINDS show/hide collapse is live.
-            animating = s.msg_ui.animating()
-                || s.queue_toggle_at.elapsed() < QUEUE_ANIM
-                || s.keybinds_toggle_at.elapsed() < KEYBINDS_ANIM;
-            term.draw(|f| ui::render(f, &s, t))?;
-        }
+            s.clone()
+        };
+
+        let t = snapshot.started.elapsed().as_secs_f64();
+        let playing = snapshot.music.playing;
+        // Keep painting at high fps while the QUEUE↔LYRICS width glide or the
+        // KEYBINDS show/hide collapse is live.
+        let animating = snapshot.msg_ui.animating()
+            || snapshot.queue_toggle_at.elapsed() < QUEUE_ANIM
+            || snapshot.keybinds_toggle_at.elapsed() < KEYBINDS_ANIM;
+        term.draw(|f| ui::render(f, &snapshot, t))?;
 
         // The CPU equalizer interpolates continuously between cached samples, so
         // keep a smooth 60fps baseline; go 120fps with music OR while an iMessage
@@ -450,11 +435,10 @@ fn event_loop<B: ratatui::backend::Backend>(
             }
             if event::poll(remaining)? {
                 if let Event::Key(k) = event::read()? {
-                    if k.kind != KeyEventKind::Release {
-                        if handle_key(shared, k.code, k.modifiers) {
+                    if k.kind != KeyEventKind::Release
+                        && handle_key(shared, k.code, k.modifiers) {
                             return Ok(());
                         }
-                    }
                 }
             }
         }
@@ -550,11 +534,10 @@ fn handle_key(
             KeyCode::Backspace => {
                 s.msg_ui.draft.pop();
             }
-            KeyCode::Char(ch) => {
-                if !mods.contains(KeyModifiers::CONTROL) {
+            KeyCode::Char(ch)
+                if !mods.contains(KeyModifiers::CONTROL) => {
                     s.msg_ui.draft.push(ch);
                 }
-            }
             _ => {}
         }
         return false; // never quit while composing
@@ -879,6 +862,19 @@ fn cells(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// One sample iMessage row: (sender, handle, text, rel_time, rich, unread,
+/// from_me, shortcode).
+type SampleMsgRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    bool,
+    bool,
+    bool,
+);
+
 /// Fills state with representative data so the snapshot looks real. `compose`
 /// opens the iMessage inline reply input so its affordance can be eyeballed.
 fn sample_data(st: &mut AppState, compose: bool) {
@@ -913,19 +909,10 @@ fn sample_data(st: &mut AppState, compose: bool) {
     // Staggered, gently-varying samples (~16 s of history) so the delayed
     // interpolation has real data to read across the whole GRAPH_WINDOW — the
     // snapshot then shows the smooth scrolling curves, not flat lines.
-    let base = st.system.per_core.clone();
     let now = Instant::now();
     for k in (0..16u64).rev() {
         let ts = now.checked_sub(Duration::from_secs(k)).unwrap_or(now);
         let ph = k as f32 * 0.5;
-        let cores: Vec<f32> = base
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v + 18.0 * (ph + i as f32 * 0.6).sin()).clamp(0.0, 100.0))
-            .collect();
-        st.cpu_samples.push_back((ts, cores));
-        let net = (2_400_000.0 * (1.0 + 0.6 * (ph as f64 * 0.8).sin())).max(1000.0) as f32;
-        st.net_samples.push_back((ts, net));
         let gpu = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0);
         let pwr = (55.6 + 30.0 * (ph * 0.6 + 1.0).sin()).clamp(5.0, 120.0);
         st.silicon_samples
@@ -939,23 +926,6 @@ fn sample_data(st: &mut AppState, compose: bool) {
         let gpup = (31.0 + 22.0 * (ph * 0.7).sin()).clamp(0.0, 100.0); // GPU %
         let cpup = (44.0 + 28.0 * (ph * 1.1 + 0.3).sin()).clamp(0.0, 100.0); // CPU %
         st.res_samples.push_back((ts, vec![memp, down, up, io, gpup, cpup]));
-    }
-    for (i, v) in [12, 20, 35, 50, 41, 30, 48, 62, 55, 37].iter().enumerate() {
-        let _ = i;
-        st.cpu_hist.push(*v);
-        st.gpu_hist.push((*v as f64 * 0.6) as u64);
-        st.power_hist.push((*v as f64 * 0.8) as u64);
-    }
-    // Seed the MEM·DISK·NET wave bands (KB/s for net + disk-IO, % for mem/free)
-    // with gently-varying history so visual-verify shows the multi-band wave.
-    for k in 0..64u32 {
-        let ph = k as f32 * 0.28;
-        let wob = |amp: f32, off: f32| (amp * (ph + off).sin().abs()).max(0.0);
-        st.net_rx_hist.push((400.0 + wob(2200.0, 0.0)) as u64);  // KB/s down
-        st.net_tx_hist.push((40.0 + wob(260.0, 1.7)) as u64);    // KB/s up
-        st.disk_io_hist.push((30.0 + wob(9000.0, 0.9)) as u64);  // KB/s disk I/O
-        st.mem_hist.push((62.0 + 6.0 * (ph * 0.7).sin()) as u64); // mem used %
-        st.disk_free_hist.push((39.0 + 2.0 * (ph * 0.5).sin()) as u64); // free %
     }
     st.silicon = SiliconStats {
         fresh: true,
@@ -981,7 +951,6 @@ fn sample_data(st: &mut AppState, compose: bool) {
         today_cache_read: 17_957_000,
         today_cache_write: 3_519_000,
         today_cost: 4.10,
-        month_cost: 47.20,
         today_messages: 342,
         top_model: "Opus".into(),
         sessions_today: 6,
@@ -1055,7 +1024,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
     }
     // Album art: decode the last real dump (so visual-verify exercises the true
     // sampling path on a real cover); fall back to a radial gradient otherwise.
-    st.album_art = collectors::sample_album_art(st.music.track_id());
+    st.album_art = std::sync::Arc::new(collectors::sample_album_art(st.music.track_id()));
     // Drive the dynamic palette off that cover so off-screen verify shows the
     // album-biased accents too. Back-date the fade so the single headless frame
     // renders the cross-fade fully settled rather than mid-glide (#8).
@@ -1147,7 +1116,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
         ]
         .into_iter()
         .enumerate()
-        .map(|(i, (sender, handle, text, rel, rich, unread, from_me, shortcode)): (usize, (&str, &str, &str, &str, bool, bool, bool, bool))| {
+        .map(|(i, (sender, handle, text, rel, rich, unread, from_me, shortcode)): (usize, SampleMsgRow)| {
             let preview = {
                 let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
                 let flat = if flat.chars().count() <= 96 {

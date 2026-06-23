@@ -89,5 +89,14 @@ pub fn clear() -> Vec<String> {
             Err(e) => report.push(format!("{kind}/ — error: {e}")),
         }
     }
+    // The miss log lives at the cache ROOT, not under a kind subdir — clear it too.
+    let miss = root.join(crate::lyrics::MISS_FILE);
+    match std::fs::remove_file(&miss) {
+        Ok(_) => report.push(format!("removed {}", crate::lyrics::MISS_FILE)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            report.push(format!("{} (empty)", crate::lyrics::MISS_FILE))
+        }
+        Err(e) => report.push(format!("{} — error: {e}", crate::lyrics::MISS_FILE)),
+    }
     report
 }

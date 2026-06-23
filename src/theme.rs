@@ -14,6 +14,11 @@ pub const FAINT: Color = Color::Rgb(70, 76, 104);
 /// (and returns to when there's no album art). The lively accents (ACCENT/CYAN/
 /// PINK) are exposed through the `accent()`/`cyan()`/`pink()` accessors below,
 /// which serve a live, album-art-biased, cross-faded value each frame.
+/// An 8-bit RGB triple.
+pub type Rgb = (u8, u8, u8);
+/// The three on-brand accent targets derived from album art: (accent, cyan, pink).
+pub type ArtTheme = (Rgb, Rgb, Rgb);
+
 pub const ACCENT_BASE: (u8, u8, u8) = (157, 124, 255); // violet
 pub const CYAN_BASE: (u8, u8, u8) = (86, 214, 255);
 pub const PINK_BASE: (u8, u8, u8) = (255, 110, 199);
@@ -116,27 +121,6 @@ pub fn blend(a: Color, b: Color, t: f32) -> Color {
 fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     (f(a.0, b.0), f(a.1, b.1), f(a.2, b.2))
-}
-
-/// A smooth horizontal bar using 1/8-cell block glyphs for sub-cell precision.
-pub fn bar(frac: f32, width: usize) -> String {
-    let frac = frac.clamp(0.0, 1.0) as f64;
-    let total_eighths = (frac * width as f64 * 8.0).round() as usize;
-    let full = total_eighths / 8;
-    let rem = total_eighths % 8;
-    let mut s = String::with_capacity(width * 3);
-    for _ in 0..full.min(width) {
-        s.push('█');
-    }
-    let mut drawn = full.min(width);
-    if drawn < width && rem > 0 {
-        s.push([' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'][rem]);
-        drawn += 1;
-    }
-    for _ in drawn..width {
-        s.push('░');
-    }
-    s
 }
 
 /// Vertical block glyph for a 0..1 fill fraction (fills from the bottom).
@@ -310,7 +294,7 @@ fn widest_channel(b: &[(u8, u8, u8)]) -> u8 {
 /// Derive the three on-brand accent targets (accent, cyan, pink) from album-art
 /// pixels. Returns the house defaults when the art is empty or unusable, so the
 /// theme cleanly relaxes back to synthwave between songs / with no cover.
-pub fn theme_from_art(px: &[[u8; 3]]) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u8)) {
+pub fn theme_from_art(px: &[[u8; 3]]) -> ArtTheme {
     if px.is_empty() {
         return (ACCENT_BASE, CYAN_BASE, PINK_BASE);
     }
@@ -325,23 +309,4 @@ pub fn theme_from_art(px: &[[u8; 3]]) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u
     let cyan = brandify(second, CYAN_BASE, 0.45, 0.55, 0.55, 0.82);
     let pink = brandify(lead, PINK_BASE, 0.40, 0.55, 0.60, 0.82);
     (accent, cyan, pink)
-}
-
-/// Braille-ish sparkline using vertical block glyphs.
-pub fn spark(data: &[u64], width: usize) -> String {
-    if data.is_empty() {
-        return " ".repeat(width);
-    }
-    let glyphs = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let slice: Vec<u64> = data.iter().rev().take(width).rev().copied().collect();
-    let max = slice.iter().copied().max().unwrap_or(1).max(1);
-    let mut s = String::new();
-    for _ in slice.len()..width {
-        s.push(' ');
-    }
-    for v in slice {
-        let idx = ((v as f64 / max as f64) * 8.0).round() as usize;
-        s.push(glyphs[idx.min(8)]);
-    }
-    s
 }
