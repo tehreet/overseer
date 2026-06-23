@@ -2125,16 +2125,25 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
                 ));
             }
         } else if ui.draft.is_empty() {
-            // Empty → faint prompt that fades in with the wipe.
-            spans.push(Span::styled(
-                format!("reply to {sender}…"),
-                Style::default()
-                    .fg(c::blend(c::BG, c::FAINT, e))
-                    .add_modifier(Modifier::ITALIC),
+            // Empty → a gently shimmering prompt and NO caret; the cursor only
+            // appears once you're actually typing. The base fades up with the open.
+            spans.extend(shimmer_spans(
+                &format!("reply to {sender}…"),
+                t,
+                0.0,
+                c::blend(c::BG, c::FAINT, e),
+                0.5,
+                0.12,
+                false,
             ));
-            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
         } else {
-            // Live draft, left-truncated so the caret stays visible.
+            // Live draft, left-truncated so the caret stays visible. It fades up
+            // from the placeholder tone (FAINT→TEXT) over ~160ms as you start
+            // typing, so it transitions smoothly out of the shimmering prompt.
+            let appear = ui
+                .typed_at
+                .map(|ta| (ta.elapsed().as_secs_f32() / 0.16).clamp(0.0, 1.0))
+                .unwrap_or(1.0);
             let budget = iw.saturating_sub(indent + 2).max(4);
             let draft = &ui.draft;
             let shown_draft: String = if draft.chars().count() > budget {
@@ -2142,8 +2151,11 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
             } else {
                 draft.clone()
             };
-            spans.push(Span::styled(shown_draft, Style::default().fg(c::blend(c::BG, c::TEXT, e))));
-            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
+            spans.push(Span::styled(
+                shown_draft,
+                Style::default().fg(c::blend(c::FAINT, c::TEXT, appear)),
+            ));
+            spans.push(Span::styled("▏", Style::default().fg(c::blend(c::BG, caret_col, appear))));
         }
         Some(Line::from(spans))
     } else {

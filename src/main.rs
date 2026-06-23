@@ -597,6 +597,10 @@ fn handle_key(
             }
             KeyCode::Char(ch)
                 if !mods.contains(KeyModifiers::CONTROL) => {
+                    // First keystroke after the placeholder → start the fade-in.
+                    if s.msg_ui.draft.is_empty() {
+                        s.msg_ui.typed_at = Some(Instant::now());
+                    }
                     s.msg_ui.draft.push(ch);
                 }
             _ => {}

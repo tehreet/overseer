@@ -510,6 +510,7 @@ pub struct MsgUi {
     pub last_click_chat: Option<i64>, // chat the last click landed on (double-click must match)
     pub composing: bool,              // inline reply input open?
     pub draft: String,                // reply being typed
+    pub typed_at: Option<Instant>,    // when the draft went empty→non-empty (fade the text in)
     pub phase: MsgPhase,              // current transition
     pub anim_start: Option<Instant>,  // when the current transition began
     pub send_failed_at: Option<Instant>, // osascript nonzero → border flash
@@ -542,6 +543,7 @@ impl Default for MsgUi {
             last_click_chat: None,
             composing: false,
             draft: String::new(),
+            typed_at: None,
             phase: MsgPhase::Idle,
             anim_start: None,
             send_failed_at: None,
