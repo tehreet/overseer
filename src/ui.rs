@@ -2066,13 +2066,10 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         .saturating_sub(footer_rows);
     let shown = list_rows.min(msgs.items.len());
 
-    // Record the clickable conversation rows for mouse hit-testing: row i is
-    // drawn at inner.y + i (the list renders as a Paragraph into `inner`).
+    // Clickable x-range of the card; the per-row y's are recorded as the rows are
+    // drawn below, so the threaded composer's row-shift is reflected in the map.
     hit.x0 = inner.x;
     hit.x1 = inner.x.saturating_add(inner.width.saturating_sub(1));
-    for (i, m) in msgs.items.iter().take(shown).enumerate() {
-        hit.rows.push((inner.y + i as u16, m.chat_id));
-    }
 
     // Index (within items) of the focused conversation, for the slide marker —
     // now identity-based (focus_chat_id), so it works for read rows too.
@@ -2083,7 +2080,75 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
     // Reserved column budget: marker(2) + sender(18) + gap(1) + reltime(4) + dot(2).
     let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
 
+    // ----- inline reply composer -----
+    // Built once here, then threaded directly BENEATH the focused conversation in
+    // the row loop, so it reads as a reply nested under that message. It unfurls
+    // in (text fades up from BG over the Opening ease) and the rows below it slide
+    // down to make room — a smooth "pop out below the message" rather than a fixed
+    // box at the bottom of the card.
+    let composer_line: Option<Line> = if composer_open {
+        // Opening eases 0→1; Closing/Sending eases 1→0.
+        let p = match ui.phase {
+            MsgPhase::Opening => ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+            MsgPhase::Closing => 1.0 - ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+            _ => 1.0,
+        };
+        let e = p * p * (3.0 - 2.0 * p); // smoothstep
+        let sender = focus_idx
+            .and_then(|i| msgs.items.get(i))
+            .map(|m| m.sender.clone())
+            .unwrap_or_else(|| "message".into());
+        // Soft blinking caret (~1s sine on alpha), DIM↔TEXT.
+        let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
+        let caret_col = c::blend(c::FAINT, c::TEXT, blink);
+        // Thread connector descending from the focused row's marker.
+        let mut spans = vec![Span::styled(
+            "╰▸ ",
+            Style::default().fg(c::blend(c::BG, c::pink(), e)).add_modifier(Modifier::BOLD),
+        )];
+        if ui.phase == MsgPhase::Sending {
+            // Shimmer the draft away as a send "whoosh".
+            let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
+            let chars: Vec<char> = ui.draft.chars().collect();
+            let n = chars.len().max(1);
+            for (ci, ch) in chars.iter().enumerate() {
+                let cp = ci as f32 / n as f32;
+                let d = (cp - head).abs();
+                let b = (-(d * d) / (2.0 * 0.08 * 0.08)).exp();
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(c::blend(c::TEXT, c::jazz(0.88), b)),
+                ));
+            }
+        } else if ui.draft.is_empty() {
+            // Empty → faint prompt that fades in with the wipe.
+            spans.push(Span::styled(
+                format!("reply to {sender}…"),
+                Style::default()
+                    .fg(c::blend(c::BG, c::FAINT, e))
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
+        } else {
+            // Live draft, left-truncated so the caret stays visible.
+            let budget = iw.saturating_sub(3 + 2).max(4);
+            let draft = &ui.draft;
+            let shown_draft: String = if draft.chars().count() > budget {
+                draft.chars().skip(draft.chars().count() - budget).collect()
+            } else {
+                draft.clone()
+            };
+            spans.push(Span::styled(shown_draft, Style::default().fg(c::blend(c::BG, c::TEXT, e))));
+            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
+        }
+        Some(Line::from(spans))
+    } else {
+        None
+    };
+
     let mut lines: Vec<Line> = Vec::with_capacity(ih);
+    let mut drawn = 0usize; // lines emitted so far (drives hit-test y + the insert)
+    let mut composer_placed = composer_line.is_none();
     for (i, m) in msgs.items.iter().take(shown).enumerate() {
         let is_focus = Some(i) == focus_idx;
         // Read/unread tone, crossfading on Advance for the focused row.
@@ -2136,74 +2201,33 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         }
         row_spans.push(Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)));
         row_spans.push(dot);
+        hit.rows.push((inner.y + drawn as u16, m.chat_id));
         lines.push(Line::from(row_spans));
+        drawn += 1;
+        // Thread the reply composer directly beneath the focused conversation.
+        if Some(i) == focus_idx && !composer_placed {
+            if let Some(cl) = composer_line.clone() {
+                lines.push(cl);
+                drawn += 1;
+            }
+            composer_placed = true;
+        }
+    }
+
+    // Fallback: if the focused row wasn't visible, append the composer at the end.
+    if !composer_placed {
+        if let Some(cl) = composer_line {
+            lines.push(cl);
+        }
     }
 
     // ----- separator + keybind hint (only while focused) -----
     if want_footer {
         lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
         lines.push(Line::from(Span::styled(
-            "  m: read · mm: reply",
+            "  click: focus · dbl-click: reply · esc: close",
             Style::default().fg(c::FAINT),
         )));
-    }
-
-    // ----- inline reply composer (vertical-wipe open / close) -----
-    if composer_open {
-        // Wipe progress: Opening eases 0→1; Closing/Sending eases 1→0.
-        let p = match ui.phase {
-            MsgPhase::Opening => ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
-            MsgPhase::Closing => 1.0 - ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
-            _ => 1.0,
-        };
-        let e = p * p * (3.0 - 2.0 * p); // smoothstep
-        let sender = focus_idx
-            .and_then(|i| msgs.items.get(i))
-            .map(|m| m.sender.clone())
-            .unwrap_or_else(|| "message".into());
-
-        // Blinking caret: sine on alpha (~1s period), DIM↔TEXT — soft, not hard.
-        let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
-        let caret_col = c::blend(c::FAINT, c::TEXT, blink);
-
-        let prompt_alpha = e; // text fades in with the wipe
-        let mut spans = vec![
-            Span::styled("↳ ", Style::default().fg(c::blend(c::BG, c::pink(), e))),
-            Span::styled(
-                format!("reply to {sender}  "),
-                Style::default().fg(c::blend(c::BG, c::DIM, prompt_alpha)),
-            ),
-        ];
-        if ui.phase == MsgPhase::Sending {
-            // Shimmer the draft away as a send "whoosh".
-            spans = vec![Span::styled("↳ ", Style::default().fg(c::pink()))];
-            let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
-            let chars: Vec<char> = ui.draft.chars().collect();
-            let n = chars.len().max(1);
-            for (ci, ch) in chars.iter().enumerate() {
-                let cp = ci as f32 / n as f32;
-                let d = (cp - head).abs();
-                let b = (-(d * d) / (2.0 * 0.08 * 0.08)).exp();
-                let col = c::blend(c::TEXT, c::jazz(0.88), b);
-                spans.push(Span::styled(ch.to_string(), Style::default().fg(col)));
-            }
-        } else {
-            // Live draft, left-truncated so the caret stays visible.
-            let budget = iw.saturating_sub(2 + 9 + sender.chars().count() + 3).max(4);
-            let draft = &ui.draft;
-            let shown_draft: String = if draft.chars().count() > budget {
-                let skip = draft.chars().count() - budget;
-                draft.chars().skip(skip).collect()
-            } else {
-                draft.clone()
-            };
-            spans.push(Span::styled(
-                shown_draft,
-                Style::default().fg(c::blend(c::BG, c::TEXT, prompt_alpha)),
-            ));
-            spans.push(Span::styled("▏", Style::default().fg(caret_col)));
-        }
-        lines.push(Line::from(spans));
     }
 
     f.render_widget(Paragraph::new(lines), inner);

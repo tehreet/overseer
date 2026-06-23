@@ -1361,8 +1361,11 @@ fn sample_data(st: &mut AppState, compose: bool) {
             ]),
         ],
     };
-    // `--compose` previews the inline reply input affordance.
+    // `--compose` previews the inline reply composer threaded under the focused
+    // conversation (the top one here).
     if compose {
+        st.msg_ui.active = true;
+        st.msg_ui.focus_chat_id = st.messages.items.first().map(|m| m.chat_id);
         st.msg_ui.composing = true;
         st.msg_ui.draft = "on my way".into();
         st.msg_ui.phase = state::MsgPhase::Opening;
