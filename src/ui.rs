@@ -2058,13 +2058,11 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
     // message rows above it never reflow. Reserve 1 row while opening/open.
     let composer_open = ui.composing || ui.phase == MsgPhase::Opening;
     let composer_rows = if composer_open { 1usize } else { 0 };
-    // One row for the separator + keybind hint, only while focused and with room.
-    let want_footer = ui.active && ih > msgs.items.len() + composer_rows + 1;
-    let footer_rows = if want_footer { 2 } else { 0 };
-    let list_rows = ih
-        .saturating_sub(composer_rows)
-        .saturating_sub(footer_rows);
+    let list_rows = ih.saturating_sub(composer_rows);
     let shown = list_rows.min(msgs.items.len());
+
+    // A reply just sent → shimmer that conversation as a sent confirmation.
+    let glow = ui.sent_glow_at.filter(|g| g.elapsed() < crate::state::SENT_GLOW);
 
     // Clickable x-range of the card; the per-row y's are recorded as the rows are
     // drawn below, so the threaded composer's row-shift is reflected in the map.
@@ -2101,11 +2099,17 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         // Soft blinking caret (~1s sine on alpha), DIM↔TEXT.
         let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
         let caret_col = c::blend(c::FAINT, c::TEXT, blink);
-        // Thread connector descending from the focused row's marker.
-        let mut spans = vec![Span::styled(
-            "╰▸ ",
-            Style::default().fg(c::blend(c::BG, c::pink(), e)).add_modifier(Modifier::BOLD),
-        )];
+        // Indent the composer so the reply lines up under the message-text column
+        // (marker 2 + sender 18 + gap 1), with a small connector just before it —
+        // so what you type starts right below the message, not at the far left.
+        let indent = 2 + 18 + 1; // preview column
+        let mut spans = vec![
+            Span::raw(" ".repeat(indent - 2)),
+            Span::styled(
+                "↳ ",
+                Style::default().fg(c::blend(c::BG, c::pink(), e)).add_modifier(Modifier::BOLD),
+            ),
+        ];
         if ui.phase == MsgPhase::Sending {
             // Shimmer the draft away as a send "whoosh".
             let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
@@ -2131,7 +2135,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
             spans.push(Span::styled("▏", Style::default().fg(caret_col)));
         } else {
             // Live draft, left-truncated so the caret stays visible.
-            let budget = iw.saturating_sub(3 + 2).max(4);
+            let budget = iw.saturating_sub(indent + 2).max(4);
             let draft = &ui.draft;
             let shown_draft: String = if draft.chars().count() > budget {
                 draft.chars().skip(draft.chars().count() - budget).collect()
@@ -2157,7 +2161,14 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         } else {
             0.0
         };
-        let (sender_col, prev_col, marker_col, dot_col) = if m.unread {
+        // The conversation being replied to (while composing) or just sent gets a
+        // travelling sheen; the rest recede toward the background so the active
+        // thread stands out.
+        let glow_this = glow.is_some() && ui.sent_chat_id == Some(m.chat_id);
+        let highlight = (composer_open && is_focus) || glow_this;
+        let dimmed = composer_open && !is_focus && !glow_this;
+
+        let (mut sender_col, mut prev_col, mut marker_col, mut dot_col) = if m.unread {
             // unread → (read) as adv goes 0→1
             (
                 c::blend(c::TEXT, c::DIM, adv),
@@ -2168,6 +2179,16 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         } else {
             (c::DIM, c::FAINT, c::FAINT, c::FAINT)
         };
+        if dimmed {
+            sender_col = c::blend(sender_col, c::BG, 0.55);
+            prev_col = c::blend(prev_col, c::BG, 0.55);
+            marker_col = c::blend(marker_col, c::BG, 0.55);
+            dot_col = c::blend(dot_col, c::BG, 0.55);
+        }
+        if highlight {
+            sender_col = c::TEXT;
+            marker_col = c::pink();
+        }
 
         // Focus marker (the only moving element); reserved width 2.
         let marker = if is_focus {
@@ -2176,7 +2197,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
             Span::raw("  ")
         };
         let sender = pad_width(&m.sender, 18);
-        let sender_style = if m.unread && adv < 0.5 {
+        let sender_style = if (m.unread && adv < 0.5) || highlight {
             Style::default().fg(sender_col).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(sender_col)
@@ -2188,7 +2209,10 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
             Span::raw("  ")
         };
         let mut row_spans: Vec<Span> = vec![marker, Span::styled(sender, sender_style), Span::raw(" ")];
-        if m.is_rich && m.unread {
+        if highlight {
+            // Replying-to / just-sent: gentle travelling sheen on the message.
+            row_spans.extend(shimmer_spans(&preview, t, i as f32, c::pink(), 0.5, 0.10, false));
+        } else if m.is_rich && m.unread {
             // A *new* picture/video preview ("[rich message]") gets a gentle
             // travelling sheen so it reads as special, settling to faint as the
             // row is marked read (adv 0→1). Once read it's plain, like before.
@@ -2219,15 +2243,6 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         if let Some(cl) = composer_line {
             lines.push(cl);
         }
-    }
-
-    // ----- separator + keybind hint (only while focused) -----
-    if want_footer {
-        lines.push(Line::from(Span::styled("─".repeat(iw), Style::default().fg(c::FAINT))));
-        lines.push(Line::from(Span::styled(
-            "  click: focus · dbl-click: reply · esc: close",
-            Style::default().fg(c::FAINT),
-        )));
     }
 
     f.render_widget(Paragraph::new(lines), inner);

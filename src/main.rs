@@ -551,7 +551,25 @@ fn handle_key(
                 if !draft.is_empty() {
                     // Target = the focused conversation, by chat GUID.
                     if let Some(guid) = focused_guid(&s) {
-                        collectors::send_imessage(shared.clone(), guid, draft);
+                        collectors::send_imessage(shared.clone(), guid, draft.clone());
+                        // Optimistic local echo: show the reply as that
+                        // conversation's latest message right away (the next
+                        // chat.db poll, ~1s, confirms it with the real row), and
+                        // mark it to shimmer for a few seconds as a sent glow.
+                        if let Some(id) = s.msg_ui.focus_chat_id {
+                            if let Some(m) =
+                                s.messages.items.iter_mut().find(|m| m.chat_id == id)
+                            {
+                                m.preview = format!("You: {draft}");
+                                m.full_text = draft;
+                                m.from_me = true;
+                                m.unread = false;
+                                m.is_rich = false;
+                                m.rel = "now".into();
+                            }
+                            s.msg_ui.sent_chat_id = Some(id);
+                            s.msg_ui.sent_glow_at = Some(Instant::now());
+                        }
                         // Optimistic "whoosh" close; an async failure reopens the
                         // composer with the draft restored and flashes the border.
                         s.msg_ui.phase = MsgPhase::Sending;

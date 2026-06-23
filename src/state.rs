@@ -513,7 +513,12 @@ pub struct MsgUi {
     pub phase: MsgPhase,              // current transition
     pub anim_start: Option<Instant>,  // when the current transition began
     pub send_failed_at: Option<Instant>, // osascript nonzero → border flash
+    pub sent_glow_at: Option<Instant>, // a reply just sent → shimmer it for a few seconds
+    pub sent_chat_id: Option<i64>,    // which conversation the glow belongs to
 }
+
+/// How long a just-sent message keeps its confirmation shimmer.
+pub const SENT_GLOW: Duration = Duration::from_secs(3);
 
 impl Default for MsgUi {
     fn default() -> Self {
@@ -528,6 +533,8 @@ impl Default for MsgUi {
             phase: MsgPhase::Idle,
             anim_start: None,
             send_failed_at: None,
+            sent_glow_at: None,
+            sent_chat_id: None,
         }
     }
 }
@@ -544,6 +551,7 @@ impl MsgUi {
         self.composing
             || self.phase != MsgPhase::Idle
             || self.send_failed_at.is_some()
+            || self.sent_glow_at.is_some_and(|g| g.elapsed() < SENT_GLOW)
     }
 }
 
