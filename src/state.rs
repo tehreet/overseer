@@ -515,10 +515,22 @@ pub struct MsgUi {
     pub send_failed_at: Option<Instant>, // osascript nonzero → border flash
     pub sent_glow_at: Option<Instant>, // a reply just sent → shimmer it for a few seconds
     pub sent_chat_id: Option<i64>,    // which conversation the glow belongs to
+    pub pending_echo: Option<PendingEcho>, // sticky optimistic echo until the poll confirms
 }
 
 /// How long a just-sent message keeps its confirmation shimmer.
 pub const SENT_GLOW: Duration = Duration::from_secs(3);
+
+/// An optimistically-echoed reply, held until the real row lands in chat.db so
+/// the poll that runs between send and confirmation can't flicker the preview
+/// back to the previous message. [[messages-optimistic-echo]]
+#[derive(Clone)]
+pub struct PendingEcho {
+    pub chat_id: i64,
+    pub preview: String,   // "You: …" — the conversation's new latest line
+    pub full_text: String, // raw sent text, used to detect when the real row arrives
+    pub at: Instant,       // when sent, for a give-up cap on a never-landing send
+}
 
 impl Default for MsgUi {
     fn default() -> Self {
@@ -535,6 +547,7 @@ impl Default for MsgUi {
             send_failed_at: None,
             sent_glow_at: None,
             sent_chat_id: None,
+            pending_echo: None,
         }
     }
 }

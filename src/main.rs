@@ -553,20 +553,28 @@ fn handle_key(
                     if let Some(guid) = focused_guid(&s) {
                         collectors::send_imessage(shared.clone(), guid, draft.clone());
                         // Optimistic local echo: show the reply as that
-                        // conversation's latest message right away (the next
-                        // chat.db poll, ~1s, confirms it with the real row), and
-                        // mark it to shimmer for a few seconds as a sent glow.
+                        // conversation's latest message right away, and keep it
+                        // sticky (pending_echo) so the next chat.db poll can't
+                        // flicker it back before the real row lands. Also mark it
+                        // to shimmer for a few seconds as a sent glow.
                         if let Some(id) = s.msg_ui.focus_chat_id {
+                            let preview = format!("You: {draft}");
                             if let Some(m) =
                                 s.messages.items.iter_mut().find(|m| m.chat_id == id)
                             {
-                                m.preview = format!("You: {draft}");
-                                m.full_text = draft;
+                                m.preview = preview.clone();
+                                m.full_text = draft.clone();
                                 m.from_me = true;
                                 m.unread = false;
                                 m.is_rich = false;
                                 m.rel = "now".into();
                             }
+                            s.msg_ui.pending_echo = Some(state::PendingEcho {
+                                chat_id: id,
+                                preview,
+                                full_text: draft,
+                                at: Instant::now(),
+                            });
                             s.msg_ui.sent_chat_id = Some(id);
                             s.msg_ui.sent_glow_at = Some(Instant::now());
                         }

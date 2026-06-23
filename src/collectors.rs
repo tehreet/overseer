@@ -2834,6 +2834,7 @@ pub fn spawn_messages(shared: Shared) {
                     // Focus is identity-based (focus_chat_id), so it survives row
                     // reordering automatically and resolves to None if the focused
                     // conversation drops out of the window — no index to clamp.
+                    apply_pending_echo(&mut s);
                 }
                 None => {
                     let mut s = shared.lock().unwrap();
@@ -3313,6 +3314,8 @@ pub fn send_imessage(shared: Shared, guid: String, body: String) {
         if !ok {
             if let Ok(mut s) = shared.lock() {
                 s.msg_ui.send_failed_at = Some(Instant::now());
+                // Drop the optimistic echo — the message didn't actually go out.
+                s.msg_ui.pending_echo = None;
                 // Restore the draft so the user can retry — but don't clobber a
                 // new compose they may already have started in the meantime.
                 if !s.msg_ui.composing {
@@ -3324,6 +3327,34 @@ pub fn send_imessage(shared: Shared, guid: String, body: String) {
             }
         }
     });
+}
+
+/// Keep a just-sent reply showing as its conversation's latest message until the
+/// real row lands in chat.db, so a poll between send and confirmation can't
+/// flicker the preview back to the previous message. Self-clears once the real
+/// outbound row appears, or after a give-up cap (e.g. a send that never lands).
+fn apply_pending_echo(s: &mut AppState) {
+    let Some(echo) = s.msg_ui.pending_echo.clone() else { return };
+    if echo.at.elapsed() > Duration::from_secs(10) {
+        s.msg_ui.pending_echo = None;
+        return;
+    }
+    let Some(m) = s.messages.items.iter_mut().find(|m| m.chat_id == echo.chat_id) else {
+        return; // conversation not in the current window; let the cap expire it
+    };
+    if m.from_me && m.full_text == echo.full_text {
+        s.msg_ui.pending_echo = None; // real send landed — stop forcing the echo
+    } else {
+        if m.unread {
+            s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
+        }
+        m.preview = echo.preview.clone();
+        m.full_text = echo.full_text.clone();
+        m.from_me = true;
+        m.unread = false;
+        m.is_rich = false;
+        m.rel = "now".into();
+    }
 }
 
 /// Mark every unread inbound message in one conversation read, persisting to
