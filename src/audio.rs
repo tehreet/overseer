@@ -793,15 +793,13 @@ pub fn spawn_voice(shared: Shared) {
     // Discord-scoped process tap of the call audio → lights the DISCORD border
     // while the remote side is talking. The bot-gateway "Speaking" events this used
     // to ride are now walled off by Discord's mandatory DAVE/E2EE (voice close
-    // 4017), so the local tap is the only signal left. Verified via
-    // --diag-discord-audio that it captures speech even when Discord is routed
-    // through WaveLink's virtual HAL device (tap peaks ~0.26 on speech, ~0 when
-    // quiet), so it runs by default. Set OVERSEER_DISCORD_AUDIO=0 to disable it on
-    // a rig where the per-process tap misbehaves.
-    let disabled = std::env::var("OVERSEER_DISCORD_AUDIO")
-        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
-        .unwrap_or(false);
-    if disabled {
+    // 4017), and the local tap captures the call audio even through WaveLink
+    // (verified via --diag-discord-audio). BUT: on a WaveLink rig, standing up this
+    // second process-tap + private aggregate device alongside the always-on
+    // spectrum tap disrupts CoreAudio routing — other apps (Chrome, Apple Music)
+    // lose output while Discord keeps working. So keep it OPT-IN until that
+    // interaction is understood: set OVERSEER_DISCORD_AUDIO=1 to enable.
+    if std::env::var("OVERSEER_DISCORD_AUDIO").map(|v| v.trim().is_empty()).unwrap_or(true) {
         return;
     }
     std::thread::spawn(move || {
