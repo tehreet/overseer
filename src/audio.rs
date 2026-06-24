@@ -466,8 +466,10 @@ fn cf_dict(pairs: &[(CFRetained<CFString>, *const CFType)]) -> Option<CFRetained
 /// RMS above this (≈ -52 dB) counts as "audio is flowing" → talking.
 const VOICE_THRESH: f32 = 0.0025;
 /// Hold the shimmer this long after the audio falls quiet, so the gaps between
-/// words/sentences don't strobe the border off and on.
-const VOICE_HANG_MS: u64 = 300;
+/// words/sentences don't strobe the border off and on. Long enough to bridge a
+/// breath mid-sentence; short enough that the border settles soon after the call
+/// goes quiet.
+const VOICE_HANG_MS: u64 = 800;
 
 /// Realtime state for the Discord tap: a smoothed level + the current speaking
 /// latch + when it was last loud (for the hang-off).
@@ -788,11 +790,18 @@ pub fn diag_voice() {
 /// clear the speaking flag when Discord goes away. Cheap 2 s poll; the tap itself
 /// does the realtime work.
 pub fn spawn_voice(shared: Shared) {
-    // Opt-in: on this rig Discord's audio is laundered through WaveLink's HAL
-    // driver, so its per-process tap is silent and this can never fire (see
-    // --diag-discord-audio). It DOES work on a standard audio chain where Discord
-    // outputs directly to a real/aggregate device, so it's available behind a flag.
-    if std::env::var("OVERSEER_DISCORD_AUDIO").map(|v| v.trim().is_empty()).unwrap_or(true) {
+    // Discord-scoped process tap of the call audio → lights the DISCORD border
+    // while the remote side is talking. The bot-gateway "Speaking" events this used
+    // to ride are now walled off by Discord's mandatory DAVE/E2EE (voice close
+    // 4017), so the local tap is the only signal left. Verified via
+    // --diag-discord-audio that it captures speech even when Discord is routed
+    // through WaveLink's virtual HAL device (tap peaks ~0.26 on speech, ~0 when
+    // quiet), so it runs by default. Set OVERSEER_DISCORD_AUDIO=0 to disable it on
+    // a rig where the per-process tap misbehaves.
+    let disabled = std::env::var("OVERSEER_DISCORD_AUDIO")
+        .map(|v| matches!(v.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(false);
+    if disabled {
         return;
     }
     std::thread::spawn(move || {
