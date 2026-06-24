@@ -1273,20 +1273,10 @@ fn queue_panel(f: &mut Frame, area: Rect, s: &AppState) {
     let q = &s.queue;
     let m = &s.music;
 
-    // Title with an on-palette count badge — same custom-span construction the
-    // discord card uses, so the queued-track "3" reads as cyan (not off-palette).
-    let mut title_spans = vec![Span::styled(
+    let title_spans = vec![Span::styled(
         " QUEUE  ",
         Style::default().fg(c::accent()).add_modifier(Modifier::BOLD),
     )];
-    let queued = q.items.len();
-    if m.running && !m.track.is_empty() && queued > 0 {
-        title_spans.push(Span::styled(
-            format!("{queued}"),
-            Style::default().fg(c::cyan()).add_modifier(Modifier::BOLD),
-        ));
-        title_spans.push(Span::styled(" up next ", Style::default().fg(c::DIM)));
-    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
