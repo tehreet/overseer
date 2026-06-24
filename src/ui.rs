@@ -206,9 +206,16 @@ fn left_card_heights(avail: u16, s: &AppState) -> [u16; 8] {
     // iMessage, Signal, Discord. [7] slack. (CPU and mac-doctor no longer own cards —
     // CPU folds into RESOURCES, doctor folds into ROBOTS.)
     let mut h = [16u16, 9, 10, 7, 0, 0, 0, 0];
+    // Reserve the inline-composer row ONLY while it's actually open, so a focused
+    // card with the composer closed hugs its rows (no empty footer slack). Matches
+    // each panel's own `composer_open`, so reserved height == drawn height exactly.
+    use crate::state::{MsgCard, MsgPhase};
+    let composer_open = |card: MsgCard| {
+        s.msg_ui.active_card == card && (s.msg_ui.composing || s.msg_ui.phase == MsgPhase::Opening)
+    };
     let want = [
-        card_height(&s.messages, s.msg_ui.active),
-        card_height(&s.signal, false),
+        card_height(&s.messages, composer_open(MsgCard::IMessage)),
+        card_height(&s.signal, s.signal.can_send && composer_open(MsgCard::Signal)),
         discord_height(&s.discord),
     ];
     for (i, &w) in want.iter().enumerate() {
@@ -281,8 +288,19 @@ impl MsgHit {
     }
 }
 
-pub fn render(f: &mut Frame, s: &AppState, t: f64, hit: &mut MsgHit) {
-    hit.clear();
+/// Clickable rows for both text cards captured each frame — iMESSAGE and SIGNAL
+/// each get their own map so a click can be routed to the right card (and its
+/// `MsgCard`). The event loop holds only the render snapshot, so these ride out
+/// here rather than being read back from shared state.
+#[derive(Default)]
+pub struct Hits {
+    pub msg: MsgHit,
+    pub sig: MsgHit,
+}
+
+pub fn render(f: &mut Frame, s: &AppState, t: f64, hits: &mut Hits) {
+    hits.msg.clear();
+    hits.sig.clear();
     // Push this frame's cross-faded, album-biased accents into the live palette
     // store up front so every card below reads a coherent, glided value (#8).
     c::apply_dynamic(&s.dynamic_theme);
@@ -317,8 +335,8 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64, hit: &mut MsgHit) {
     proc_panel(f, left[1], s);
     robots_panel(f, left[2], s, t);
     weather_panel(f, left[3], s);
-    messages_panel(f, left[4], s, t, hit);
-    signal_panel(f, left[5], s, t);
+    messages_panel(f, left[4], s, t, &mut hits.msg);
+    signal_panel(f, left[5], s, t, &mut hits.sig);
     discord_panel(f, left[6], s, t);
 
     // Until the first music poll lands, show the (neutral) lyrics panel so we
@@ -1922,15 +1940,16 @@ fn night_icon(icon: &str, sunrise: &str, sunset: &str) -> String {
 }
 
 /// Exact rows a message card needs for its content (incl. borders) so the layout
-/// can size it tight — no trailing gap below the last conversation. `active` adds
-/// the focused iMESSAGE footer (separator + keybind hint).
-fn card_height(m: &crate::state::Messages, active: bool) -> u16 {
+/// can size it tight — no trailing gap below the last conversation. `composer_open`
+/// adds the single row the inline reply composer threads in; when it's closed the
+/// card hugs its rows (a focused-but-idle card shows no empty footer slack).
+fn card_height(m: &crate::state::Messages, composer_open: bool) -> u16 {
     if !m.fresh || !m.available {
         return 4; // graceful gate message (1-2 lines + borders)
     }
     let n = m.items.len().clamp(1, 5) as u16;
-    let footer = if active { 2 } else { 0 };
-    2 + n + footer
+    let composer = if composer_open { 1 } else { 0 };
+    2 + n + composer
 }
 
 /// Shared unread/all-read title badge for the iMESSAGE and SIGNAL cards so the
@@ -1955,20 +1974,103 @@ fn unread_badge(unread_count: u32, dot: ratatui::style::Color) -> Vec<Span<'stat
     }
 }
 
+/// The inline reply composer line, threaded directly beneath the focused
+/// conversation, shared by the iMESSAGE and SIGNAL cards so both feel identical.
+/// It unfurls in (text fades up from BG over the Opening ease), shimmers the draft
+/// away on send, and shows a gently shimmering prompt (no caret) when empty. None
+/// when the composer is closed. `iw` is the card's inner width; `sender` is the
+/// focused conversation's name (for the "reply to …" prompt).
+fn compose_line(ui: &crate::state::MsgUi, sender: &str, t: f64, iw: usize) -> Option<Line<'static>> {
+    use crate::state::MsgPhase;
+    if !(ui.composing || ui.phase == MsgPhase::Opening) {
+        return None;
+    }
+    // Opening eases 0→1; Closing eases 1→0.
+    let p = match ui.phase {
+        MsgPhase::Opening => ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+        MsgPhase::Closing => 1.0 - ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
+        _ => 1.0,
+    };
+    let e = p * p * (3.0 - 2.0 * p); // smoothstep
+    // Soft blinking caret (~1s sine on alpha), DIM↔TEXT.
+    let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
+    let caret_col = c::blend(c::FAINT, c::TEXT, blink);
+    // Indent so the reply lines up under the message-text column (marker 2 +
+    // sender 18 + gap 1), with a small connector just before it.
+    let indent = 2 + 18 + 1; // preview column
+    let mut spans = vec![
+        Span::raw(" ".repeat(indent - 2)),
+        Span::styled(
+            "↳ ",
+            Style::default().fg(c::blend(c::BG, c::pink(), e)).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if ui.phase == MsgPhase::Sending {
+        // Shimmer the draft away as a send "whoosh".
+        let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
+        let chars: Vec<char> = ui.draft.chars().collect();
+        let n = chars.len().max(1);
+        for (ci, ch) in chars.iter().enumerate() {
+            let cp = ci as f32 / n as f32;
+            let d = (cp - head).abs();
+            let b = (-(d * d) / (2.0 * 0.08 * 0.08)).exp();
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(c::blend(c::TEXT, c::jazz(0.88), b)),
+            ));
+        }
+    } else if ui.draft.is_empty() {
+        // Empty → a gently shimmering prompt and NO caret; the cursor only appears
+        // once you're actually typing. The base fades up with the open.
+        spans.extend(shimmer_spans(
+            &format!("reply to {sender}…"),
+            t,
+            0.0,
+            c::blend(c::BG, c::FAINT, e),
+            0.5,
+            0.12,
+            false,
+        ));
+    } else {
+        // Live draft, left-truncated so the caret stays visible. It fades up from
+        // the placeholder tone (FAINT→TEXT) over ~160ms as you start typing.
+        let appear = ui
+            .typed_at
+            .map(|ta| (ta.elapsed().as_secs_f32() / 0.16).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        let budget = iw.saturating_sub(indent + 2).max(4);
+        let draft = &ui.draft;
+        let shown_draft: String = if draft.chars().count() > budget {
+            draft.chars().skip(draft.chars().count() - budget).collect()
+        } else {
+            draft.clone()
+        };
+        spans.push(Span::styled(
+            shown_draft,
+            Style::default().fg(c::blend(c::FAINT, c::TEXT, appear)),
+        ));
+        spans.push(Span::styled("▏", Style::default().fg(c::blend(c::BG, caret_col, appear))));
+    }
+    Some(Line::from(spans))
+}
+
 /// iMESSAGE card: unread badge in the title, a list of recent inbound messages
 /// (focus marker · sender · preview · rel-time · unread dot), and an inline reply
 /// input that wipes open on a double-press. All motion is interpolated each
 /// frame off `s.msg_ui.anim_start` — never a discrete flip.
 fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut MsgHit) {
-    use crate::state::MsgPhase;
+    use crate::state::{MsgCard, MsgPhase};
     let msgs = &s.messages;
     let ui = &s.msg_ui;
+    // This card only owns the shared composer/focus/animation state while it's the
+    // active card; when SIGNAL is focused, iMESSAGE renders as a plain list.
+    let here = ui.active_card == MsgCard::IMessage;
 
     // ----- title with unread badge / all-read tick -----
     let border = c::PANEL_BORDER_HOT;
     // Settle: pink "● n unread" crossfades to green "✓ all read" over 300ms.
     let badge_blend = match ui.phase {
-        MsgPhase::Advancing if msgs.unread_count == 0 => {
+        MsgPhase::Advancing if here && msgs.unread_count == 0 => {
             ui.progress(Duration::from_millis(300)).unwrap_or(1.0)
         }
         _ => {
@@ -1988,8 +2090,8 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
         title_spans.extend(unread_badge(msgs.unread_count, dot));
     }
 
-    // Failure flash: border pulses red, fade in 120ms / out 240ms.
-    let border = if let Some(fa) = ui.send_failed_at {
+    // Failure flash: border pulses red, fade in 120ms / out 240ms (this card only).
+    let border = if let Some(fa) = ui.send_failed_at.filter(|_| here) {
         let e = fa.elapsed().as_secs_f32();
         let amp = if e < 0.12 {
             e / 0.12
@@ -2012,7 +2114,7 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
     f.render_widget(block, area);
     // Unread → shimmer the border until you've actually checked iMessage (but not
     // while the brief red send-fail flash is playing).
-    let flashing = ui.send_failed_at.is_some_and(|fa| fa.elapsed().as_secs_f32() < 0.36);
+    let flashing = here && ui.send_failed_at.is_some_and(|fa| fa.elapsed().as_secs_f32() < 0.36);
     if msgs.available && msgs.unread_count > 0 && !flashing {
         shimmer_border(f, area, t, 0.55, 0.0);
     }
@@ -2056,13 +2158,13 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
 
     // The composer (when open) consumes the card's reserved bottom slack so the
     // message rows above it never reflow. Reserve 1 row while opening/open.
-    let composer_open = ui.composing || ui.phase == MsgPhase::Opening;
+    let composer_open = here && (ui.composing || ui.phase == MsgPhase::Opening);
     let composer_rows = if composer_open { 1usize } else { 0 };
     let list_rows = ih.saturating_sub(composer_rows);
     let shown = list_rows.min(msgs.items.len());
 
     // A reply just sent → shimmer that conversation as a sent confirmation.
-    let glow = ui.sent_glow_at.filter(|g| g.elapsed() < crate::state::SENT_GLOW);
+    let glow = ui.sent_glow_at.filter(|_| here).filter(|g| g.elapsed() < crate::state::SENT_GLOW);
 
     // Clickable x-range of the card; the per-row y's are recorded as the rows are
     // drawn below, so the threaded composer's row-shift is reflected in the map.
@@ -2071,93 +2173,27 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
 
     // Index (within items) of the focused conversation, for the slide marker —
     // now identity-based (focus_chat_id), so it works for read rows too.
-    let focus_idx = ui
-        .focus_chat_id
-        .and_then(|id| msgs.items.iter().position(|m| m.chat_id == id));
+    let focus_idx = if here {
+        ui.focus_chat_id
+            .and_then(|id| msgs.items.iter().position(|m| m.chat_id == id))
+    } else {
+        None
+    };
 
     // Reserved column budget: marker(2) + sender(18) + gap(1) + reltime(4) + dot(2).
     let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
 
     // ----- inline reply composer -----
-    // Built once here, then threaded directly BENEATH the focused conversation in
-    // the row loop, so it reads as a reply nested under that message. It unfurls
-    // in (text fades up from BG over the Opening ease) and the rows below it slide
-    // down to make room — a smooth "pop out below the message" rather than a fixed
-    // box at the bottom of the card.
+    // Built once here (shared with the SIGNAL card via `compose_line`), then
+    // threaded directly BENEATH the focused conversation in the row loop, so it
+    // reads as a reply nested under that message: it unfurls in and the rows below
+    // slide down to make room — a smooth "pop out below the message".
     let composer_line: Option<Line> = if composer_open {
-        // Opening eases 0→1; Closing/Sending eases 1→0.
-        let p = match ui.phase {
-            MsgPhase::Opening => ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
-            MsgPhase::Closing => 1.0 - ui.progress(Duration::from_millis(180)).unwrap_or(1.0),
-            _ => 1.0,
-        };
-        let e = p * p * (3.0 - 2.0 * p); // smoothstep
         let sender = focus_idx
             .and_then(|i| msgs.items.get(i))
-            .map(|m| m.sender.clone())
-            .unwrap_or_else(|| "message".into());
-        // Soft blinking caret (~1s sine on alpha), DIM↔TEXT.
-        let blink = 0.5 + 0.5 * ((t * std::f64::consts::TAU).sin() as f32);
-        let caret_col = c::blend(c::FAINT, c::TEXT, blink);
-        // Indent the composer so the reply lines up under the message-text column
-        // (marker 2 + sender 18 + gap 1), with a small connector just before it —
-        // so what you type starts right below the message, not at the far left.
-        let indent = 2 + 18 + 1; // preview column
-        let mut spans = vec![
-            Span::raw(" ".repeat(indent - 2)),
-            Span::styled(
-                "↳ ",
-                Style::default().fg(c::blend(c::BG, c::pink(), e)).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if ui.phase == MsgPhase::Sending {
-            // Shimmer the draft away as a send "whoosh".
-            let head = ui.progress(Duration::from_millis(260)).unwrap_or(1.0);
-            let chars: Vec<char> = ui.draft.chars().collect();
-            let n = chars.len().max(1);
-            for (ci, ch) in chars.iter().enumerate() {
-                let cp = ci as f32 / n as f32;
-                let d = (cp - head).abs();
-                let b = (-(d * d) / (2.0 * 0.08 * 0.08)).exp();
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default().fg(c::blend(c::TEXT, c::jazz(0.88), b)),
-                ));
-            }
-        } else if ui.draft.is_empty() {
-            // Empty → a gently shimmering prompt and NO caret; the cursor only
-            // appears once you're actually typing. The base fades up with the open.
-            spans.extend(shimmer_spans(
-                &format!("reply to {sender}…"),
-                t,
-                0.0,
-                c::blend(c::BG, c::FAINT, e),
-                0.5,
-                0.12,
-                false,
-            ));
-        } else {
-            // Live draft, left-truncated so the caret stays visible. It fades up
-            // from the placeholder tone (FAINT→TEXT) over ~160ms as you start
-            // typing, so it transitions smoothly out of the shimmering prompt.
-            let appear = ui
-                .typed_at
-                .map(|ta| (ta.elapsed().as_secs_f32() / 0.16).clamp(0.0, 1.0))
-                .unwrap_or(1.0);
-            let budget = iw.saturating_sub(indent + 2).max(4);
-            let draft = &ui.draft;
-            let shown_draft: String = if draft.chars().count() > budget {
-                draft.chars().skip(draft.chars().count() - budget).collect()
-            } else {
-                draft.clone()
-            };
-            spans.push(Span::styled(
-                shown_draft,
-                Style::default().fg(c::blend(c::FAINT, c::TEXT, appear)),
-            ));
-            spans.push(Span::styled("▏", Style::default().fg(c::blend(c::BG, caret_col, appear))));
-        }
-        Some(Line::from(spans))
+            .map(|m| m.sender.as_str())
+            .unwrap_or("message");
+        compose_line(ui, sender, t, iw)
     } else {
         None
     };
@@ -2260,11 +2296,17 @@ fn messages_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut Msg
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// SIGNAL card: identical row style to iMESSAGE (sender · preview · rel-time ·
-/// unread dot) and unread-badge title, but read-only — Signal Desktop has no send
-/// API, so there's no focus marker, reply composer, or mark-read interaction.
-fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
+/// SIGNAL card: identical row style to iMESSAGE (focus marker · sender · preview ·
+/// rel-time · unread dot) and unread-badge title. Reads from Signal Desktop's DB;
+/// when signal-cli is linked (`can_send`) it also drives the SAME inline composer
+/// as iMESSAGE — send goes out through signal-cli on a background thread. Without
+/// signal-cli it degrades to the original read-only list.
+fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64, hit: &mut MsgHit) {
+    use crate::state::{MsgCard, MsgPhase};
     let sig = &s.signal;
+    let ui = &s.msg_ui;
+    // This card owns the shared composer/focus only when it's sendable AND active.
+    let here = sig.can_send && ui.active_card == MsgCard::Signal;
 
     // ----- title with unread badge / all-read tick (mirrors iMESSAGE) -----
     let mut title_spans = vec![Span::styled(
@@ -2275,17 +2317,27 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         title_spans.extend(unread_badge(sig.unread_count, c::pink()));
     }
 
+    // Failure flash: border pulses red, fade in 120ms / out 240ms (this card only).
+    let mut border = c::PANEL_BORDER_HOT;
+    if let Some(fa) = ui.send_failed_at.filter(|_| here) {
+        let e = fa.elapsed().as_secs_f32();
+        let amp = if e < 0.12 { e / 0.12 } else { (1.0 - (e - 0.12) / 0.24).clamp(0.0, 1.0) };
+        border = c::blend(border, c::RED, amp);
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(c::PANEL_BORDER_HOT).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(border).add_modifier(Modifier::BOLD))
         .title(Line::from(title_spans))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(c::BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    // Unread → shimmer the border until you've checked Signal.
-    if sig.available && sig.unread_count > 0 {
+    // Unread → shimmer the border until you've checked Signal (but not during the
+    // brief red send-fail flash).
+    let flashing = here && ui.send_failed_at.is_some_and(|fa| fa.elapsed().as_secs_f32() < 0.36);
+    if sig.available && sig.unread_count > 0 && !flashing {
         shimmer_border(f, area, t, 0.55, 0.0);
     }
 
@@ -2325,19 +2377,78 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
 
     let iw = inner.width as usize;
     let ih = inner.height as usize;
+
+    // Composer (when open) consumes one reserved row so the list above never reflows.
+    let composer_open = here && (ui.composing || ui.phase == MsgPhase::Opening);
+    let composer_rows = if composer_open { 1usize } else { 0 };
+    let list_rows = ih.saturating_sub(composer_rows);
+    let shown = list_rows.min(sig.items.len());
+
+    // A reply just sent → shimmer that conversation as a sent confirmation.
+    let glow = ui.sent_glow_at.filter(|_| here).filter(|g| g.elapsed() < crate::state::SENT_GLOW);
+
     // Same reserved columns as iMESSAGE: marker(2)+sender(18)+gap(1)+rel(4)+dot(2).
     let prevw = iw.saturating_sub(2 + 18 + 1 + 4 + 2).max(6);
-    let shown = ih.min(sig.items.len());
+
+    // Index of the focused conversation (identity-based), for the slide marker.
+    let focus_idx = if here {
+        ui.focus_chat_id
+            .and_then(|id| sig.items.iter().position(|m| m.chat_id == id))
+    } else {
+        None
+    };
+
+    // Record the clickable x-range when the card is interactive (sendable); per-row
+    // y's go in as rows are drawn, so the threaded composer's shift is reflected.
+    if sig.can_send {
+        hit.x0 = inner.x;
+        hit.x1 = inner.x.saturating_add(inner.width.saturating_sub(1));
+    }
+
+    // ----- inline composer (shared with iMESSAGE) -----
+    let composer_line: Option<Line> = if composer_open {
+        let sender = focus_idx
+            .and_then(|i| sig.items.get(i))
+            .map(|m| m.sender.as_str())
+            .unwrap_or("message");
+        compose_line(ui, sender, t, iw)
+    } else {
+        None
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(ih);
+    let mut drawn = 0usize;
+    let mut composer_placed = composer_line.is_none();
     for (i, m) in sig.items.iter().take(shown).enumerate() {
-        let (sender_col, prev_col, dot_col) = if m.unread {
-            (c::TEXT, c::TEXT, c::pink())
+        let is_focus = Some(i) == focus_idx;
+        let glow_this = glow.is_some() && ui.sent_chat_id == Some(m.chat_id);
+        let highlight = (composer_open && is_focus) || glow_this;
+        let dimmed = composer_open && !is_focus && !glow_this;
+
+        let (mut sender_col, mut prev_col, mut marker_col, mut dot_col) = if m.unread {
+            (c::TEXT, c::TEXT, c::pink(), c::pink())
         } else {
-            (c::DIM, c::FAINT, c::FAINT)
+            (c::DIM, c::FAINT, c::FAINT, c::FAINT)
+        };
+        if dimmed {
+            sender_col = c::blend(sender_col, c::BG, 0.55);
+            prev_col = c::blend(prev_col, c::BG, 0.55);
+            marker_col = c::blend(marker_col, c::BG, 0.55);
+            dot_col = c::blend(dot_col, c::BG, 0.55);
+        }
+        if highlight {
+            sender_col = c::TEXT;
+            marker_col = c::pink();
+        }
+
+        // Focus marker (the only moving element); reserved width 2.
+        let marker = if is_focus {
+            Span::styled("▌ ", Style::default().fg(marker_col).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("  ")
         };
         let sender = pad_width(&m.sender, 18);
-        let sender_style = if m.unread {
+        let sender_style = if m.unread || highlight {
             Style::default().fg(sender_col).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(sender_col)
@@ -2348,15 +2459,13 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         } else {
             Span::raw("  ")
         };
-        let mut row_spans: Vec<Span> = vec![
-            Span::raw("  "), // marker column kept for alignment parity (no focus)
-            Span::styled(sender, sender_style),
-            Span::raw(" "),
-        ];
-        if m.is_rich && m.unread {
+        let mut row_spans: Vec<Span> = vec![marker, Span::styled(sender, sender_style), Span::raw(" ")];
+        if highlight {
+            // Replying-to / just-sent: gentle travelling sheen on the message.
+            row_spans.extend(shimmer_spans(&preview, t, i as f32, c::pink(), 0.5, 0.10, false));
+        } else if m.is_rich && m.unread {
             // An *unread* photo/attachment ("[photo]") gets the same gentle
-            // travelling sheen as a fresh iMESSAGE picture, so it reads as a live,
-            // highlighted message instead of being dimmed like a read one.
+            // travelling sheen as a fresh iMESSAGE picture.
             row_spans.extend(shimmer_spans(&preview, t, i as f32, c::pink(), 0.5, 0.10, false));
         } else if m.is_rich {
             row_spans.push(Span::styled(preview, Style::default().fg(c::FAINT).add_modifier(Modifier::ITALIC)));
@@ -2365,8 +2474,27 @@ fn signal_panel(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         }
         row_spans.push(Span::styled(format!("{:>4}", truncate(&m.rel, 4)), Style::default().fg(c::FAINT)));
         row_spans.push(dot);
+        if sig.can_send {
+            hit.rows.push((inner.y + drawn as u16, m.chat_id));
+        }
         lines.push(Line::from(row_spans));
+        drawn += 1;
+        // Thread the composer directly beneath the focused conversation.
+        if Some(i) == focus_idx && !composer_placed {
+            if let Some(cl) = composer_line.clone() {
+                lines.push(cl);
+                drawn += 1;
+            }
+            composer_placed = true;
+        }
     }
+    // Fallback: focused row wasn't visible → append the composer at the end.
+    if !composer_placed {
+        if let Some(cl) = composer_line {
+            lines.push(cl);
+        }
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
 }
 

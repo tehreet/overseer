@@ -392,7 +392,8 @@ pub struct MessageItem {
     pub sender: String,      // contact name · group-chat name · pretty handle
     #[allow(dead_code)] // raw 1:1 address; superseded by `guid` as the reply target, kept for display/debug
     pub handle: String,      // 1:1 sender address (phone/email); empty for group chats
-    pub guid: String,        // chat.guid (e.g. "SMS;-;+1…" / "iMessage;-;…" / group) — reply target
+    pub guid: String,        // chat.guid (e.g. "SMS;-;+1…" / "iMessage;-;…" / group) — iMessage reply target
+    pub send_target: String, // Signal send target: "+1…" (1:1) / "g:<base64>" (group); empty = read-only
     pub preview: String,     // latest message: real text, summarized, or truncated
     pub full_text: String,   // untruncated latest text (summarize input / send context)
     pub ts_unix: f64,        // unix seconds of the latest message
@@ -477,6 +478,7 @@ pub struct Keybinds {
 pub struct Messages {
     pub fresh: bool,        // first poll completed
     pub available: bool,    // chat.db readable (Full Disk Access granted)?
+    pub can_send: bool,     // a send path is wired up (iMessage: always; Signal: signal-cli linked)
     pub unread_count: u32,  // conversations w/ recent unread inbound (excl. shortcodes)
     pub items: Vec<MessageItem>, // recent conversations, newest-active first
 }
@@ -498,12 +500,25 @@ pub enum MsgPhase {
 }
 
 
-/// iMessage interaction state. Lives on AppState so the pure render fn can read
-/// it; mutated only by the main.rs event loop. Animations are interpolated each
-/// frame off `anim_start` — never a discrete flip — so motion is buttery.
+/// Which messaging card the shared composer is currently bound to. Only one of
+/// the iMESSAGE / SIGNAL cards is focused (and composable) at a time, so a single
+/// `MsgUi` drives whichever is active — `active_card` records which.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum MsgCard {
+    #[default]
+    IMessage,
+    Signal,
+}
+
+/// iMessage / Signal interaction state. Lives on AppState so the pure render fn
+/// can read it; mutated only by the main.rs event loop. Animations are
+/// interpolated each frame off `anim_start` — never a discrete flip — so motion
+/// is buttery. The same machinery drives both text cards; `active_card` selects
+/// which one the focus marker, composer, and optimistic echo belong to.
 #[derive(Clone)]
 pub struct MsgUi {
-    pub active: bool,                 // is the iMessage card focused?
+    pub active_card: MsgCard,         // which card (iMESSAGE / SIGNAL) is focused
+    pub active: bool,                 // is a text card focused?
     pub focus_chat_id: Option<i64>,   // focused conversation (click/'m'); identity, not index
     pub last_key_at: Option<Instant>, // double-press window for 'm'
     pub last_click_at: Option<Instant>, // double-click window for the mouse
@@ -527,6 +542,7 @@ pub const SENT_GLOW: Duration = Duration::from_secs(3);
 /// back to the previous message. [[messages-optimistic-echo]]
 #[derive(Clone)]
 pub struct PendingEcho {
+    pub card: MsgCard,     // which card's item list this echo belongs to
     pub chat_id: i64,
     pub preview: String,   // "You: …" — the conversation's new latest line
     pub full_text: String, // raw sent text, used to detect when the real row arrives
@@ -536,6 +552,7 @@ pub struct PendingEcho {
 impl Default for MsgUi {
     fn default() -> Self {
         Self {
+            active_card: MsgCard::IMessage,
             active: false,
             focus_chat_id: None,
             last_key_at: None,
@@ -762,6 +779,24 @@ impl Default for AppState {
             keybinds_toggle_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+        }
+    }
+}
+
+impl AppState {
+    /// The conversation list the focused composer is acting on — iMESSAGE or
+    /// SIGNAL, per `msg_ui.active_card`. Lets the one interaction code path drive
+    /// either card without branching at every call site.
+    pub fn active_msgs(&self) -> &Messages {
+        match self.msg_ui.active_card {
+            MsgCard::IMessage => &self.messages,
+            MsgCard::Signal => &self.signal,
+        }
+    }
+    pub fn active_msgs_mut(&mut self) -> &mut Messages {
+        match self.msg_ui.active_card {
+            MsgCard::IMessage => &mut self.messages,
+            MsgCard::Signal => &mut self.signal,
         }
     }
 }

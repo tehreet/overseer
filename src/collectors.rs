@@ -2829,6 +2829,7 @@ pub fn spawn_messages(shared: Shared) {
                     let mut s = shared.lock().unwrap();
                     s.messages.fresh = true;
                     s.messages.available = true;
+                    s.messages.can_send = true; // Messages.app AppleScript send is always available
                     s.messages.unread_count = unread;
                     s.messages.items = items;
                     // Focus is identity-based (focus_chat_id), so it survives row
@@ -3017,6 +3018,7 @@ fn read_messages(
             sender,
             handle: if is_group { String::new() } else { chat_ident },
             guid,
+            send_target: String::new(), // iMessage sends via the guid, not signal-cli
             preview,
             full_text: body_text,
             ts_unix: ts,
@@ -3334,16 +3336,26 @@ pub fn send_imessage(shared: Shared, guid: String, body: String) {
 /// flicker the preview back to the previous message. Self-clears once the real
 /// outbound row appears, or after a give-up cap (e.g. a send that never lands).
 fn apply_pending_echo(s: &mut AppState) {
+    use crate::state::MsgCard;
     let Some(echo) = s.msg_ui.pending_echo.clone() else { return };
-    if echo.at.elapsed() > Duration::from_secs(10) {
+    // Give-up cap: long enough to outlast one full poll of the slower card
+    // (Signal polls every 15s and a signal-cli send takes a moment to sync back to
+    // Signal Desktop's DB), so a just-sent reply never flickers back to the old
+    // preview before the real row lands. A failed send clears the echo at once.
+    if echo.at.elapsed() > Duration::from_secs(20) {
         s.msg_ui.pending_echo = None;
         return;
     }
-    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == echo.chat_id) else {
+    // The echo belongs to whichever card it was sent from (iMESSAGE / SIGNAL).
+    let msgs = match echo.card {
+        MsgCard::IMessage => &mut s.messages,
+        MsgCard::Signal => &mut s.signal,
+    };
+    let Some(pos) = msgs.items.iter().position(|m| m.chat_id == echo.chat_id) else {
         return; // conversation not in the current window; let the cap expire it
     };
     let landed = {
-        let m = &s.messages.items[pos];
+        let m = &msgs.items[pos];
         m.from_me && m.full_text == echo.full_text
     };
     if landed {
@@ -3353,11 +3365,11 @@ fn apply_pending_echo(s: &mut AppState) {
     // Poll ran before the send landed: keep showing the reply as the latest
     // message AND keep the thread pinned to the top, so neither the preview nor
     // the list order flickers back until the real row arrives.
+    if msgs.items[pos].unread {
+        msgs.unread_count = msgs.unread_count.saturating_sub(1);
+    }
     {
-        let m = &mut s.messages.items[pos];
-        if m.unread {
-            s.messages.unread_count = s.messages.unread_count.saturating_sub(1);
-        }
+        let m = &mut msgs.items[pos];
         m.preview = echo.preview.clone();
         m.full_text = echo.full_text.clone();
         m.from_me = true;
@@ -3366,8 +3378,8 @@ fn apply_pending_echo(s: &mut AppState) {
         m.rel = "now".into();
     }
     if pos != 0 {
-        let item = s.messages.items.remove(pos);
-        s.messages.items.insert(0, item);
+        let item = msgs.items.remove(pos);
+        msgs.items.insert(0, item);
     }
 }
 
@@ -3468,7 +3480,10 @@ SELECT COALESCE(NULLIF(TRIM(c.name),''), NULLIF(TRIM(c.profileFullName),''), \
        COALESCE(NULLIF(TRIM(sc.profileFullName),''), NULLIF(TRIM(sc.name),''), '') AS src, \
        m.hasVisualMediaAttachments AS vis, \
        m.hasAttachments AS att, \
-       replace(replace(replace(COALESCE(m.body,''), char(10),' '), char(13),' '), char(9),' ') AS body \
+       replace(replace(replace(COALESCE(m.body,''), char(10),' '), char(13),' '), char(9),' ') AS body, \
+       c.id AS cid, \
+       COALESCE(c.e164,'') AS e164, \
+       COALESCE(c.groupId,'') AS gid \
 FROM conversations c \
 JOIN messages m ON m.rowid = (SELECT rowid FROM messages mm \
      WHERE mm.conversationId=c.id AND mm.type IN ('incoming','outgoing') \
@@ -3503,14 +3518,20 @@ pub fn spawn_signal(shared: Shared) {
                 read_signal(&uri, k)
             });
             let failed = result.is_none();
+            // Can we actually SEND? Only if signal-cli is installed with a linked
+            // account. Cheap to re-check each round (a file probe), so the composer
+            // lights up the moment the user finishes linking — no restart needed.
+            let can_send = signal_account().is_some();
             {
                 let mut s = shared.lock().unwrap();
                 s.signal.fresh = true;
+                s.signal.can_send = can_send;
                 match result {
                     Some((items, unread)) => {
                         s.signal.available = true;
                         s.signal.unread_count = unread;
                         s.signal.items = items;
+                        apply_pending_echo(&mut s);
                     }
                     None => s.signal.available = false,
                 }
@@ -3541,7 +3562,7 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
     for line in body.lines() {
         // The PRAGMA emits a lone "ok" line (no tabs) → caught by the field guard.
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 9 {
+        if f.len() < 12 {
             continue;
         }
         let who = f[0].to_string();
@@ -3553,6 +3574,23 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
         let has_vis = f[6].trim() == "1";
         let has_att = f[7].trim() == "1";
         let raw_body = f[8].to_string();
+        let conv_id = f[9].trim();
+        let e164 = f[10].trim();
+        let group_id = f[11].trim();
+
+        // signal-cli send target: groups by their base64 id (g:<id>), 1:1 by the
+        // contact's phone number. Username-only contacts (no e164) aren't sendable,
+        // so they stay read-only (empty target → no composer).
+        let send_target = if is_group && !group_id.is_empty() {
+            format!("g:{group_id}")
+        } else if !is_group && !e164.is_empty() {
+            e164.to_string()
+        } else {
+            String::new()
+        };
+        // Stable per-conversation identity for focus/echo/hit-test (the iMESSAGE
+        // path keys on an i64 chat_id; Signal's id is a string, so hash it).
+        let chat_id = stable_id(conv_id);
 
         let (text, is_rich) = if !raw_body.trim().is_empty() {
             (raw_body, false)
@@ -3577,11 +3615,12 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
         };
 
         items.push(MessageItem {
-            chat_id: 0,
+            chat_id,
             rowid: 0,
             sender: who,
-            handle: String::new(), // read-only: no reply target
-            guid: String::new(),   // read-only: Signal Desktop has no send API
+            handle: String::new(), // unused for Signal (send goes through signal-cli)
+            guid: String::new(),   // iMessage-only reply target; Signal uses send_target
+            send_target,
             preview,
             full_text: text,
             ts_unix: ts,
@@ -3598,6 +3637,92 @@ fn read_signal(db_copy: &str, key: &str) -> Option<(Vec<crate::state::MessageIte
     items.truncate(SHOWN_CONVERSATIONS);
     let unread = unread_badge_count(&items, now);
     Some((items, unread))
+}
+
+/// Stable i64 identity for a Signal conversation id (a string). The iMESSAGE
+/// interaction machinery keys focus / optimistic-echo / hit-test on an i64
+/// chat_id, so hashing the Signal id lets that same code drive this card.
+/// Deterministic across polls within a run (fixed-key SipHash).
+fn stable_id(s: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish() as i64
+}
+
+/// Path to the signal-cli binary if installed (Homebrew on Apple/Intel). signal-cli
+/// is the only way to SEND on Signal — Signal Desktop exposes no send API — so the
+/// composer only lights up when this (and a linked account) is present.
+fn signal_cli_bin() -> Option<String> {
+    ["/opt/homebrew/bin/signal-cli", "/usr/local/bin/signal-cli"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(str::to_string)
+}
+
+/// The e164 of the Signal account linked to signal-cli, or None if signal-cli
+/// isn't installed or no account is linked yet. A cheap file probe (no JVM
+/// spawn), so the collector can re-check it every poll — the composer enables
+/// itself the moment linking finishes, no restart needed.
+fn signal_account() -> Option<String> {
+    signal_cli_bin()?; // no binary → nothing to send with
+    let home = dirs::home_dir()?;
+    let accounts = home.join(".local/share/signal-cli/data/accounts.json");
+    let txt = std::fs::read_to_string(&accounts).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    // { "accounts": [ { "number": "+1…", "path": "…" }, … ] }
+    v.get("accounts")?
+        .as_array()?
+        .iter()
+        .find_map(|a| a.get("number").and_then(|n| n.as_str()))
+        .map(str::to_string)
+}
+
+/// Send a Signal message via signal-cli on a background thread — JVM startup is
+/// ~1-2s, so never on the render path. Mirrors `send_imessage`: it WAITS for the
+/// exit status and, on failure, re-opens the composer with the draft restored and
+/// flips `send_failed_at` so the border flashes red; success rides the optimistic
+/// echo already playing in the UI. `target` is "+1…" for a 1:1 or "g:<base64>"
+/// for a group.
+pub fn send_signal(shared: Shared, target: String, body: String) {
+    std::thread::spawn(move || {
+        let ok = (|| -> Option<bool> {
+            let bin = signal_cli_bin()?;
+            let account = signal_account()?;
+            let mut cmd = Command::new(bin);
+            cmd.args(["-a", &account, "send", "-m", &body]);
+            match target.strip_prefix("g:") {
+                Some(group_id) => {
+                    cmd.args(["-g", group_id]);
+                }
+                None => {
+                    cmd.arg(&target);
+                }
+            }
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()
+                .map(|s| s.success())
+        })()
+        .unwrap_or(false);
+        if !ok {
+            if let Ok(mut s) = shared.lock() {
+                s.msg_ui.send_failed_at = Some(Instant::now());
+                // Drop the optimistic echo — the message didn't actually go out.
+                s.msg_ui.pending_echo = None;
+                // Restore the draft on the SIGNAL composer so the user can retry —
+                // but don't clobber a new compose they may already have started.
+                if !s.msg_ui.composing {
+                    s.msg_ui.active_card = crate::state::MsgCard::Signal;
+                    s.msg_ui.composing = true;
+                    s.msg_ui.draft = body;
+                    s.msg_ui.phase = crate::state::MsgPhase::Idle;
+                    s.msg_ui.anim_start = None;
+                }
+            }
+        }
+    });
 }
 
 /// `--diag-signal`: dump how recent INCOMING Signal messages are flagged so we can

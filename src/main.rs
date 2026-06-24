@@ -294,6 +294,7 @@ fn demo_anonymize(st: &mut AppState) {
         sender: sender.into(),
         handle: String::new(),
         guid: String::new(),
+        send_target: String::new(),
         preview: preview.into(),
         full_text: preview.into(),
         ts_unix: 0.0,
@@ -418,8 +419,8 @@ fn event_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     shared: &Arc<Mutex<AppState>>,
 ) -> Result<()> {
-    // Clickable iMessage rows from the last drawn frame; refreshed every render.
-    let mut hit = ui::MsgHit::default();
+    // Clickable iMessage + Signal rows from the last drawn frame; refreshed every render.
+    let mut hits = ui::Hits::default();
     loop {
         // Settle any finished iMessage transition, then take a cheap snapshot of
         // AppState and RELEASE the lock before drawing (issue #16). render() is the
@@ -445,7 +446,7 @@ fn event_loop<B: ratatui::backend::Backend>(
         // render() records the clickable iMessage rows into `hit` so a mouse
         // click can be mapped back to a conversation (the snapshot is a clone, so
         // render can't write hitboxes into shared state — they ride out here).
-        term.draw(|f| ui::render(f, &snapshot, t, &mut hit))?;
+        term.draw(|f| ui::render(f, &snapshot, t, &mut hits))?;
 
         // The CPU equalizer interpolates continuously between cached samples, so
         // keep a smooth 60fps baseline; go 120fps with music OR while an iMessage
@@ -471,7 +472,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                     {
                         return Ok(());
                     }
-                    Event::Mouse(m) => handle_mouse(shared, m, &hit),
+                    Event::Mouse(m) => handle_mouse(shared, m, &hits),
                     _ => {}
                 }
             }
@@ -549,36 +550,46 @@ fn handle_key(
             KeyCode::Enter => {
                 let draft = s.msg_ui.draft.trim().to_string();
                 if !draft.is_empty() {
-                    // Target = the focused conversation, by chat GUID.
-                    if let Some(guid) = focused_guid(&s) {
-                        collectors::send_imessage(shared.clone(), guid, draft.clone());
+                    // Target = the focused conversation. iMESSAGE sends by chat GUID
+                    // through Messages.app; SIGNAL sends via signal-cli.
+                    let card = s.msg_ui.active_card;
+                    if let Some(target) = focused_target(&s) {
+                        match card {
+                            state::MsgCard::IMessage => {
+                                collectors::send_imessage(shared.clone(), target, draft.clone())
+                            }
+                            state::MsgCard::Signal => {
+                                collectors::send_signal(shared.clone(), target, draft.clone())
+                            }
+                        }
                         // Optimistic local echo: show the reply as that
                         // conversation's latest message right away, and keep it
-                        // sticky (pending_echo) so the next chat.db poll can't
-                        // flicker it back before the real row lands. Also mark it
-                        // to shimmer for a few seconds as a sent glow.
+                        // sticky (pending_echo) so the next poll can't flicker it
+                        // back before the real row lands. Mark it to shimmer too.
                         if let Some(id) = s.msg_ui.focus_chat_id {
                             let preview = format!("You: {draft}");
-                            if let Some(pos) =
-                                s.messages.items.iter().position(|m| m.chat_id == id)
                             {
-                                {
-                                    let m = &mut s.messages.items[pos];
-                                    m.preview = preview.clone();
-                                    m.full_text = draft.clone();
-                                    m.from_me = true;
-                                    m.unread = false;
-                                    m.is_rich = false;
-                                    m.rel = "now".into();
-                                }
-                                // Sending bumps the thread to the top of the list
-                                // immediately (like Messages), not after delivery.
-                                if pos != 0 {
-                                    let item = s.messages.items.remove(pos);
-                                    s.messages.items.insert(0, item);
+                                let msgs = s.active_msgs_mut();
+                                if let Some(pos) = msgs.items.iter().position(|m| m.chat_id == id) {
+                                    {
+                                        let m = &mut msgs.items[pos];
+                                        m.preview = preview.clone();
+                                        m.full_text = draft.clone();
+                                        m.from_me = true;
+                                        m.unread = false;
+                                        m.is_rich = false;
+                                        m.rel = "now".into();
+                                    }
+                                    // Sending bumps the thread to the top of the list
+                                    // immediately (like Messages), not after delivery.
+                                    if pos != 0 {
+                                        let item = msgs.items.remove(pos);
+                                        msgs.items.insert(0, item);
+                                    }
                                 }
                             }
                             s.msg_ui.pending_echo = Some(state::PendingEcho {
+                                card,
                                 chat_id: id,
                                 preview,
                                 full_text: draft,
@@ -628,56 +639,91 @@ fn handle_key(
                 return true; // quit
             }
         }
-        KeyCode::Char('m') => {
-            let now = Instant::now();
-            let double = s
-                .msg_ui
-                .last_key_at
-                .map(|p| now.duration_since(p) <= MSG_DOUBLE)
-                .unwrap_or(false);
-            s.msg_ui.last_key_at = Some(now);
-
-            if !s.msg_ui.active {
-                // First press focuses the card on the most relevant conversation.
-                let f = default_focus(&s);
-                s.msg_ui.active = true;
-                s.msg_ui.focus_chat_id = f;
-                s.msg_ui.phase = MsgPhase::Idle;
-            } else if double {
-                // Double-press on the focused conversation → open inline reply.
-                if s.msg_ui.focus_chat_id.is_none() {
-                    s.msg_ui.focus_chat_id = default_focus(&s);
-                }
-                s.msg_ui.composing = true;
-                s.msg_ui.draft.clear();
-                s.msg_ui.phase = MsgPhase::Opening;
-                s.msg_ui.anim_start = Some(now);
-            } else {
-                // Single press → mark focused read + advance to the next conversation.
-                advance_queue(&mut s);
-                s.msg_ui.phase = MsgPhase::Advancing;
-                s.msg_ui.anim_start = Some(now);
-            }
+        // 'm' drives the iMESSAGE card, 's' the SIGNAL card (only when it's
+        // sendable — signal-cli linked). Each: first press focuses, double-press
+        // opens the composer, single press advances. Pressing the other card's key
+        // switches focus to it.
+        KeyCode::Char('m') => focus_or_advance(&mut s, Instant::now(), state::MsgCard::IMessage),
+        KeyCode::Char('s') if s.signal.can_send => {
+            focus_or_advance(&mut s, Instant::now(), state::MsgCard::Signal)
         }
         _ => {}
     }
     false
 }
 
-/// Route a mouse click through the iMessage card. Single left-click focuses
-/// (highlights) the conversation under the cursor; a double-click on that same
-/// conversation drops the cursor into a reply composer for it.
-fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hit: &ui::MsgHit) {
+/// First press focuses `card` (on its most relevant conversation), a double-press
+/// opens the composer, a single press advances. Pressing a card's key while the
+/// OTHER card is focused switches to it (cancelling any half-typed draft). Shared
+/// by the iMESSAGE ('m') and SIGNAL ('s') hotkeys.
+fn focus_or_advance(s: &mut AppState, now: Instant, card: state::MsgCard) {
     use state::MsgPhase;
+    let switching = !s.msg_ui.active || s.msg_ui.active_card != card;
+    let double = !switching
+        && s.msg_ui
+            .last_key_at
+            .map(|p| now.duration_since(p) <= MSG_DOUBLE)
+            .unwrap_or(false);
+    s.msg_ui.last_key_at = Some(now);
+
+    if switching {
+        // Focus this card on its most relevant conversation; drop any other-card draft.
+        s.msg_ui.active_card = card;
+        s.msg_ui.active = true;
+        s.msg_ui.composing = false;
+        s.msg_ui.draft.clear();
+        s.msg_ui.focus_chat_id = default_focus(s);
+        s.msg_ui.phase = MsgPhase::Idle;
+        s.msg_ui.anim_start = None;
+    } else if double {
+        // Double-press on the focused conversation → open inline composer.
+        if s.msg_ui.focus_chat_id.is_none() {
+            s.msg_ui.focus_chat_id = default_focus(s);
+        }
+        s.msg_ui.composing = true;
+        s.msg_ui.typed_at = None;
+        s.msg_ui.draft.clear();
+        s.msg_ui.phase = MsgPhase::Opening;
+        s.msg_ui.anim_start = Some(now);
+    } else {
+        // Single press → mark focused read (iMessage) + advance to the next.
+        advance_queue(s);
+        s.msg_ui.phase = MsgPhase::Advancing;
+        s.msg_ui.anim_start = Some(now);
+    }
+}
+
+/// Route a mouse click through the iMESSAGE / SIGNAL cards. Single left-click
+/// focuses (highlights) the conversation under the cursor; a double-click on that
+/// same conversation drops the cursor into a reply composer for it. The two cards
+/// keep separate hit maps, so the click is routed to whichever it lands on.
+fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hits: &ui::Hits) {
+    use state::{MsgCard, MsgPhase};
     if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
     }
-    let Some(chat_id) = hit.chat_at(m.column, m.row) else {
+    // Which card (and conversation) did the click land on?
+    let (chat_id, card) = if let Some(id) = hits.msg.chat_at(m.column, m.row) {
+        (id, MsgCard::IMessage)
+    } else if let Some(id) = hits.sig.chat_at(m.column, m.row) {
+        (id, MsgCard::Signal)
+    } else {
         return; // click landed outside any conversation row
     };
     let mut s = shared.lock().unwrap();
     let now = Instant::now();
-    let double = s.msg_ui.last_click_chat == Some(chat_id)
+    // Only iMESSAGE rows or sendable SIGNAL rows open the composer.
+    let composable = matches!(card, MsgCard::IMessage) || s.signal.can_send;
+    // Clicking the other card cancels any in-flight compose and counts as a switch.
+    let switching = !s.msg_ui.active || s.msg_ui.active_card != card;
+    if switching && s.msg_ui.composing {
+        s.msg_ui.composing = false;
+        s.msg_ui.draft.clear();
+        s.msg_ui.phase = MsgPhase::Idle;
+        s.msg_ui.anim_start = None;
+    }
+    let double = !switching
+        && s.msg_ui.last_click_chat == Some(chat_id)
         && s
             .msg_ui
             .last_click_at
@@ -685,8 +731,9 @@ fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hit: &ui::MsgHit) 
             .unwrap_or(false);
     s.msg_ui.last_click_at = Some(now);
     s.msg_ui.last_click_chat = Some(chat_id);
+    s.msg_ui.active_card = card;
 
-    if double {
+    if double && composable {
         s.msg_ui.active = true;
         s.msg_ui.focus_chat_id = Some(chat_id);
         s.msg_ui.composing = true;
@@ -695,8 +742,8 @@ fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hit: &ui::MsgHit) 
         s.msg_ui.phase = MsgPhase::Opening;
         s.msg_ui.anim_start = Some(now);
     } else if !s.msg_ui.composing {
-        // Single click focuses AND clears the unread notification on that
-        // conversation (with the read crossfade if it was unread).
+        // Single click focuses AND (iMessage) clears the unread notification on
+        // that conversation, with the read crossfade if it was unread.
         s.msg_ui.active = true;
         s.msg_ui.focus_chat_id = Some(chat_id);
         if mark_conversation_read(&mut s, chat_id) {
@@ -708,33 +755,39 @@ fn handle_mouse(shared: &Arc<Mutex<AppState>>, m: MouseEvent, hit: &ui::MsgHit) 
     }
 }
 
-/// Default focus when the card is first activated: the most relevant
-/// conversation — the first unread one, or the newest if everything's read.
+/// Default focus when a card is first activated: the most relevant conversation in
+/// the ACTIVE card — the first unread one, or the newest if everything's read.
 fn default_focus(s: &AppState) -> Option<i64> {
-    s.messages
-        .items
+    let items = &s.active_msgs().items;
+    items
         .iter()
         .find(|m| m.unread)
-        .or_else(|| s.messages.items.first())
+        .or_else(|| items.first())
         .map(|m| m.chat_id)
 }
 
-/// `chat.guid` of the focused conversation — the reply target. Works for
-/// iMessage, SMS, 1:1 and group threads alike (empty → no sendable target).
-fn focused_guid(s: &AppState) -> Option<String> {
+/// Send target of the focused conversation in the active card: iMESSAGE → the
+/// `chat.guid` (works for iMessage/SMS/1:1/group); SIGNAL → the signal-cli target
+/// ("+1…" or "g:<base64>"). None when there's no sendable target.
+fn focused_target(s: &AppState) -> Option<String> {
     let id = s.msg_ui.focus_chat_id?;
-    s.messages
-        .items
-        .iter()
-        .find(|m| m.chat_id == id)
-        .map(|m| m.guid.clone())
-        .filter(|g| !g.is_empty())
+    let m = s.active_msgs().items.iter().find(|m| m.chat_id == id)?;
+    let target = match s.msg_ui.active_card {
+        state::MsgCard::IMessage => &m.guid,
+        state::MsgCard::Signal => &m.send_target,
+    };
+    (!target.is_empty()).then(|| target.clone())
 }
 
 /// Mark one conversation read — flip it in our snapshot for an instant response
 /// (clears the unread dot + badge), and persist to chat.db so the next poll
-/// doesn't resurrect it. Returns true if it was actually unread.
+/// doesn't resurrect it. Returns true if it was actually unread. SIGNAL is a
+/// no-op: its read state lives in an encrypted DB we don't write, so faking it
+/// would just flicker back on the next poll.
 fn mark_conversation_read(s: &mut AppState, chat_id: i64) -> bool {
+    if s.msg_ui.active_card == state::MsgCard::Signal {
+        return false;
+    }
     let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == chat_id) else {
         return false;
     };
@@ -755,13 +808,14 @@ fn mark_conversation_read(s: &mut AppState, chat_id: i64) -> bool {
     true
 }
 
-/// Mark the focused conversation read, then advance focus to the next one.
+/// Mark the focused conversation read (iMessage), then advance focus to the next
+/// one in the active card.
 fn advance_queue(s: &mut AppState) {
     let Some(id) = s.msg_ui.focus_chat_id else { return };
-    let Some(pos) = s.messages.items.iter().position(|m| m.chat_id == id) else { return };
+    let Some(pos) = s.active_msgs().items.iter().position(|m| m.chat_id == id) else { return };
     mark_conversation_read(s, id);
     // Advance focus to the next conversation (stay put if this was the last).
-    if let Some(next) = s.messages.items.get(pos + 1).map(|m| m.chat_id) {
+    if let Some(next) = s.active_msgs().items.get(pos + 1).map(|m| m.chat_id) {
         s.msg_ui.focus_chat_id = Some(next);
     }
 }
@@ -894,7 +948,7 @@ fn snapshot(args: &[String]) -> Result<()> {
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend)?;
     let t = 1.3;
-    term.draw(|f| ui::render(f, &st, t, &mut ui::MsgHit::default()))?;
+    term.draw(|f| ui::render(f, &st, t, &mut ui::Hits::default()))?;
 
     let buf = term.backend().buffer().clone();
     let mut out = io::stdout().lock();
@@ -977,7 +1031,7 @@ fn cells(args: &[String]) -> Result<()> {
     }
     let backend = TestBackend::new(w, h);
     let mut term = Terminal::new(backend)?;
-    term.draw(|f| ui::render(f, &st, t, &mut ui::MsgHit::default()))?;
+    term.draw(|f| ui::render(f, &st, t, &mut ui::Hits::default()))?;
     let buf = term.backend().buffer().clone();
 
     let bg0 = (13u8, 14u8, 22u8); // theme::BG
@@ -1242,6 +1296,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
     st.messages = state::Messages {
         fresh: true,
         available: true,
+        can_send: true,
         unread_count: 2,
         // Contacts-only, most-recent-first, capped at 5 (matches the collector).
         // (sender, handle, text, rel, rich, unread, from_me, shortcode)
@@ -1273,6 +1328,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
                 sender: sender.into(),
                 handle: handle.into(),
                 guid: String::new(),
+                send_target: String::new(),
                 preview,
                 full_text: text.into(),
                 ts_unix: 0.0,
@@ -1289,6 +1345,7 @@ fn sample_data(st: &mut AppState, compose: bool) {
     st.signal = state::Messages {
         fresh: true,
         available: true,
+        can_send: true,
         unread_count: 1,
         // Signal conversations — read-only, same row style. (sender,text,rel,unread,from_me,rich)
         items: vec![
@@ -1299,13 +1356,15 @@ fn sample_data(st: &mut AppState, compose: bool) {
             ("Adam", "You: Jesus", "yd", false, true, false),
         ]
         .into_iter()
-        .map(|(sender, text, rel, unread, from_me, rich): (&str, &str, &str, bool, bool, bool)| {
+        .enumerate()
+        .map(|(i, (sender, text, rel, unread, from_me, rich)): (usize, (&str, &str, &str, bool, bool, bool))| {
             state::MessageItem {
-                chat_id: 0,
+                chat_id: i as i64,
                 rowid: 0,
                 sender: sender.into(),
                 handle: String::new(),
                 guid: String::new(),
+                send_target: "+15555550100".into(),
                 preview: text.into(),
                 full_text: text.into(),
                 ts_unix: 0.0,
@@ -1318,6 +1377,28 @@ fn sample_data(st: &mut AppState, compose: bool) {
         })
         .collect(),
     };
+    // SIGNAL composer preview: OVERSEER_FAKE_SIGNAL=compose focuses the SIGNAL card
+    // with the inline composer open; =focus is the post-send state (focused, composer
+    // closed). Mirrors OVERSEER_FAKE_DOCTOR.
+    match std::env::var("OVERSEER_FAKE_SIGNAL").as_deref() {
+        Ok("compose") => {
+            st.msg_ui.active_card = state::MsgCard::Signal;
+            st.msg_ui.active = true;
+            st.msg_ui.composing = true;
+            st.msg_ui.focus_chat_id = st.signal.items.first().map(|m| m.chat_id);
+            st.msg_ui.draft = "see you at 8".into();
+            st.msg_ui.typed_at = Some(Instant::now());
+            st.msg_ui.phase = state::MsgPhase::Idle;
+        }
+        Ok("focus") => {
+            st.msg_ui.active_card = state::MsgCard::Signal;
+            st.msg_ui.active = true;
+            st.msg_ui.composing = false;
+            st.msg_ui.focus_chat_id = st.signal.items.first().map(|m| m.chat_id);
+            st.msg_ui.phase = state::MsgPhase::Idle;
+        }
+        _ => {}
+    }
     st.discord = state::Discord {
         fresh: true,
         available: true,
