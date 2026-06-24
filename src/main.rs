@@ -237,10 +237,14 @@ fn demo_anonymize(st: &mut AppState) {
         polled: true,
         ..Default::default()
     };
-    // Re-derive art + palette for the new (uncached → gradient) track so accents stay coherent.
+    // Keep the gradient art for the NOW PLAYING visual, but PIN the palette to the
+    // house synthwave accents so the demo always wears the signature purple/blue
+    // theme — no album-art biasing.
     st.album_art = std::sync::Arc::new(collectors::sample_album_art(st.music.track_id()));
-    let target = theme::theme_from_art(&st.album_art.px);
-    st.dynamic_theme.retarget(st.music.track_id(), [target.0, target.1, target.2]);
+    st.dynamic_theme.retarget(
+        st.music.track_id(),
+        [theme::ACCENT_BASE, theme::CYAN_BASE, theme::PINK_BASE],
+    );
     st.dynamic_theme.blend_start = now - Duration::from_secs(1);
 
     // --- lyrics: original lines (synced) so the karaoke wipe has something to ride ---
