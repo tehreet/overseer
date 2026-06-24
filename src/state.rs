@@ -313,8 +313,9 @@ pub struct QueueTrack {
 }
 
 /// The next few tracks Apple Music will play (best-effort, by current-playlist
-/// order — AppleScript can't read the true dynamic "Up Next" list). Recomputed
-/// when the current track changes.
+/// order — AppleScript can't read the true dynamic "Up Next" list). When Music
+/// exposes no current playlist (streamed catalog albums), falls back to the rest
+/// of the album from the keyless iTunes catalog. Recomputed when the track changes.
 #[derive(Clone, Default)]
 pub struct Queue {
     pub fresh: bool,

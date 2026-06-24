@@ -1221,7 +1221,18 @@ pub fn spawn_queue(shared: Shared) {
                 s.queue.source_track_id != id || !s.queue.fresh
             };
             if stale {
-                let items = read_queue();
+                let mut items = read_queue();
+                if items.is_empty() {
+                    // AppleScript can't read the up-next for a streamed catalog
+                    // album — those expose no `current playlist`. Fall back to the
+                    // album's tracklist from the keyless iTunes catalog and show
+                    // whatever's left after the current track.
+                    let (track, artist, album) = {
+                        let s = shared.lock().unwrap();
+                        (s.music.track.clone(), s.music.artist.clone(), s.music.album.clone())
+                    };
+                    items = read_queue_itunes(&track, &artist, &album);
+                }
                 let mut s = shared.lock().unwrap();
                 if s.music.track_id() == id {
                     s.queue = crate::state::Queue { fresh: true, source_track_id: id, items };
@@ -1254,6 +1265,131 @@ fn read_queue() -> Vec<crate::state::QueueTrack> {
             }
         })
         .collect()
+}
+
+/// Best-effort up-next when AppleScript draws a blank — streamed catalog albums
+/// expose no `current playlist`, so the only way to know what's next is the album
+/// itself. Look the album up in the keyless iTunes catalog, find the current
+/// track in its ordered tracklist, and return the next three. Empty for albums
+/// iTunes doesn't index, or when the current track can't be located.
+fn read_queue_itunes(cur_track: &str, artist: &str, album: &str) -> Vec<crate::state::QueueTrack> {
+    if album.is_empty() || cur_track.is_empty() {
+        return Vec::new();
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let primary = primary_artist(artist);
+    // Resolve the album → collectionId. Album search is steadier for odd titles;
+    // a song search is the backstop for albums that only surface by track.
+    let cid = itunes_album_id(&agent, album, &primary)
+        .or_else(|| itunes_song_collection(&agent, cur_track, &primary, album));
+    let Some(cid) = cid else { return Vec::new() };
+
+    let url = format!("https://itunes.apple.com/lookup?id={cid}&entity=song&limit=200");
+    let Ok(resp) = agent.get(&url).call() else { return Vec::new() };
+    let Ok(v) = resp.into_json::<serde_json::Value>() else { return Vec::new() };
+    let Some(results) = v.get("results").and_then(|r| r.as_array()) else { return Vec::new() };
+
+    // Songs only (skip the leading collection record), in disc/track order.
+    let mut songs: Vec<(i64, i64, String, String, f64)> = results
+        .iter()
+        .filter(|r| r.get("wrapperType").and_then(|w| w.as_str()) == Some("track"))
+        .map(|r| {
+            let disc = r.get("discNumber").and_then(|x| x.as_i64()).unwrap_or(1);
+            let num = r.get("trackNumber").and_then(|x| x.as_i64()).unwrap_or(0);
+            let name = r.get("trackName").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let art = r.get("artistName").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let dur = r.get("trackTimeMillis").and_then(|x| x.as_f64()).unwrap_or(0.0) / 1000.0;
+            (disc, num, name, art, dur)
+        })
+        .collect();
+    songs.sort_by_key(|s| (s.0, s.1));
+
+    let cur = norm_title(cur_track);
+    let Some(pos) = songs.iter().position(|s| norm_title(&s.2) == cur) else { return Vec::new() };
+    songs
+        .iter()
+        .skip(pos + 1)
+        .take(3)
+        .map(|s| crate::state::QueueTrack {
+            track: s.2.clone(),
+            artist: s.3.clone(),
+            duration: s.4,
+        })
+        .collect()
+}
+
+/// The first artist credit only — iTunes indexes an album under its album artist,
+/// not a track's full "A, B & C feat. D" credit. Cut at the first separator that
+/// introduces a secondary name.
+fn primary_artist(artist: &str) -> String {
+    let mut end = artist.len();
+    for sep in [",", "/", " & ", " feat", " Feat", " FEAT", " featuring", " x "] {
+        if let Some(i) = artist.find(sep) {
+            end = end.min(i);
+        }
+    }
+    artist[..end].trim().to_string()
+}
+
+/// Normalize a title for fuzzy matching across stores: drop parenthetical or
+/// bracketed credits ("(feat. …)", "[Bonus]"), lowercase, keep only alphanumerics.
+fn norm_title(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = (depth - 1).max(0),
+            _ if depth == 0 && c.is_alphanumeric() => out.extend(c.to_lowercase()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Search the album by name + primary artist; return the collectionId whose title
+/// matches (normalized). None when nothing lines up.
+fn itunes_album_id(agent: &ureq::Agent, album: &str, artist: &str) -> Option<i64> {
+    let term = urlencode(&format!("{album} {artist}"));
+    let url = format!("https://itunes.apple.com/search?entity=album&limit=10&term={term}");
+    let v: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
+    let results = v.get("results")?.as_array()?;
+    let want = norm_title(album);
+    results
+        .iter()
+        .find(|r| {
+            r.get("collectionName")
+                .and_then(|c| c.as_str())
+                .map(norm_title)
+                .map(|n| !n.is_empty() && (n == want || n.starts_with(&want) || want.starts_with(&n)))
+                .unwrap_or(false)
+        })
+        .and_then(|r| r.get("collectionId").and_then(|x| x.as_i64()))
+}
+
+/// Backstop album lookup via a song search — prefer a result matching both album
+/// and track, else any track-name match.
+fn itunes_song_collection(agent: &ureq::Agent, track: &str, artist: &str, album: &str) -> Option<i64> {
+    let term = urlencode(&format!("{track} {artist}"));
+    let url = format!("https://itunes.apple.com/search?entity=song&limit=25&term={term}");
+    let v: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
+    let results = v.get("results")?.as_array()?;
+    let want_album = norm_title(album);
+    let want_track = norm_title(track);
+    let track_of = |r: &serde_json::Value| {
+        r.get("trackName").and_then(|c| c.as_str()).map(norm_title).unwrap_or_default()
+    };
+    results
+        .iter()
+        .find(|r| {
+            let cn = r.get("collectionName").and_then(|c| c.as_str()).map(norm_title).unwrap_or_default();
+            !cn.is_empty() && cn == want_album && track_of(r) == want_track
+        })
+        .or_else(|| results.iter().find(|r| track_of(r) == want_track))
+        .and_then(|r| r.get("collectionId").and_then(|x| x.as_i64()))
 }
 
 // ---------------------------------------------------------------------------
