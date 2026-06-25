@@ -313,10 +313,10 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64, hits: &mut Hits) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(area);
 
-    footer(f, outer[1], s, t);
+    footer(f, outer[1], s);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -717,21 +717,22 @@ fn shimmer_border(f: &mut Frame, area: Rect, t: f64, speed: f32, glow: f32) {
 }
 
 /// One welded micro-chart on the footer's bottom row: where it anchors (under
-/// its number), the live 0..1 series, the base-hue ramp, and whether a real
-/// alarm is firing (crest lerps to RED).
+/// its number), the live 0..1 series, its fixed tint (magnitude is already the
+/// bar height, so colour is identity not data), and whether a real alarm fires.
 struct FootChart {
     x: u16,
     series: Vec<f32>,
-    hue: fn(f32) -> Color,
+    tint: Color,
     alarm: bool,
 }
 
-fn footer(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
-    // Two-row "glass cockpit": row 0 is the exact readouts (byte-for-byte the
-    // old footer, so numbers never reflow); row 1 is a strip of per-metric
-    // micro-waveforms welded directly under each number, fed by the same
-    // delay-interpolated series() the RESOURCES wave uses — buttery, honest,
-    // and shimmering with a single traveling specular sheen. See line 1.
+fn footer(f: &mut Frame, area: Rect, s: &AppState) {
+    // Two-row status bar: row 0 is the exact readouts (byte-for-byte the old
+    // footer, so numbers never reflow); row 1 is a strip of per-metric 8-level
+    // eighth-block sparklines welded directly under each number, fed by the same
+    // delay-interpolated series() the RESOURCES wave uses. Each is its own tint;
+    // the bar's height carries the value, brightness eases the level boundary so
+    // it glides instead of stepping. Honest, thin, on-palette. See line 1.
     f.render_widget(
         Block::default().style(Style::default().bg(c::PANEL_BORDER)),
         area,
@@ -789,29 +790,31 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     // are already 6-char fields, so they anchor flush.)
     let cpu_x = x.saturating_sub(1).max(area.x);
     push!(val(format!("{cpu:>3.0}%"), cpu_col));
-    charts.push(FootChart { x: cpu_x, series: res6(5, pct), hue: c::jazz, alarm: load_alarm });
+    // Fixed per-metric tints, reusing the RESOURCES wave's channel palette so the
+    // two cards read as one instrument family. Height carries the magnitude.
+    charts.push(FootChart { x: cpu_x, series: res6(5, pct), tint: Color::Rgb(86, 214, 255), alarm: load_alarm });
     if si.fresh {
         push!(sep());
         push!(lbl("GPU "));
         let gpu_x = x.saturating_sub(1).max(area.x);
         push!(val(format!("{:>3.0}%", si.gpu_pct), c::jazz(si.gpu_pct / 100.0)));
-        charts.push(FootChart { x: gpu_x, series: res6(4, pct), hue: c::jazz, alarm: false });
+        charts.push(FootChart { x: gpu_x, series: res6(4, pct), tint: c::accent(), alarm: false });
         push!(sep());
         push!(lbl("PWR "));
         let pwr_x = x;
         push!(val(format!("{:>5.1}W", si.all_power_w), c::jazz((si.all_power_w / 120.0).clamp(0.0, 1.0))));
-        charts.push(FootChart { x: pwr_x, series: sil6(1, pwr_n), hue: c::jazz, alarm: false });
+        charts.push(FootChart { x: pwr_x, series: sil6(1, pwr_n), tint: Color::Rgb(255,176,92), alarm: false });
         push!(sep());
         push!(lbl("TEMP "));
         let temp_x = x.saturating_sub(1).max(area.x);
         push!(val(format!("{:>3.0}°", si.cpu_temp_c), temp_col));
-        charts.push(FootChart { x: temp_x, series: sil6(2, temp_n), hue: c::jazz, alarm: temp_alarm });
+        charts.push(FootChart { x: temp_x, series: sil6(2, temp_n), tint: Color::Rgb(255,110,96), alarm: temp_alarm });
     }
     push!(sep());
     push!(lbl("MEM "));
     let mem_x = x.saturating_sub(1).max(area.x);
     push!(val(format!("{:>3.0}%", memf * 100.0), c::jazz(memf)));
-    charts.push(FootChart { x: mem_x, series: res6(0, pct), hue: c::jazz, alarm: false });
+    charts.push(FootChart { x: mem_x, series: res6(0, pct), tint: c::GREEN, alarm: false });
     push!(sep());
     push!(lbl("NET "));
     let net_dn_x = x;
@@ -819,8 +822,8 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
     let net_up_x = x + 1; // skip the leading space so the chart sits under ▲+digits
     push!(Span::styled(format!(" ▲{:>5}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::pink()).bg(c::PANEL_BORDER)));
     // NET ↓ leans cyan, NET ↑ leans pink — echoing the ▼/▲ glyph colors.
-    charts.push(FootChart { x: net_dn_x, series: res6(1, lograte), hue: |p| c::jazz(0.5 * p), alarm: false });
-    charts.push(FootChart { x: net_up_x, series: res6(2, lograte), hue: |p| c::jazz(0.5 + 0.5 * p), alarm: false });
+    charts.push(FootChart { x: net_dn_x, series: res6(1, lograte), tint: Color::Rgb(86,214,255), alarm: false });
+    charts.push(FootChart { x: net_up_x, series: res6(2, lograte), tint: c::pink(), alarm: false });
     if s.usage.fresh {
         push!(sep());
         push!(lbl("Claude today "));
@@ -847,17 +850,9 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         return;
     }
 
-    // Rows 1+ — the welded micro-waveform strip (4px tall over two cells). One
-    // global specular sheen rakes the full width every ~3s (color-only,
-    // lighten-only → no flicker, no jump).
-    let chart_top = area.y + 1;
-    let chart_rows = area.height - 1;
-    let base_y = area.y + area.height - 1; // bottom row, for hairlines
-    let sw = area.width.max(1) as f32;
-    let sheen_w = 3.0f32;
-    let sheen_speed = (sw + 2.0 * sheen_w) / 3.0;
-    let sheen_phase =
-        (t as f32 * sheen_speed).rem_euclid(sw + 2.0 * sheen_w) - sheen_w + area.x as f32;
+    // Row 1 — the welded sparkline strip, one clean eighth-block row. Scalars
+    // share the same baseline via their hairline, so it reads as one bank.
+    let chart_y = area.y + 1;
     let right = area.right();
     let buf = f.buffer_mut();
     for fc in &charts {
@@ -866,93 +861,57 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState, t: f64) {
         if fc.x.saturating_add(6) > right {
             continue;
         }
-        footer_chart(buf, fc.x, chart_top, chart_rows, &fc.series, fc.hue, fc.alarm, sheen_phase, sheen_w);
+        footer_chart(buf, fc.x, chart_y, &fc.series, fc.tint, fc.alarm);
     }
     for &(hx, hw) in &hairlines {
         let hw = hw.min(right.saturating_sub(hx));
-        footer_hairline(buf, hx, base_y, hw);
+        footer_hairline(buf, hx, chart_y, hw);
     }
 }
 
-/// Draw one metric's 6-column micro-waveform as a bottom-anchored area-wave,
-/// `rows` cells tall (each cell two truecolor pixels via '▀', fg = upper px,
-/// bg = lower px) → `rows*2` vertical pixels of resolution. Every pixel's lit
-/// fraction is continuous, so a crest gliding past a pixel boundary fades in
-/// smoothly — no stepping. Color is a vertical glow: dim body at the floor up to
-/// a vivid crest, the hue carrying magnitude via `hue(p)` (lerping to RED on a
-/// real alarm). Older columns ghost (phosphor recency) and the shared traveling
-/// sheen lightens whatever sits under its band.
-#[allow(clippy::too_many_arguments)]
+/// Draw one metric's 6-column micro-sparkline in a single row of eighth-blocks
+/// (`▁`..`█`), bottom-anchored on the slab. Height carries the value (8 clean
+/// levels, no black mud — the unlit area is always the slab). `tint` is the
+/// metric's fixed identity colour (→ RED on a real alarm). Two honest, data-
+/// aligned eases keep it from stepping/looking dead: the top block fades in as
+/// the value climbs into its level (anti-pop within the 8-step grid), and the
+/// newest (rightmost) column reads a touch brighter than the oldest (recency).
 fn footer_chart(
     buf: &mut ratatui::buffer::Buffer,
     x0: u16,
-    y_top: u16,
-    rows: u16,
+    y: u16,
     v: &[f32],
-    hue: fn(f32) -> Color,
+    tint: Color,
     alarm: bool,
-    sheen_phase: f32,
-    sheen_w: f32,
 ) {
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let n = v.len().max(1);
-    let rows = rows.max(1);
-    let px_h = (rows as f32) * 2.0; // total vertical pixels in the column
-    let glint = c::jazz(0.95);
+    let body = if alarm { c::blend(tint, c::RED, 0.85) } else { tint };
     for (lx, &p) in v.iter().enumerate() {
         let p = p.clamp(0.0, 1.0);
-        // Floor so every live gauge keeps a hued baseline pixel: a genuinely-low
-        // metric (idle PWR/TEMP) stays a colored well, visibly distinct from the
-        // grey "no-trend" hairline under the history-less scalars. The baselines
-        // share the floor sightline, so the strip reads as one instrument bank.
-        let total_px = (p * px_h).max(0.85); // pixels lit, bottom-up
-        let x = x0.saturating_add(lx as u16);
-        // Per-column garnish (same for every pixel in the column):
-        // phosphor recency by age (f(lx) only → steady column redraws identically
-        // → zero flicker) and the parabolic sheen band by absolute x.
-        let age = (n as f32 - 1.0 - lx as f32) / (n as f32 - 1.0).max(1.0);
-        let decay = 1.0 - 0.42 * age.powf(1.6);
-        let d = (x as f32 - sheen_phase) / sheen_w;
-        let gloss = (1.0 - d * d).max(0.0) * 0.42;
-        let base_hue = hue(p);
-        let hue_c = if alarm { c::blend(base_hue, c::RED, 0.85) } else { base_hue };
-        // One pixel at integer level `level` (0 = floor) with lit fraction `lit`.
-        let px = |level: f32, lit: f32| -> Color {
-            let vt = ((level + 0.5) / px_h).clamp(0.0, 1.0); // floor → crest
-            let target = c::blend(c::BG, hue_c, 0.45 + 0.55 * vt); // body → vivid crest
-            let mut col = c::blend(c::BG, target, lit); // anti-aliased fade-in
-            col = c::blend(c::BG, col, decay); // phosphor
-            if gloss > 0.0 {
-                col = c::blend(col, glint, gloss); // specular sheen, lighten-only
-            }
-            col
-        };
-        for r in 0..rows {
-            let fb = (rows - 1 - r) as f32; // 0 = bottom cell
-            let lower = fb * 2.0; // lower pixel's level
-            let upper = fb * 2.0 + 1.0; // upper pixel's level
-            let lower_lit = (total_px - lower).clamp(0.0, 1.0);
-            if lower_lit <= 0.0 {
-                continue; // this whole cell is above the wave → leave the slab
-            }
-            let upper_lit = (total_px - upper).clamp(0.0, 1.0);
-            let fg = px(upper, upper_lit); // upper pixel (fg of '▀')
-            let bg = px(lower, lower_lit); // lower pixel (bg of '▀')
-            if let Some(cell) = buf.cell_mut((x, y_top.saturating_add(r))) {
-                cell.set_char('▀');
-                cell.fg = fg;
-                cell.bg = bg;
-            }
+        let h = (p * 8.0).clamp(0.6, 8.0); // 0.6 floor → always at least ▁
+        let lvl = (h.ceil() as usize).clamp(1, 8);
+        let frac = 1.0 - (lvl as f32 - h); // 0..1 fill of the top (newest) level
+        let age = (n - 1 - lx) as f32 / (n - 1).max(1) as f32; // 0 newest .. 1 oldest
+        let b = (0.80 + 0.20 * frac) * (0.74 + 0.26 * (1.0 - age));
+        if let Some(cell) = buf.cell_mut((x0.saturating_add(lx as u16), y)) {
+            cell.set_char(BLOCKS[lvl - 1]);
+            cell.fg = c::blend(c::BG, body, b);
+            cell.bg = c::PANEL_BORDER;
         }
     }
 }
 
 /// The honest "no trend" mark under a history-less scalar (Claude $, uptime,
-/// procs): a static faint baseline — never a synthetic sparkline.
+/// procs): a static faint baseline on the same sightline as the sparklines —
+/// never a synthetic chart. Tinted just off FAINT so it reads "no trend here"
+/// rather than dead.
 fn footer_hairline(buf: &mut ratatui::buffer::Buffer, x0: u16, y: u16, width: u16) {
+    let col = c::blend(c::FAINT, c::DIM, 0.35);
     for i in 0..width {
         if let Some(cell) = buf.cell_mut((x0.saturating_add(i), y)) {
             cell.set_char('▁');
-            cell.fg = c::FAINT;
+            cell.fg = col;
             cell.bg = c::PANEL_BORDER;
         }
     }
