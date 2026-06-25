@@ -39,9 +39,6 @@ const GRAPH_WINDOW: Duration = Duration::from_millis(12_000);
 /// visible column is an anti-aliased area integral and the scroll never steps.
 const WAVE_OS: usize = 3;
 
-/// Visible cell width of each footer micro-graph (welds under a 6-char readout).
-const FOOT_CW: usize = 6;
-
 /// Delayed Catmull-Rom value of channel `ch` from a multi-channel sample buffer
 /// at `target` time.
 fn sampled_channel(samples: &VecDeque<(Instant, Vec<f32>)>, ch: usize, target: Instant) -> f32 {
@@ -375,7 +372,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64, hits: &mut Hits) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(area);
 
     footer(f, outer[1], s);
@@ -783,7 +780,8 @@ fn shimmer_border(f: &mut Frame, area: Rect, t: f64, speed: f32, glow: f32) {
 /// bar height, so colour is identity not data), and whether a real alarm fires.
 struct FootChart {
     x: u16,
-    series: Vec<f32>,
+    w: u16, // visible width — each wave spans its whole label+number lane so it
+    series: Vec<f32>, // flows like the RESOURCES wave instead of reading as 6 bars
     tint: Color,
     alarm: bool,
 }
@@ -835,12 +833,12 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     let pwr_n: fn(f32) -> f32 = |w| (w / 120.0).clamp(0.0, 1.0);
     let temp_n: fn(f32) -> f32 = |c| ((c - 30.0) / 70.0).clamp(0.0, 1.0);
     // Delay-interpolated series for one channel of a sample ring, built at the
-    // wave's supersampled sub-column width (WAVE_OS × the 6 visible cells).
-    let res6 = |ch: usize, norm: fn(f32) -> f32| {
-        series(&s.res_samples, WAVE_OS * FOOT_CW, move |b, tt| sampled_channel(b, ch, tt), norm)
+    // wave's supersampled sub-column width (WAVE_OS × the wave's `w` visible cells).
+    let res_w = |ch: usize, w: u16, norm: fn(f32) -> f32| {
+        series(&s.res_samples, WAVE_OS * w as usize, move |b, tt| sampled_channel(b, ch, tt), norm)
     };
-    let sil6 = |ch: usize, norm: fn(f32) -> f32| {
-        series(&s.silicon_samples, WAVE_OS * FOOT_CW, move |b, tt| sampled_channel(b, ch, tt), norm)
+    let sil_w = |ch: usize, w: u16, norm: fn(f32) -> f32| {
+        series(&s.silicon_samples, WAVE_OS * w as usize, move |b, tt| sampled_channel(b, ch, tt), norm)
     };
 
     // Build row 0 exactly as before, but track a running cell-x so each number's
@@ -861,45 +859,53 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     push!(Span::styled(" q ", Style::default().fg(c::BG).bg(c::accent()).add_modifier(Modifier::BOLD)));
     push!(Span::styled(" quit", Style::default().fg(c::DIM).bg(c::PANEL_BORDER)));
     push!(sep());
+    // Each metric's wave spans its WHOLE label+number lane (recorded from the label
+    // start to the end of the number), not just the 6-char number — so it's wide
+    // enough to read as a flowing right-to-left wave like the RESOURCES card, not a
+    // row of bars. Fixed per-metric tints reuse that wave's palette.
+    let cpu_wx = x;
     push!(lbl("CPU "));
-    // Each gliding readout is a fixed 6-char field ("100.0%"/" 10.3W"/" 58.0°"),
-    // so its 6-col sparkline welds flush beneath it and the right edge never moves
-    // as digits change. Fixed per-metric tints reuse the RESOURCES wave palette so
-    // the two cards read as one instrument family; the bar height is the value.
-    let cpu_x = x;
     push!(val(format!("{cpu:>5.1}%"), cpu_col));
-    charts.push(FootChart { x: cpu_x, series: res6(5, pct), tint: Color::Rgb(86, 214, 255), alarm: load_alarm });
+    let cpu_w = x - cpu_wx;
+    charts.push(FootChart { x: cpu_wx, w: cpu_w, series: res_w(5, cpu_w, pct), tint: Color::Rgb(86, 214, 255), alarm: load_alarm });
     if si.fresh {
         push!(sep());
+        let gpu_wx = x;
         push!(lbl("GPU "));
-        let gpu_x = x;
         push!(val(format!("{gpu_disp:>5.1}%"), c::jazz(gpu_disp / 100.0)));
-        charts.push(FootChart { x: gpu_x, series: res6(4, pct), tint: c::accent(), alarm: false });
+        let gpu_w = x - gpu_wx;
+        charts.push(FootChart { x: gpu_wx, w: gpu_w, series: res_w(4, gpu_w, pct), tint: c::accent(), alarm: false });
         push!(sep());
+        let pwr_wx = x;
         push!(lbl("PWR "));
-        let pwr_x = x;
         push!(val(format!("{pwr_disp:>5.1}W"), c::jazz((pwr_disp / 120.0).clamp(0.0, 1.0))));
-        charts.push(FootChart { x: pwr_x, series: sil6(1, pwr_n), tint: Color::Rgb(255,176,92), alarm: false });
+        let pwr_w = x - pwr_wx;
+        charts.push(FootChart { x: pwr_wx, w: pwr_w, series: sil_w(1, pwr_w, pwr_n), tint: Color::Rgb(255,176,92), alarm: false });
         push!(sep());
+        let temp_wx = x;
         push!(lbl("TEMP "));
-        let temp_x = x;
         push!(val(format!("{temp_disp:>5.1}°"), temp_col));
-        charts.push(FootChart { x: temp_x, series: sil6(2, temp_n), tint: Color::Rgb(255,110,96), alarm: temp_alarm });
+        let temp_w = x - temp_wx;
+        charts.push(FootChart { x: temp_wx, w: temp_w, series: sil_w(2, temp_w, temp_n), tint: Color::Rgb(255,110,96), alarm: temp_alarm });
     }
     push!(sep());
+    let mem_wx = x;
     push!(lbl("MEM "));
-    let mem_x = x;
     push!(val(format!("{mem_disp:>5.1}%"), c::jazz(mem_disp / 100.0)));
-    charts.push(FootChart { x: mem_x, series: res6(0, pct), tint: c::GREEN, alarm: false });
+    let mem_w = x - mem_wx;
+    charts.push(FootChart { x: mem_wx, w: mem_w, series: res_w(0, mem_w, pct), tint: c::GREEN, alarm: false });
     push!(sep());
+    // NET: ↓ wave spans "NET ▼…", ↑ wave spans " ▲…" — each its own lane.
+    let net_dn_wx = x;
     push!(lbl("NET "));
-    let net_dn_x = x;
     push!(Span::styled(format!("▼{:>5}", fmt_rate_short(rx_bps)), Style::default().fg(c::cyan()).bg(c::PANEL_BORDER)));
-    let net_up_x = x + 1; // skip the leading space so the chart sits under ▲+digits
+    let net_dn_w = x - net_dn_wx;
+    let net_up_wx = x;
     push!(Span::styled(format!(" ▲{:>5}", fmt_rate_short(tx_bps)), Style::default().fg(c::pink()).bg(c::PANEL_BORDER)));
+    let net_up_w = x - net_up_wx;
     // NET ↓ leans cyan, NET ↑ leans pink — echoing the ▼/▲ glyph colors.
-    charts.push(FootChart { x: net_dn_x, series: res6(1, lograte), tint: Color::Rgb(86,214,255), alarm: false });
-    charts.push(FootChart { x: net_up_x, series: res6(2, lograte), tint: c::pink(), alarm: false });
+    charts.push(FootChart { x: net_dn_wx, w: net_dn_w, series: res_w(1, net_dn_w, lograte), tint: Color::Rgb(86,214,255), alarm: false });
+    charts.push(FootChart { x: net_up_wx, w: net_up_w, series: res_w(2, net_up_w, lograte), tint: c::pink(), alarm: false });
     if s.usage.fresh {
         push!(sep());
         push!(lbl("Claude today "));
@@ -926,72 +932,61 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    // Rows 1-2 — the welded micro-graph strip: each metric is the same glowing
-    // sub-cell area-wave as the RESOURCES card, in a 6-cell-wide slot. Scalars
-    // share the wave's baseline via their hairline on the bottom row.
-    let chart_top = area.y + 1;
-    let chart_h = area.height - 1; // rows below the readouts
-    let base_y = area.y + area.height - 1; // bottom row, for hairlines
+    // Row 1 — the wave strip: each metric is a wide, flowing eighth-block wave
+    // spanning its whole lane (the RESOURCES wave in miniature). Scalars share the
+    // baseline via their hairline.
+    let chart_y = area.y + 1;
     let right = area.right();
-    // Recency ramp: newest (rightmost) column brightest, oldest dimmest — the one
-    // bit of motion, data-aligned, shared by every chart.
-    let recency: Vec<f32> = (0..FOOT_CW)
-        .map(|x| {
-            let age = (FOOT_CW - 1 - x) as f32 / (FOOT_CW - 1).max(1) as f32;
-            0.74 + 0.26 * (1.0 - age)
-        })
-        .collect();
     let buf = f.buffer_mut();
     for fc in &charts {
-        // Degradation under width pressure: if a chart would spill past the bar,
+        // Degradation under width pressure: if a wave would spill past the bar,
         // skip it (it sits at the far right, so NET ↑ drops first) — never clip.
-        if fc.x.saturating_add(FOOT_CW as u16) > right {
+        if fc.x.saturating_add(fc.w) > right {
             continue;
         }
-        let rect = Rect { x: fc.x, y: chart_top, width: FOOT_CW as u16, height: chart_h };
-        footer_chart(buf, rect, &fc.series, fc.tint, fc.alarm, &recency);
+        let rect = Rect { x: fc.x, y: chart_y, width: fc.w, height: 1 };
+        footer_chart(buf, rect, &fc.series, fc.tint, fc.alarm);
     }
     for &(hx, hw) in &hairlines {
         let hw = hw.min(right.saturating_sub(hx));
-        footer_hairline(buf, hx, base_y, hw);
+        footer_hairline(buf, hx, chart_y, hw);
     }
 }
 
 /// Draw one metric's micro-graph: the same glowing sub-cell area-wave as the
 /// RESOURCES card (`wave_area`), single-band in the metric's tint (→ RED on a
-/// real alarm), brightness-ramped newest→oldest by `recency`. `v` is the
-/// supersampled series (WAVE_OS × the slot's cell width); the slab shows above
-/// and behind the wave so it sits cleanly in the footer.
-fn footer_chart(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    v: &[f32],
-    tint: Color,
-    alarm: bool,
-    recency: &[f32],
-) {
+/// real alarm). `v` is the supersampled series (WAVE_OS × `area.width` cells); a
+/// one row strip, but spanning the whole lane it reads as a flowing eighth-block
+/// wave. The slab shows above and behind the wave so it sits cleanly in the footer.
+fn footer_chart(buf: &mut ratatui::buffer::Buffer, area: Rect, v: &[f32], tint: Color, alarm: bool) {
     let shade = if alarm { c::blend(tint, c::RED, 0.85) } else { tint };
     // Floor so a genuinely-idle metric still shows a thin hued baseline (never an
-    // empty gap next to its busy neighbours) — kept low so it reads as a baseline,
-    // not a block competing with live metrics.
+    // empty gap next to its busy neighbours), kept low so it reads as a baseline.
     let band: Vec<f32> = v.iter().map(|&x| x.max(0.13)).collect();
+    // Recency ramp across the visible width: newest (rightmost) column brightest,
+    // oldest dimmest — a data-aligned glow that reinforces the right-to-left flow.
+    let w = area.width.max(1) as usize;
+    let recency: Vec<f32> = (0..w)
+        .map(|x| {
+            let age = (w - 1 - x) as f32 / (w - 1).max(1) as f32;
+            0.78 + 0.22 * (1.0 - age)
+        })
+        .collect();
     wave_area(
         buf,
         area,
         &[(shade, band)],
-        Some(recency),
+        Some(&recency),
         &WaveCfg {
-            // Light blur only: the footer strip is just WAVE_OS*FOOT_CW=18 sub-cols,
-            // so RESOURCES' wide kernel would flatten the amplitude — the 3×
-            // supersample + Catmull-Rom already carry the smoothness; this is AA.
+            // Light blur only — the 3× supersample + Catmull-Rom carry the
+            // smoothness; a wide kernel here would just flatten the amplitude.
             oversample: WAVE_OS,
             blur_radius: 1,
             blur_passes: 2,
-            // Compressed-bright glow: a 2-row well lives mostly in the bottom row,
-            // so lift the base (≈0.66) while the crest still pops (≈0.89) — keeps
-            // the hue saturated instead of sitting in the dim half of the ramp.
-            glow_base: 0.55,
-            glow_span: 0.45,
+            // One bright row (no vertical room for a dim→vivid ramp), so keep the
+            // eighth-block fill saturated; height carries the wave shape.
+            glow_base: 0.74,
+            glow_span: 0.26,
             fill: None, // gauge value is already 0..1
             bg: c::PANEL_BORDER,
         },
