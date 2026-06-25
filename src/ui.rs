@@ -739,16 +739,30 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     );
     let sys = &s.system;
     let si = &s.silicon;
-    let memf = if sys.mem_total > 0 { sys.mem_used as f32 / sys.mem_total as f32 } else { 0.0 };
-    let cpu = if si.fresh { si.cpu_pct } else { sys.cpu_overall };
     let ncpu = sys.per_core.len().max(1) as f64;
+
+    // Every readout is the delay-interpolated value at now-EQ_DELAY — the same
+    // Catmull-Rom playback the charts and the PROC card use — so the numbers
+    // GLIDE through intermediate values instead of snapping at the 1 Hz collector
+    // tick. Each number is exactly the head (rightmost column) of its own
+    // sparkline, and a tenths digit makes the glide read like the PROC card.
+    let play = Instant::now().checked_sub(EQ_DELAY).unwrap_or_else(Instant::now);
+    let res_at = |ch: usize| sampled_channel(&s.res_samples, ch, play);
+    let sil_at = |ch: usize| sampled_channel(&s.silicon_samples, ch, play);
+    let cpu = res_at(5); // sysinfo cpu% — matches the CPU sparkline + RESOURCES lane
+    let gpu_disp = res_at(4);
+    let mem_disp = res_at(0);
+    let pwr_disp = if si.fresh { sil_at(1) } else { si.all_power_w };
+    let temp_disp = if si.fresh { sil_at(2) } else { si.cpu_temp_c };
+    let rx_bps = res_at(1) as f64 * 1024.0;
+    let tx_bps = res_at(2) as f64 * 1024.0;
 
     let sep = || Span::styled("  │  ", Style::default().fg(c::FAINT).bg(c::PANEL_BORDER));
     let lbl = |t: &str| Span::styled(t.to_string(), Style::default().fg(c::DIM).bg(c::PANEL_BORDER));
     let val = |t: String, col| Span::styled(t, Style::default().fg(col).bg(c::PANEL_BORDER).add_modifier(Modifier::BOLD));
     // Jazz family for normal readouts; RED only when a real threshold is crossed.
-    let temp_alarm = si.cpu_temp_c > 80.0;
-    let temp_col = if temp_alarm { c::RED } else { c::jazz((si.cpu_temp_c - 30.0) / 70.0) };
+    let temp_alarm = temp_disp > 80.0;
+    let temp_col = if temp_alarm { c::RED } else { c::jazz((temp_disp - 30.0) / 70.0) };
     let load_alarm = sys.load.0 > ncpu;
     let cpu_col = if load_alarm { c::RED } else { c::jazz(cpu / 100.0) };
 
@@ -785,42 +799,41 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     push!(Span::styled(" quit", Style::default().fg(c::DIM).bg(c::PANEL_BORDER)));
     push!(sep());
     push!(lbl("CPU "));
-    // The 6-col chart straddles a 4-char value field ("100%"): start one col left
-    // so it centers on the number instead of overhanging into the gap. (PWR/NET
-    // are already 6-char fields, so they anchor flush.)
-    let cpu_x = x.saturating_sub(1).max(area.x);
-    push!(val(format!("{cpu:>3.0}%"), cpu_col));
-    // Fixed per-metric tints, reusing the RESOURCES wave's channel palette so the
-    // two cards read as one instrument family. Height carries the magnitude.
+    // Each gliding readout is a fixed 6-char field ("100.0%"/" 10.3W"/" 58.0°"),
+    // so its 6-col sparkline welds flush beneath it and the right edge never moves
+    // as digits change. Fixed per-metric tints reuse the RESOURCES wave palette so
+    // the two cards read as one instrument family; the bar height is the value.
+    let cpu_x = x;
+    push!(val(format!("{cpu:>5.1}%"), cpu_col));
     charts.push(FootChart { x: cpu_x, series: res6(5, pct), tint: Color::Rgb(86, 214, 255), alarm: load_alarm });
     if si.fresh {
         push!(sep());
         push!(lbl("GPU "));
-        let gpu_x = x.saturating_sub(1).max(area.x);
-        push!(val(format!("{:>3.0}%", si.gpu_pct), c::jazz(si.gpu_pct / 100.0)));
+        let gpu_x = x;
+        push!(val(format!("{gpu_disp:>5.1}%"), c::jazz(gpu_disp / 100.0)));
         charts.push(FootChart { x: gpu_x, series: res6(4, pct), tint: c::accent(), alarm: false });
         push!(sep());
         push!(lbl("PWR "));
         let pwr_x = x;
-        push!(val(format!("{:>5.1}W", si.all_power_w), c::jazz((si.all_power_w / 120.0).clamp(0.0, 1.0))));
+        push!(val(format!("{pwr_disp:>5.1}W"), c::jazz((pwr_disp / 120.0).clamp(0.0, 1.0))));
         charts.push(FootChart { x: pwr_x, series: sil6(1, pwr_n), tint: Color::Rgb(255,176,92), alarm: false });
         push!(sep());
         push!(lbl("TEMP "));
-        let temp_x = x.saturating_sub(1).max(area.x);
-        push!(val(format!("{:>3.0}°", si.cpu_temp_c), temp_col));
+        let temp_x = x;
+        push!(val(format!("{temp_disp:>5.1}°"), temp_col));
         charts.push(FootChart { x: temp_x, series: sil6(2, temp_n), tint: Color::Rgb(255,110,96), alarm: temp_alarm });
     }
     push!(sep());
     push!(lbl("MEM "));
-    let mem_x = x.saturating_sub(1).max(area.x);
-    push!(val(format!("{:>3.0}%", memf * 100.0), c::jazz(memf)));
+    let mem_x = x;
+    push!(val(format!("{mem_disp:>5.1}%"), c::jazz(mem_disp / 100.0)));
     charts.push(FootChart { x: mem_x, series: res6(0, pct), tint: c::GREEN, alarm: false });
     push!(sep());
     push!(lbl("NET "));
     let net_dn_x = x;
-    push!(Span::styled(format!("▼{:>5}", fmt_rate_short(sys.net_rx_bps)), Style::default().fg(c::cyan()).bg(c::PANEL_BORDER)));
+    push!(Span::styled(format!("▼{:>5}", fmt_rate_short(rx_bps)), Style::default().fg(c::cyan()).bg(c::PANEL_BORDER)));
     let net_up_x = x + 1; // skip the leading space so the chart sits under ▲+digits
-    push!(Span::styled(format!(" ▲{:>5}", fmt_rate_short(sys.net_tx_bps)), Style::default().fg(c::pink()).bg(c::PANEL_BORDER)));
+    push!(Span::styled(format!(" ▲{:>5}", fmt_rate_short(tx_bps)), Style::default().fg(c::pink()).bg(c::PANEL_BORDER)));
     // NET ↓ leans cyan, NET ↑ leans pink — echoing the ▼/▲ glyph colors.
     charts.push(FootChart { x: net_dn_x, series: res6(1, lograte), tint: Color::Rgb(86,214,255), alarm: false });
     charts.push(FootChart { x: net_up_x, series: res6(2, lograte), tint: c::pink(), alarm: false });
