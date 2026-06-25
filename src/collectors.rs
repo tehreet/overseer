@@ -144,19 +144,22 @@ pub fn spawn_system(shared: Shared) {
                         cpu_pct,
                     ],
                 ));
-                while s.res_samples.len() > 16 {
+                while s.res_samples.len() > 32 {
                     s.res_samples.pop_front();
                 }
                 // Top-process snapshot for the proc card's delayed, interpolated
                 // playback (eased cpu%/mem + sliding row reorder, keyed by name).
                 let proc_snap = s.system.top_procs.clone();
                 s.proc_samples.push_back((now, proc_snap));
-                while s.proc_samples.len() > 16 {
+                while s.proc_samples.len() > 32 {
                     s.proc_samples.pop_front();
                 }
             }
 
-            thread::sleep(Duration::from_millis(1000));
+            // 2 Hz: twice the curve support for the waves + readouts (real
+            // intermediate motion for Catmull-Rom), still cheap for the periodic
+            // full process refresh above. dt is measured, so rates stay correct.
+            thread::sleep(Duration::from_millis(500));
         }
     });
 }

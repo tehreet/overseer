@@ -34,6 +34,14 @@ fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, u: f32) -> f32 {
 /// real sample — honest data, buttery motion.
 const GRAPH_WINDOW: Duration = Duration::from_millis(12_000);
 
+/// Horizontal supersample factor for the area-wave: bands are built at
+/// `WAVE_OS * width` sub-columns and area-averaged back down to cells, so every
+/// visible column is an anti-aliased area integral and the scroll never steps.
+const WAVE_OS: usize = 3;
+
+/// Visible cell width of each footer micro-graph (welds under a 6-char readout).
+const FOOT_CW: usize = 6;
+
 /// Delayed Catmull-Rom value of channel `ch` from a multi-channel sample buffer
 /// at `target` time.
 fn sampled_channel(samples: &VecDeque<(Instant, Vec<f32>)>, ch: usize, target: Instant) -> f32 {
@@ -109,85 +117,139 @@ fn smoothed(v: &[f32], radius: usize, passes: usize) -> Vec<f32> {
     cur
 }
 
-/// Render the RESOURCES wave: the live channels **stacked** into one smooth,
-/// cohesive area that scrolls per-frame (the inputs are delay-interpolated
-/// upstream, so the curve glides instead of stepping at 1 Hz). Each channel is a
-/// shade up the jazz ramp — violet → pink → white, the "four shades of pink" —
-/// piled bottom→top, so the silhouette is the combined activity. A dim→vivid
-/// vertical glow plus a 1/8-block top edge keep it buttery; the stack is
-/// normalised so the busiest column just kisses the top and the wave owns the card.
-fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(ratatui::style::Color, Vec<f32>)]) {
-    use ratatui::style::Color;
+/// Tuning for the unified sub-cell area-wave renderer (`wave_area`). The big
+/// RESOURCES wave and every footer micro-graph go through it, so they glide with
+/// the exact same feel — same blur, glow, supersample, and eighth-block crest.
+struct WaveCfg {
+    /// Horizontal supersample: the caller builds bands at `oversample * width`
+    /// sub-columns; the renderer area-averages each group back to one cell, so
+    /// every visible column is an anti-aliased area integral (no scroll stepping).
+    oversample: usize,
+    blur_radius: usize,
+    blur_passes: usize,
+    /// Vertical glow: brightness `glow_base + glow_span*crest` (floor → top row),
+    /// blended from BG up to the band shade so the column reads as a dim-base →
+    /// vivid-crest wave with depth, never a flat bar.
+    glow_base: f32,
+    glow_span: f32,
+    /// `Some(fill)` → stack-peak normalise so the busiest column kisses `fill` of
+    /// the height (RESOURCES). `None` → bands are already 0..1 (footer gauges).
+    fill: Option<f32>,
+    /// Background shown above the wave and behind the eighth-block crest (the
+    /// card BG for RESOURCES, the slab for the footer).
+    bg: Color,
+}
+
+/// The one sub-cell area-wave renderer. `bands` stack bottom→top; each is a
+/// `(shade, sub-column heights)` pair at `cfg.oversample * area.width` length.
+/// `col_gain` optionally scales each visible column's brightness (the footer's
+/// recency ramp). Writes straight into the buffer, so it works at any height —
+/// one row or sixteen. A dim→vivid vertical glow plus the `vblock` top edge keep
+/// the silhouette buttery; the stack is normalised so the busiest column kisses
+/// the top. See line 1.
+fn wave_area(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    bands: &[(Color, Vec<f32>)],
+    col_gain: Option<&[f32]>,
+    cfg: &WaveCfg,
+) {
     let w = area.width as usize;
     let h = area.height as usize;
     if w == 0 || h == 0 || bands.is_empty() {
         return;
     }
-    // Blur each channel so bursty signals read as one buttery curve, not cliffs.
-    let bands: Vec<(Color, Vec<f32>)> =
-        bands.iter().map(|(col, v)| (*col, smoothed(v, 2, 4))).collect();
-    // Per-column stack totals → scale so the tallest column ~fills the plot.
+    let os = cfg.oversample.max(1);
+    // Blur each band in sub-column space, then area-average each group of `os`
+    // sub-columns down to one visible cell (true supersample, not a point pick) —
+    // so bursty signals read as one buttery curve and the scroll never steps.
+    let cells: Vec<(Color, Vec<f32>)> = bands
+        .iter()
+        .map(|(col, v)| {
+            let b = smoothed(v, cfg.blur_radius, cfg.blur_passes);
+            let down: Vec<f32> = (0..w)
+                .map(|x| {
+                    let lo = x * os;
+                    let hi = ((x + 1) * os).min(b.len());
+                    if hi <= lo {
+                        b.get(lo).copied().unwrap_or(0.0)
+                    } else {
+                        b[lo..hi].iter().sum::<f32>() / (hi - lo) as f32
+                    }
+                })
+                .collect();
+            (*col, down)
+        })
+        .collect();
+    // Per-visible-column stack totals → scale.
     let mut totals = vec![0.0f32; w];
-    for (x, total) in totals.iter_mut().enumerate().take(w) {
-        for (_, v) in &bands {
+    for (x, total) in totals.iter_mut().enumerate() {
+        for (_, v) in &cells {
             *total += v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         }
     }
-    let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.8);
-    let scale = (h as f32 * 0.94) / peak;
-
-    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    let scale = match cfg.fill {
+        Some(fill) => {
+            let peak = totals.iter().copied().fold(0.0f32, f32::max).max(0.8);
+            (h as f32 * fill) / peak
+        }
+        None => h as f32, // values already 0..1
+    };
     for row in 0..h {
         let r_bot = (h - 1 - row) as f32; // this cell spans rows [r_bot, r_bot+1)
         let crest = ((r_bot + 0.5) / h as f32).clamp(0.0, 1.0); // dim base → vivid top
-        let mut spans: Vec<Span> = Vec::new();
-        let mut run = String::new();
-        let mut run_col: Option<Color> = None;
-        for (x, &col_total) in totals.iter().enumerate().take(w) {
-            let total = col_total * scale; // stack top, in rows
-            let (ch, col) = if total <= r_bot {
-                (' ', None) // above the wave
-            } else {
-                // Which shade owns this cell? Probe the cell's middle (clamped just
-                // inside the stack top) and find the band whose slice contains it.
-                let probe = (r_bot + 0.5).min(total - 1e-3).max(0.0);
-                let mut acc = 0.0f32;
-                let mut shade = bands.last().map(|b| b.0).unwrap_or(c::BG);
-                for (col, v) in &bands {
-                    let br = v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0) * scale;
-                    if probe < acc + br {
-                        shade = *col;
-                        break;
-                    }
-                    acc += br;
-                }
-                // Sub-cell smoothing only on the very top edge of the stack.
-                let ch = if total < r_bot + 1.0 { c::vblock(total - r_bot) } else { '█' };
-                (ch, Some(c::blend(c::BG, shade, 0.42 + 0.58 * crest)))
-            };
-            if col == run_col {
-                run.push(ch);
-            } else {
-                if !run.is_empty() {
-                    let prev = std::mem::take(&mut run);
-                    spans.push(match run_col {
-                        Some(c) => Span::styled(prev, Style::default().fg(c)),
-                        None => Span::raw(prev),
-                    });
-                }
-                run.push(ch);
-                run_col = col;
+        let yy = area.y + row as u16;
+        for x in 0..w {
+            let xx = area.x + x as u16;
+            let total = totals[x] * scale; // stack top, in rows
+            let Some(cell) = buf.cell_mut((xx, yy)) else { continue };
+            if total <= r_bot {
+                cell.set_char(' ');
+                cell.bg = cfg.bg;
+                continue; // above the wave
             }
+            // Which shade owns this cell? Probe the cell mid (clamped just inside
+            // the stack top) and find the band whose slice contains it.
+            let probe = (r_bot + 0.5).min(total - 1e-3).max(0.0);
+            let mut acc = 0.0f32;
+            let mut shade = cells.last().map(|b| b.0).unwrap_or(c::BG);
+            for (col, v) in &cells {
+                let br = v.get(x).copied().unwrap_or(0.0).clamp(0.0, 1.0) * scale;
+                if probe < acc + br {
+                    shade = *col;
+                    break;
+                }
+                acc += br;
+            }
+            let ch = if total < r_bot + 1.0 { c::vblock(total - r_bot) } else { '█' };
+            let gain = col_gain.and_then(|g| g.get(x).copied()).unwrap_or(1.0);
+            let g = ((cfg.glow_base + cfg.glow_span * crest) * gain).clamp(0.0, 1.0);
+            cell.set_char(ch);
+            cell.fg = c::blend(c::BG, shade, g); // glow anchored at BG keeps hue
+            cell.bg = cfg.bg;
         }
-        if !run.is_empty() {
-            spans.push(match run_col {
-                Some(c) => Span::styled(run, Style::default().fg(c)),
-                None => Span::raw(run),
-            });
-        }
-        lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The RESOURCES wave: the six live channels stacked into one cohesive, glowing
+/// area through the shared `wave_area` renderer. Inputs are delay-interpolated
+/// and 3× supersampled, so the curve glides and scrolls without stepping.
+fn stacked_wave(f: &mut Frame, area: Rect, bands: &[(Color, Vec<f32>)]) {
+    wave_area(
+        f.buffer_mut(),
+        area,
+        bands,
+        None,
+        &WaveCfg {
+            oversample: WAVE_OS,
+            blur_radius: 3,
+            blur_passes: 6,
+            glow_base: 0.22,
+            glow_span: 0.78,
+            fill: Some(0.94),
+            bg: c::BG,
+        },
+    );
 }
 
 /// Row heights for the 11-slot left column given the available height `avail`.
@@ -313,7 +375,7 @@ pub fn render(f: &mut Frame, s: &AppState, t: f64, hits: &mut Hits) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
     footer(f, outer[1], s);
@@ -772,12 +834,13 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
     let lograte: fn(f32) -> f32 = |kbps| (kbps.max(0.5).log10() / 4.0).clamp(0.0, 1.0);
     let pwr_n: fn(f32) -> f32 = |w| (w / 120.0).clamp(0.0, 1.0);
     let temp_n: fn(f32) -> f32 = |c| ((c - 30.0) / 70.0).clamp(0.0, 1.0);
-    // 6-col delay-interpolated series for one channel of a sample ring.
+    // Delay-interpolated series for one channel of a sample ring, built at the
+    // wave's supersampled sub-column width (WAVE_OS × the 6 visible cells).
     let res6 = |ch: usize, norm: fn(f32) -> f32| {
-        series(&s.res_samples, 6, move |b, tt| sampled_channel(b, ch, tt), norm)
+        series(&s.res_samples, WAVE_OS * FOOT_CW, move |b, tt| sampled_channel(b, ch, tt), norm)
     };
     let sil6 = |ch: usize, norm: fn(f32) -> f32| {
-        series(&s.silicon_samples, 6, move |b, tt| sampled_channel(b, ch, tt), norm)
+        series(&s.silicon_samples, WAVE_OS * FOOT_CW, move |b, tt| sampled_channel(b, ch, tt), norm)
     };
 
     // Build row 0 exactly as before, but track a running cell-x so each number's
@@ -863,56 +926,76 @@ fn footer(f: &mut Frame, area: Rect, s: &AppState) {
         return;
     }
 
-    // Row 1 — the welded sparkline strip, one clean eighth-block row. Scalars
-    // share the same baseline via their hairline, so it reads as one bank.
-    let chart_y = area.y + 1;
+    // Rows 1-2 — the welded micro-graph strip: each metric is the same glowing
+    // sub-cell area-wave as the RESOURCES card, in a 6-cell-wide slot. Scalars
+    // share the wave's baseline via their hairline on the bottom row.
+    let chart_top = area.y + 1;
+    let chart_h = area.height - 1; // rows below the readouts
+    let base_y = area.y + area.height - 1; // bottom row, for hairlines
     let right = area.right();
+    // Recency ramp: newest (rightmost) column brightest, oldest dimmest — the one
+    // bit of motion, data-aligned, shared by every chart.
+    let recency: Vec<f32> = (0..FOOT_CW)
+        .map(|x| {
+            let age = (FOOT_CW - 1 - x) as f32 / (FOOT_CW - 1).max(1) as f32;
+            0.74 + 0.26 * (1.0 - age)
+        })
+        .collect();
     let buf = f.buffer_mut();
     for fc in &charts {
         // Degradation under width pressure: if a chart would spill past the bar,
         // skip it (it sits at the far right, so NET ↑ drops first) — never clip.
-        if fc.x.saturating_add(6) > right {
+        if fc.x.saturating_add(FOOT_CW as u16) > right {
             continue;
         }
-        footer_chart(buf, fc.x, chart_y, &fc.series, fc.tint, fc.alarm);
+        let rect = Rect { x: fc.x, y: chart_top, width: FOOT_CW as u16, height: chart_h };
+        footer_chart(buf, rect, &fc.series, fc.tint, fc.alarm, &recency);
     }
     for &(hx, hw) in &hairlines {
         let hw = hw.min(right.saturating_sub(hx));
-        footer_hairline(buf, hx, chart_y, hw);
+        footer_hairline(buf, hx, base_y, hw);
     }
 }
 
-/// Draw one metric's 6-column micro-sparkline in a single row of eighth-blocks
-/// (`▁`..`█`), bottom-anchored on the slab. Height carries the value (8 clean
-/// levels, no black mud — the unlit area is always the slab). `tint` is the
-/// metric's fixed identity colour (→ RED on a real alarm). Two honest, data-
-/// aligned eases keep it from stepping/looking dead: the top block fades in as
-/// the value climbs into its level (anti-pop within the 8-step grid), and the
-/// newest (rightmost) column reads a touch brighter than the oldest (recency).
+/// Draw one metric's micro-graph: the same glowing sub-cell area-wave as the
+/// RESOURCES card (`wave_area`), single-band in the metric's tint (→ RED on a
+/// real alarm), brightness-ramped newest→oldest by `recency`. `v` is the
+/// supersampled series (WAVE_OS × the slot's cell width); the slab shows above
+/// and behind the wave so it sits cleanly in the footer.
 fn footer_chart(
     buf: &mut ratatui::buffer::Buffer,
-    x0: u16,
-    y: u16,
+    area: Rect,
     v: &[f32],
     tint: Color,
     alarm: bool,
+    recency: &[f32],
 ) {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let n = v.len().max(1);
-    let body = if alarm { c::blend(tint, c::RED, 0.85) } else { tint };
-    for (lx, &p) in v.iter().enumerate() {
-        let p = p.clamp(0.0, 1.0);
-        let h = (p * 8.0).clamp(0.6, 8.0); // 0.6 floor → always at least ▁
-        let lvl = (h.ceil() as usize).clamp(1, 8);
-        let frac = 1.0 - (lvl as f32 - h); // 0..1 fill of the top (newest) level
-        let age = (n - 1 - lx) as f32 / (n - 1).max(1) as f32; // 0 newest .. 1 oldest
-        let b = (0.80 + 0.20 * frac) * (0.74 + 0.26 * (1.0 - age));
-        if let Some(cell) = buf.cell_mut((x0.saturating_add(lx as u16), y)) {
-            cell.set_char(BLOCKS[lvl - 1]);
-            cell.fg = c::blend(c::BG, body, b);
-            cell.bg = c::PANEL_BORDER;
-        }
-    }
+    let shade = if alarm { c::blend(tint, c::RED, 0.85) } else { tint };
+    // Floor so a genuinely-idle metric still shows a thin hued baseline (never an
+    // empty gap next to its busy neighbours) — kept low so it reads as a baseline,
+    // not a block competing with live metrics.
+    let band: Vec<f32> = v.iter().map(|&x| x.max(0.13)).collect();
+    wave_area(
+        buf,
+        area,
+        &[(shade, band)],
+        Some(recency),
+        &WaveCfg {
+            // Light blur only: the footer strip is just WAVE_OS*FOOT_CW=18 sub-cols,
+            // so RESOURCES' wide kernel would flatten the amplitude — the 3×
+            // supersample + Catmull-Rom already carry the smoothness; this is AA.
+            oversample: WAVE_OS,
+            blur_radius: 1,
+            blur_passes: 2,
+            // Compressed-bright glow: a 2-row well lives mostly in the bottom row,
+            // so lift the base (≈0.66) while the crest still pops (≈0.89) — keeps
+            // the hue saturated instead of sitting in the dim half of the ramp.
+            glow_base: 0.55,
+            glow_span: 0.45,
+            fill: None, // gauge value is already 0..1
+            bg: c::PANEL_BORDER,
+        },
+    );
 }
 
 /// The honest "no trend" mark under a history-less scalar (Claude $, uptime,
@@ -986,11 +1069,12 @@ fn resources_panel(f: &mut Frame, area: Rect, s: &AppState) {
             height: plot_h,
         };
         let pw = plot.width as usize;
+        // Build at WAVE_OS× the cell width; wave_area area-downsamples to cells.
         let plot_bands: Vec<(ratatui::style::Color, Vec<f32>)> = channels
             .iter()
             .map(|(col, _, norm, ch)| {
                 let ch = *ch;
-                (*col, series(&s.res_samples, pw, move |b, tt| sampled_channel(b, ch, tt), *norm))
+                (*col, series(&s.res_samples, WAVE_OS * pw, move |b, tt| sampled_channel(b, ch, tt), *norm))
             })
             .collect();
         stacked_wave(f, plot, &plot_bands);
